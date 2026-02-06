@@ -122,44 +122,98 @@ pub fn build_board_from_particle(
     );
     haipai[player_id as usize].copy_from_slice(&our_tiles);
 
-    // Opponent hands from particle
+    // Opponent hands from particle -> haipai
     for opp in 0..3 {
         let abs_seat = (player_id as usize + opp + 1) % 4;
         let hand = &particle.opponent_hands[opp];
 
-        // Pad or truncate to exactly 13 for haipai
-        // If an opponent has fewer tiles (due to melds), pad with unknown tiles
-        // that will appear in the yama; if more than 13, the excess goes to yama.
-        // For Phase 1 with Tsumogiri (no melds), opponents always have 13 tiles.
         if hand.len() >= 13 {
             haipai[abs_seat].copy_from_slice(&hand[..13]);
         } else {
-            // Opponent has fewer than 13 tiles (has melds).
-            // Fill remaining haipai slots with first available wall tiles.
-            // The actual hand tiles go first.
             for (i, &tile) in hand.iter().enumerate() {
                 haipai[abs_seat][i] = tile;
             }
-            // Fill rest with a dummy tile that won't matter since
-            // the real game state tracks hands properly via events.
-            // Use the first tile of each remaining slot.
-            // Actually, for the Board to work correctly, haipai must have
-            // real tiles. We'll borrow from the wall.
+            // Opponent has fewer than 13 tiles (has melds). Pad with tiles
+            // from the particle wall (they'll be drawn and discarded anyway).
+            // We'll adjust the wall below.
             for i in hand.len()..13 {
-                haipai[abs_seat][i] = must_tile!(0u8); // 1m placeholder
+                haipai[abs_seat][i] = must_tile!(0u8); // placeholder, fixed below
             }
         }
     }
 
-    // Build yama (wall). Board.yama goes backward (pop), so the first
-    // tile to draw should be at the END of the vec.
-    let mut yama: Vec<Tile> = particle.wall.iter().copied().rev().collect();
+    // Build yama (wall). BoardState expects exactly 70 tiles.
+    //
+    // The particle has tiles_left wall tiles + possibly our tsumo tile.
+    // At game start that's 69 + 1 = 70, but mid-game we have fewer because
+    // tiles were drawn (and discarded) before our current state.
+    //
+    // To reach 70, we need padding tiles. These represent the draws that
+    // already happened in the real game. We reconstruct them from the
+    // "consumed" tiles: tiles that are in tiles_seen but NOT in our hand
+    // and NOT in the particle (opponent hands + wall).
+    //
+    // Consumed = tiles_seen - our_hand (these are discards, open melds,
+    // and dora indicators that we've witnessed).
+    let oya = (kyoku % 4) as usize;
+    let our_offset = (player_id as usize + 4 - oya) % 4;
 
-    // If we had a tsumo tile, prepend it so it's drawn first
-    // (push to end since yama pops from back)
-    if let Some(tile) = our_tsumo_tile {
-        yama.push(tile);
+    let tiles_in_particle = particle.wall.len();
+    let tiles_with_tsumo = tiles_in_particle + our_tsumo_tile.is_some() as usize;
+    let padding_needed = 70usize.saturating_sub(tiles_with_tsumo);
+
+    // Compute consumed tiles: tiles we've observed that are NOT in our hand.
+    // These are discards, open meld tiles, and dora indicators - all visible
+    // and NOT in the particle (which only contains hidden tiles).
+    // We can safely reuse these as padding for the yama.
+    let tiles_seen = state.tiles_seen();
+    let tehai = state.tehai();
+    let mut consumed_counts = [0u8; 34];
+    for tid in 0..34 {
+        consumed_counts[tid] = tiles_seen[tid].saturating_sub(tehai[tid]);
     }
+
+    // Expand consumed counts into actual tiles for padding
+    let mut padding_tiles = Vec::with_capacity(padding_needed);
+    if padding_needed > 0 {
+        'outer: for tid in 0..34 {
+            for _ in 0..consumed_counts[tid] {
+                padding_tiles.push(must_tile!(tid));
+                if padding_tiles.len() >= padding_needed {
+                    break 'outer;
+                }
+            }
+        }
+    }
+
+    // Build yama: index 0 = drawn last, end = drawn first (pop from back).
+    let mut yama = Vec::with_capacity(70);
+
+    // Future wall tiles (drawn after current state, lowest indices).
+    // particle.wall is in draw order, reverse for pop-from-back.
+    yama.extend(particle.wall.iter().copied().rev());
+
+    // Padding tiles (drawn before current state, higher indices = popped first).
+    yama.extend(padding_tiles.iter().copied());
+
+    // Insert our tsumo tile at the correct yama position for our turn.
+    // Draw order: oya (0th pop), oya+1 (1st pop), ...
+    // Our turn is the our_offset-th pop.
+    // In a yama of length N, the k-th pop is at index N-1-k.
+    if let Some(tile) = our_tsumo_tile {
+        let insert_idx = yama.len() - our_offset;
+        yama.insert(insert_idx, tile);
+    }
+
+    ensure!(
+        yama.len() == 70,
+        "yama should have 70 tiles, got {} (wall={}, tsumo={}, padding={}/{})",
+        yama.len(),
+        tiles_in_particle,
+        our_tsumo_tile.is_some() as usize,
+        padding_tiles.len(),
+        padding_needed,
+    );
 
     // Dead wall: rinshan (4 tiles) + dora indicators (5) + ura indicators (5) = 14
     // For Phase 1, we use dummy tiles for the dead wall since:
@@ -167,7 +221,6 @@ pub fn build_board_from_particle(
     // - Dora indicators only matter for scoring (we need at least the first one)
     //
     // We need at least 1 dora indicator for StartKyoku to work.
-    // Use the first tile type that's available as a dummy.
     let dummy = must_tile!(0u8); // 1m
     let rinshan = vec![dummy; 4];
     let dora_indicators = vec![dummy; 5]; // First one gets popped as initial dora
@@ -395,6 +448,138 @@ mod test {
             if !has_variation {
                 // This is OK for tsumogiri - most draws end the same way
             }
+        }
+    }
+
+    /// Set up a game where player 2 is NOT oya (oya=0, kyoku=1).
+    /// Player 2 draws a tile, giving them 14 tiles.
+    fn setup_non_oya_game() -> PlayerState {
+        let mut state = PlayerState::new(2);
+
+        let bakaze: Tile = "E".parse().unwrap();
+        let dora_marker: Tile = "9s".parse().unwrap();
+
+        let tehais = [
+            // Player 0 (oya)
+            ["?"; 13].map(|s| s.parse::<Tile>().unwrap()),
+            // Player 1
+            ["?"; 13].map(|s| s.parse::<Tile>().unwrap()),
+            // Player 2 (us)
+            [
+                "1m", "2m", "3m", "4p", "5p", "6p", "7s", "8s", "9s", "1s", "2s", "3s", "E",
+            ]
+            .map(|s| s.parse::<Tile>().unwrap()),
+            // Player 3
+            ["?"; 13].map(|s| s.parse::<Tile>().unwrap()),
+        ];
+
+        let start_event = Event::StartKyoku {
+            bakaze,
+            dora_marker,
+            kyoku: 1, // oya = seat 0
+            honba: 0,
+            kyotaku: 0,
+            oya: 0,
+            scores: [25000; 4],
+            tehais,
+        };
+        state.update(&start_event).unwrap();
+
+        // Oya draws (not us)
+        state
+            .update(&Event::Tsumo {
+                actor: 0,
+                pai: "N".parse().unwrap(),
+            })
+            .unwrap();
+        // Oya discards
+        state
+            .update(&Event::Dahai {
+                actor: 0,
+                pai: "N".parse().unwrap(),
+                tsumogiri: true,
+            })
+            .unwrap();
+        // Player 1 draws
+        state
+            .update(&Event::Tsumo {
+                actor: 1,
+                pai: "?".parse().unwrap(),
+            })
+            .unwrap();
+        // Player 1 discards
+        state
+            .update(&Event::Dahai {
+                actor: 1,
+                pai: "W".parse().unwrap(),
+                tsumogiri: true,
+            })
+            .unwrap();
+        // Player 2 (us) draws
+        state
+            .update(&Event::Tsumo {
+                actor: 2,
+                pai: "S".parse().unwrap(),
+            })
+            .unwrap();
+
+        // Now player 2 has 14 tiles and it's our turn to discard
+        state
+    }
+
+    #[test]
+    fn build_board_non_oya() {
+        // Verify that the tsumo tile is correctly placed in yama
+        // for a non-oya player (player_id=2, oya=0).
+        let state = setup_non_oya_game();
+        let config = ParticleConfig::new(5);
+        let mut rng = ChaCha12Rng::seed_from_u64(42);
+
+        let particles = generate_particles(&state, &config, &mut rng).unwrap();
+        assert!(!particles.is_empty());
+
+        let board = build_board_from_particle(&state, &particles[0]).unwrap();
+
+        // oya = kyoku % 4 = 0. Our player is seat 2, offset k=2.
+        // The tsumo tile should be the 3rd pop (0-indexed: 2nd) from yama.
+        // Verify that the first pop (for oya) is NOT our tsumo tile "S".
+        let tsumo_tile: Tile = "S".parse().unwrap();
+        let yama_len = board.yama.len();
+
+        // The tile at the end of yama (first pop, for oya) should not be S
+        // unless it happens to be a wall tile.
+        // More importantly, the tile at position yama_len-1-2 should be S.
+        assert_eq!(
+            board.yama[yama_len - 1 - 2],
+            tsumo_tile,
+            "tsumo tile should be at offset 2 from end (3rd pop, for seat 2)"
+        );
+    }
+
+    #[test]
+    fn simulate_non_oya_completes() {
+        // Verify that simulation completes for non-oya player.
+        let state = setup_non_oya_game();
+        let config = ParticleConfig::new(5);
+        let mut rng = ChaCha12Rng::seed_from_u64(42);
+
+        let particles = generate_particles(&state, &config, &mut rng).unwrap();
+        assert!(!particles.is_empty());
+
+        for (i, particle) in particles.iter().enumerate() {
+            let result = simulate_particle(&state, particle);
+            assert!(
+                result.is_ok(),
+                "non-oya particle {i} simulation failed: {:?}",
+                result.err()
+            );
+
+            let result = result.unwrap();
+            let delta_sum: i32 = result.deltas.iter().sum();
+            assert!(
+                delta_sum.abs() <= 1000,
+                "non-oya particle {i}: delta sum {delta_sum} is too large"
+            );
         }
     }
 
