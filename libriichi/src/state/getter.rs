@@ -260,24 +260,28 @@ impl PlayerState {
             sizes[opp_rel_minus1] = tehai_len_div3 * 3 + 1;
         }
 
-        // Adjust: the total of all opponent hands + wall must equal hidden tiles.
-        // hidden = 136 - sum(tiles_seen)
+        // Use the accounting identity to get the exact total opponent tiles.
+        // hidden = 136 - tiles_seen_total
+        // hidden = opponent_hands + live_wall + dead_wall_unseen
+        // Therefore: total_opp = 136 - tiles_seen_total - tiles_left - dead_wall_unseen
         let total_seen: u16 = self.tiles_seen.iter().map(|&c| c as u16).sum();
-        let total_hidden = 136u16.saturating_sub(total_seen);
+        let dead_wall_unseen = 14u16 - self.dora_indicators.len() as u16;
+        let expected_opp =
+            136u16.saturating_sub(total_seen + self.tiles_left as u16 + dead_wall_unseen);
         let total_opp: u16 = sizes.iter().map(|&s| s as u16).sum();
-        let wall = self.tiles_left as u16;
 
-        // If there's a mismatch (e.g., an opponent just drew), adjust.
-        // The discrepancy should be exactly 0 or 1 (one opponent has 3n+2).
-        let expected_opp = total_hidden.saturating_sub(wall);
         if expected_opp > total_opp {
-            // One opponent has an extra tile (just drew, hasn't discarded).
-            // We don't know which one for certain, but it's the current
-            // turn player. We can approximate by distributing the extra tile.
+            // One opponent has an extra tile (just drew, hasn't discarded yet).
+            // Determine which opponent is the current turn player using
+            // last_cans.target_actor (the actor of the most recent event).
+            let active_rel = self.rel(self.last_cans.target_actor);
             let diff = (expected_opp - total_opp) as u8;
-            if diff <= 3 {
-                // Distribute extra tiles starting from first opponent
-                // In practice diff should be 0 or 1.
+
+            if diff == 1 && active_rel >= 1 && active_rel <= 3 {
+                // Give the extra tile to the active turn player
+                sizes[active_rel - 1] += 1;
+            } else if diff <= 3 {
+                // Fallback: distribute evenly (shouldn't happen in practice)
                 for i in 0..diff.min(3) as usize {
                     sizes[i] += 1;
                 }
