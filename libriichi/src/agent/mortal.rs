@@ -1,6 +1,8 @@
 use super::{BatchAgent, InvisibleState};
 use crate::consts::ACTION_SPACE;
 use crate::mjai::{Event, EventExt, Metadata};
+use crate::search::config::ParticleConfig;
+use crate::search::{particle, simulator};
 use crate::state::PlayerState;
 use crate::{must_tile, tu8};
 use std::mem;
@@ -14,6 +16,8 @@ use numpy::{PyArray1, PyArray2};
 use parking_lot::Mutex;
 use pyo3::intern;
 use pyo3::prelude::*;
+use rand::SeedableRng;
+use rand_chacha::ChaCha12Rng;
 
 pub struct MortalBatchAgent {
     engine: PyObject,
@@ -36,6 +40,8 @@ pub struct MortalBatchAgent {
 
     wg: WaitGroup,
     sync_fields: Arc<Mutex<SyncFields>>,
+
+    search: Option<SearchIntegration>,
 }
 
 struct SyncFields {
@@ -46,32 +52,263 @@ struct SyncFields {
     kan_action_idxs: Vec<Option<usize>>,
 }
 
+/// Optional search integration that overrides DQN actions with
+/// particle-based rollout evaluation at critical decision points.
+struct SearchIntegration {
+    rng: ChaCha12Rng,
+    config: ParticleConfig,
+    max_candidates: usize,
+    search_weight: f32,
+}
+
+impl SearchIntegration {
+    /// Decide whether to override the DQN action with a search-informed one.
+    ///
+    /// Returns `Some(action)` if search found a better action, `None` to keep DQN choice.
+    fn maybe_override(
+        &mut self,
+        state: &PlayerState,
+        q_values: &[f32; ACTION_SPACE],
+        masks: &[bool; ACTION_SPACE],
+        actor: u8,
+    ) -> Option<usize> {
+        // Quick criticality check: skip search for trivial decisions
+        if !Self::is_critical(state) {
+            return None;
+        }
+
+        // Get top-k candidate actions by q-value (excluding riichi=37)
+        let mut candidates: Vec<(usize, f32)> = q_values
+            .iter()
+            .enumerate()
+            .filter(|&(i, _)| masks[i] && i != 37)
+            .map(|(i, &q)| (i, q))
+            .collect();
+        candidates.sort_by(|a, b| b.1.total_cmp(&a.1));
+        candidates.truncate(self.max_candidates);
+
+        // Need at least 2 candidates to justify search
+        if candidates.len() < 2 {
+            return None;
+        }
+
+        let actions: Vec<usize> = candidates.iter().map(|&(a, _)| a).collect();
+
+        // Generate particles
+        let particles = particle::generate_particles(state, &self.config, &mut self.rng).ok()?;
+        if particles.is_empty() {
+            return None;
+        }
+
+        // Round-robin rollouts: particle-first, action-second
+        // Collect mean deltas for each action
+        let mut action_sums: Vec<f64> = vec![0.0; actions.len()];
+        let mut action_counts: Vec<usize> = vec![0; actions.len()];
+
+        for p in &particles {
+            for (ai, &action) in actions.iter().enumerate() {
+                if let Ok(result) =
+                    simulator::simulate_particle_action(state, p, action)
+                {
+                    action_sums[ai] += f64::from(result.deltas[actor as usize]);
+                    action_counts[ai] += 1;
+                }
+            }
+        }
+
+        // Compute mean search values
+        let search_values: Vec<f64> = action_sums
+            .iter()
+            .zip(action_counts.iter())
+            .map(|(&sum, &count)| if count > 0 { sum / count as f64 } else { f64::NEG_INFINITY })
+            .collect();
+
+        // Normalize search values to [0, 1] range
+        let search_min = search_values
+            .iter()
+            .copied()
+            .filter(|v| v.is_finite())
+            .fold(f64::INFINITY, f64::min);
+        let search_max = search_values
+            .iter()
+            .copied()
+            .filter(|v| v.is_finite())
+            .fold(f64::NEG_INFINITY, f64::max);
+        let search_range = search_max - search_min;
+
+        let normalized_search: Vec<f64> = if search_range > 1e-10 {
+            search_values
+                .iter()
+                .map(|&v| {
+                    if v.is_finite() {
+                        (v - search_min) / search_range
+                    } else {
+                        0.0
+                    }
+                })
+                .collect()
+        } else {
+            // All search values are the same; search is inconclusive
+            return None;
+        };
+
+        // Compute softmax policy from q-values for blending
+        let candidate_q: Vec<f32> = candidates.iter().map(|&(_, q)| q).collect();
+        let q_max = candidate_q
+            .iter()
+            .copied()
+            .fold(f32::NEG_INFINITY, f32::max);
+        let exp_q: Vec<f64> = candidate_q
+            .iter()
+            .map(|&q| f64::from(q - q_max).exp())
+            .collect();
+        let exp_sum: f64 = exp_q.iter().sum();
+        let policy: Vec<f64> = exp_q.iter().map(|&e| e / exp_sum).collect();
+
+        // Blend: w * normalized_search + (1-w) * policy
+        let w = f64::from(self.search_weight);
+        let blended: Vec<f64> = normalized_search
+            .iter()
+            .zip(policy.iter())
+            .map(|(&s, &p)| w.mul_add(s, (1.0 - w) * p))
+            .collect();
+
+        // Find best blended action
+        let best_idx = blended
+            .iter()
+            .enumerate()
+            .max_by(|(_, a), (_, b)| a.total_cmp(b))?
+            .0;
+
+        let best_action = actions[best_idx];
+        let dqn_action = candidates[0].0;
+
+        // Only override if search disagrees with DQN
+        if best_action != dqn_action {
+            Some(best_action)
+        } else {
+            None
+        }
+    }
+
+    /// Check if the current decision point is critical enough to warrant search.
+    ///
+    /// Simplified from criticality.py (4 of 6 factors; entropy and score
+    /// proximity are omitted to avoid complexity in Rust).
+    /// 1. Riichi: any *opponent* in riichi increases criticality
+    /// 2. Shanten: tenpai/iishanten is more critical
+    /// 3. Bakaze/kyoku: later rounds are more critical
+    /// 4. Danger: many tiles discarded = more information/danger
+    fn is_critical(state: &PlayerState) -> bool {
+        let mut score: f32 = 0.0;
+
+        // Factor 1: Opponent riichi (0.3 if any opponent in riichi)
+        // Index 0 is self (relative), 1-3 are opponents.
+        // Skip self: when we're in riichi, discards are forced (tsumogiri).
+        let riichi = state.riichi_accepted();
+        if riichi[1..].iter().any(|&r| r) {
+            score += 0.3;
+        }
+
+        // Factor 2: Shanten (0.4 for tenpai, 0.2 for iishanten)
+        let shanten = state.shanten();
+        if shanten <= 0 {
+            score += 0.4;
+        } else if shanten == 1 {
+            score += 0.2;
+        }
+
+        // Factor 3: Late kyoku (0.15 for South round)
+        let bakaze = state.bakaze();
+        if bakaze.as_u8() >= tu8!(S) {
+            score += 0.15;
+        }
+
+        // Factor 4: Many tiles played (proxy for danger/information)
+        // tiles_left starts at 70 (decremented per draw), critical when < 30
+        if state.tiles_left() < 30 {
+            score += 0.15;
+        }
+
+        // Threshold: 0.25 means at least one significant factor must be present
+        score >= 0.25
+    }
+}
+
 impl MortalBatchAgent {
     pub fn new(engine: PyObject, player_ids: &[u8]) -> Result<Self> {
         ensure!(player_ids.iter().all(|&id| matches!(id, 0..=3)));
 
-        let (name, is_oracle, version, enable_quick_eval, enable_rule_based_agari_guard) =
-            Python::with_gil(|py| {
-                let obj = engine.bind_borrowed(py);
-                ensure!(
-                    obj.getattr("react_batch")?.is_callable(),
-                    "missing method react_batch",
-                );
+        let (
+            name,
+            is_oracle,
+            version,
+            enable_quick_eval,
+            enable_rule_based_agari_guard,
+            search_cfg,
+        ) = Python::with_gil(|py| {
+            let obj = engine.bind_borrowed(py);
+            ensure!(
+                obj.getattr("react_batch")?.is_callable(),
+                "missing method react_batch",
+            );
 
-                let name = obj.getattr("name")?.extract()?;
-                let is_oracle = obj.getattr("is_oracle")?.extract()?;
-                let version = obj.getattr("version")?.extract()?;
-                let enable_quick_eval = obj.getattr("enable_quick_eval")?.extract()?;
-                let enable_rule_based_agari_guard =
-                    obj.getattr("enable_rule_based_agari_guard")?.extract()?;
-                Ok((
-                    name,
-                    is_oracle,
-                    version,
-                    enable_quick_eval,
-                    enable_rule_based_agari_guard,
-                ))
-            })?;
+            let name = obj.getattr("name")?.extract()?;
+            let is_oracle = obj.getattr("is_oracle")?.extract()?;
+            let version = obj.getattr("version")?.extract()?;
+            let enable_quick_eval = obj.getattr("enable_quick_eval")?.extract()?;
+            let enable_rule_based_agari_guard =
+                obj.getattr("enable_rule_based_agari_guard")?.extract()?;
+
+            // Read optional search parameters
+            let enable_search: bool = obj
+                .getattr("enable_search")
+                .and_then(|v| v.extract())
+                .unwrap_or(false);
+
+            let search_cfg = if enable_search {
+                let n_particles: usize = obj
+                    .getattr("search_particles")
+                    .and_then(|v| v.extract())
+                    .unwrap_or(50);
+                // Python None fails u64 extraction -> Err -> .ok() -> None.
+                // Python int succeeds -> Ok(val) -> .ok() -> Some(val).
+                // Missing attr -> getattr Err -> .ok() -> None.
+                let seed: Option<u64> = obj
+                    .getattr("search_seed")
+                    .and_then(|v| v.extract())
+                    .ok();
+                let weight: f32 = obj
+                    .getattr("search_weight")
+                    .and_then(|v| v.extract())
+                    .unwrap_or(0.5);
+                Some((n_particles, seed, weight))
+            } else {
+                None
+            };
+
+            Ok((
+                name,
+                is_oracle,
+                version,
+                enable_quick_eval,
+                enable_rule_based_agari_guard,
+                search_cfg,
+            ))
+        })?;
+
+        let search = search_cfg.map(|(n_particles, seed, weight)| {
+            let rng = match seed {
+                Some(s) => ChaCha12Rng::seed_from_u64(s),
+                None => ChaCha12Rng::from_os_rng(),
+            };
+            SearchIntegration {
+                rng,
+                config: ParticleConfig::new(n_particles),
+                max_candidates: 5,
+                search_weight: weight,
+            }
+        });
 
         let size = player_ids.len();
         let quick_eval_reactions = if enable_quick_eval {
@@ -108,6 +345,8 @@ impl MortalBatchAgent {
 
             wg: WaitGroup::new(),
             sync_fields,
+
+            search,
         })
     }
 
@@ -334,6 +573,29 @@ impl BatchAgent for MortalBatchAgent {
             } else {
                 orig_action
             };
+
+        // Drop the lock before potentially expensive search
+        drop(sync_fields);
+
+        // Optionally override with search-informed action.
+        // Skip search when DQN wants riichi (37): search can't evaluate
+        // riichi (two-step action), so don't risk suppressing it.
+        let action = if action != 37 {
+            if let Some(ref mut search) = self.search {
+                search
+                    .maybe_override(
+                        state,
+                        &self.q_values[action_idx],
+                        &self.masks_recv[action_idx],
+                        actor,
+                    )
+                    .unwrap_or(action)
+            } else {
+                action
+            }
+        } else {
+            action
+        };
 
         let event = match action {
             0..=36 => {

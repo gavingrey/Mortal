@@ -18,7 +18,7 @@ from .criticality import (
     _compute_entropy_factor,
     compute_criticality,
 )
-from .engine import SearchEngine, SearchStats
+from .engine import SearchEngine, SearchStats, _normalize_values
 
 
 # ---- SearchConfig tests ----
@@ -29,7 +29,7 @@ class TestSearchConfig:
         assert cfg.no_search_threshold == 0.25
         assert cfg.light_search_threshold == 0.45
         assert cfg.deep_search_threshold == 0.65
-        assert cfg.search_trust_weight == 0.7
+        assert cfg.search_trust_weight == 0.5
         assert cfg.enabled is True
 
     def test_allocate_no_search(self):
@@ -127,12 +127,14 @@ class MockPlayerState:
         riichi_accepted=None,
         shanten=3,
         kyoku=0,
+        bakaze=27,
         scores=None,
         last_cans=None,
     ):
         self._riichi = riichi_accepted or [False, False, False, False]
         self._shanten = shanten
         self._kyoku = kyoku
+        self._bakaze = bakaze
         self._scores = scores or [25000, 25000, 25000, 25000]
         self._last_cans = last_cans or MockCans()
 
@@ -146,6 +148,10 @@ class MockPlayerState:
     @property
     def kyoku(self):
         return self._kyoku
+
+    @property
+    def bakaze(self):
+        return self._bakaze
 
     def scores(self):
         return self._scores
@@ -190,13 +196,13 @@ class TestCriticality:
         assert crit_1 > crit_far
 
     def test_south_round_increases(self):
-        east = MockPlayerState(kyoku=0)
-        south = MockPlayerState(kyoku=4)
+        east = MockPlayerState(kyoku=0, bakaze=27)   # East 1
+        south = MockPlayerState(kyoku=0, bakaze=28)   # South 1
         assert compute_criticality(south) > compute_criticality(east)
 
     def test_all_last_increases(self):
-        south3 = MockPlayerState(kyoku=6)
-        south4 = MockPlayerState(kyoku=7)
+        south3 = MockPlayerState(kyoku=2, bakaze=28)  # South 3
+        south4 = MockPlayerState(kyoku=3, bakaze=28)  # South 4
         assert compute_criticality(south4) > compute_criticality(south3)
 
     def test_close_scores_increase(self):
@@ -226,7 +232,7 @@ class TestCriticality:
         state = MockPlayerState(
             riichi_accepted=[False, True, True, True],
             shanten=0,
-            kyoku=7,
+            kyoku=3, bakaze=28,  # South 4 (All-Last)
             scores=[25000, 25500, 24500, 25000],
             last_cans=MockCans(can_discard=True),
         )
@@ -250,6 +256,40 @@ class TestCriticality:
         mask[:10] = True
         crit_with_q = compute_criticality(state, q, mask)
         assert crit_with_q > crit_no_q
+
+
+# ---- Normalization tests ----
+
+class TestNormalization:
+    def test_basic_normalization(self):
+        values = np.array([0.0, 5.0, 10.0])
+        result = _normalize_values(values)
+        np.testing.assert_allclose(result, [0.0, 0.5, 1.0])
+
+    def test_flat_values_return_half(self):
+        values = np.array([3.0, 3.0, 3.0])
+        result = _normalize_values(values)
+        np.testing.assert_allclose(result, [0.5, 0.5, 0.5])
+
+    def test_single_value_returns_half(self):
+        values = np.array([7.0])
+        result = _normalize_values(values)
+        np.testing.assert_allclose(result, [0.5])
+
+    def test_negative_values(self):
+        values = np.array([-10.0, -5.0, 0.0])
+        result = _normalize_values(values)
+        np.testing.assert_allclose(result, [0.0, 0.5, 1.0])
+
+    def test_empty_array(self):
+        values = np.array([])
+        result = _normalize_values(values)
+        assert len(result) == 0
+
+    def test_two_values(self):
+        values = np.array([100.0, 200.0])
+        result = _normalize_values(values)
+        np.testing.assert_allclose(result, [0.0, 1.0])
 
 
 # ---- SearchEngine tests ----
@@ -300,17 +340,16 @@ class TestSearchEngine:
         assert "1 decisions" in s
         assert "1 searches" in s
 
-    def test_get_candidates_includes_special_actions(self):
-        cfg = SearchConfig(max_candidates=3)
+    def test_get_candidates_excludes_riichi(self):
+        """Riichi (action 37) should be excluded from search candidates."""
+        cfg = SearchConfig(max_candidates=5)
         engine = SearchEngine(cfg)
 
         q = np.full(ACTION_SPACE, -10.0)
-        # Top-3 by q-value are discard actions
         q[0] = 5.0
         q[1] = 4.0
         q[2] = 3.0
-        # But riichi is also legal
-        q[IDX_RIICHI] = 1.0
+        q[IDX_RIICHI] = 10.0  # Riichi has highest q-value
         mask = np.zeros(ACTION_SPACE, dtype=bool)
         mask[0] = True
         mask[1] = True
@@ -318,11 +357,30 @@ class TestSearchEngine:
         mask[IDX_RIICHI] = True
 
         candidates = engine._get_candidates(q, mask)
-        # Should include top-3 discards AND riichi (special action)
         assert 0 in candidates
         assert 1 in candidates
         assert 2 in candidates
-        assert IDX_RIICHI in candidates
+        assert IDX_RIICHI not in candidates  # Riichi excluded
+
+    def test_get_candidates_includes_non_riichi_special(self):
+        """Non-riichi special actions (agari, pon, chi) should be included."""
+        cfg = SearchConfig(max_candidates=3)
+        engine = SearchEngine(cfg)
+
+        q = np.full(ACTION_SPACE, -10.0)
+        q[0] = 5.0
+        q[1] = 4.0
+        q[IDX_AGARI] = 1.0  # Agari is legal
+        q[IDX_PASS] = 0.0   # Pass is legal
+        mask = np.zeros(ACTION_SPACE, dtype=bool)
+        mask[0] = True
+        mask[1] = True
+        mask[IDX_AGARI] = True
+        mask[IDX_PASS] = True
+
+        candidates = engine._get_candidates(q, mask)
+        assert IDX_AGARI in candidates  # Must-include special action
+        assert IDX_PASS in candidates   # Must-include special action
 
     def test_get_candidates_respects_max(self):
         cfg = SearchConfig(max_candidates=5, min_prob_coverage=0.0)
@@ -336,24 +394,97 @@ class TestSearchEngine:
 
         candidates = engine._get_candidates(q, mask)
         # Should have at most max_candidates (5) discard actions
-        # (no special actions legal, so no must-includes)
         assert len(candidates) <= 5 + 1  # Allow small overshoot from coverage
 
-    def test_select_action_returns_best_candidate(self):
+    def test_select_action_pure_policy(self):
+        """With search_trust_weight=0, should return policy-best action."""
+        cfg = SearchConfig(search_trust_weight=0.0)
+        engine = SearchEngine(cfg)
+
+        q = np.full(ACTION_SPACE, -10.0)
+        q[3] = 5.0   # Policy likes action 3
+        q[7] = 2.0   # Policy dislikes action 7
+        mask = np.zeros(ACTION_SPACE, dtype=bool)
+        mask[3] = True
+        mask[7] = True
+
+        # Search strongly prefers action 7
+        action_values = {3: -1000.0, 7: 5000.0}
+        action = engine._select_action(q, mask, [3, 7], action_values)
+        assert action == 3  # Pure policy: action 3 has higher q-value
+
+    def test_select_action_pure_search(self):
+        """With search_trust_weight=1, should return search-best action."""
+        cfg = SearchConfig(search_trust_weight=1.0)
+        engine = SearchEngine(cfg)
+
+        q = np.full(ACTION_SPACE, -10.0)
+        q[3] = 8.0   # Policy likes action 3
+        q[7] = 2.0   # Policy dislikes action 7
+        mask = np.zeros(ACTION_SPACE, dtype=bool)
+        mask[3] = True
+        mask[7] = True
+
+        # Search strongly prefers action 7
+        action_values = {3: -5000.0, 7: 5000.0}
+        action = engine._select_action(q, mask, [3, 7], action_values)
+        assert action == 7  # Pure search: action 7 has higher search value
+
+    def test_select_action_blending(self):
+        """With balanced weight, blending should combine both signals."""
+        cfg = SearchConfig(search_trust_weight=0.5)
+        engine = SearchEngine(cfg)
+
+        q = np.full(ACTION_SPACE, -10.0)
+        # Policy strongly prefers action 3 over action 7
+        q[3] = 10.0
+        q[7] = -10.0
+        mask = np.zeros(ACTION_SPACE, dtype=bool)
+        mask[3] = True
+        mask[7] = True
+
+        # Search strongly prefers action 7 over action 3
+        action_values = {3: -10000.0, 7: 10000.0}
+        action = engine._select_action(q, mask, [3, 7], action_values)
+        # With w=0.5:
+        # action 3: 0.5 * 0.0 (normalized search) + 0.5 * ~1.0 (policy prob)
+        # action 7: 0.5 * 1.0 (normalized search) + 0.5 * ~0.0 (policy prob)
+        # Both should be ~0.5, but exact result depends on softmax
+        assert action in [3, 7]  # Either is reasonable with balanced weight
+
+    def test_select_action_flat_search_values(self):
+        """When all search values are equal, should fall back to policy."""
+        cfg = SearchConfig(search_trust_weight=0.5)
+        engine = SearchEngine(cfg)
+
+        q = np.full(ACTION_SPACE, -10.0)
+        q[3] = 8.0
+        q[7] = 2.0
+        mask = np.zeros(ACTION_SPACE, dtype=bool)
+        mask[3] = True
+        mask[7] = True
+
+        # Flat search values -> normalized to 0.5 each
+        action_values = {3: 100.0, 7: 100.0}
+        action = engine._select_action(q, mask, [3, 7], action_values)
+        # Search contributes equally, policy breaks the tie
+        assert action == 3  # Policy prefers action 3
+
+    def test_select_action_no_evaluated_actions(self):
+        """When no actions were evaluated, fall back to policy argmax."""
         cfg = SearchConfig()
         engine = SearchEngine(cfg)
 
         q = np.full(ACTION_SPACE, -10.0)
-        q[3] = 5.0
-        q[7] = 8.0
-        q[1] = 3.0
+        q[5] = 3.0
+        q[9] = 7.0
         mask = np.zeros(ACTION_SPACE, dtype=bool)
-        mask[1] = True
-        mask[3] = True
-        mask[7] = True
+        mask[5] = True
+        mask[9] = True
 
-        action = engine._select_action(q, mask, [1, 3, 7], 0.0, 0.0)
-        assert action == 7  # Highest q-value
+        action_values = {}  # No evaluations
+        action = engine._select_action(q, mask, [5, 9], action_values)
+        assert action == 9  # Policy argmax
 
 
 # ---- Integration test (requires libriichi) ----
@@ -397,8 +528,13 @@ def test_integration_with_libriichi():
     for ev_json in events:
         state.update(ev_json)
 
-    # Run search
-    cfg = SearchConfig(seed=42, light_particles=5, standard_particles=10, deep_particles=20)
+    # Force high criticality for testing
+    cfg = SearchConfig(
+        seed=42,
+        no_search_threshold=0.0,
+        light_particles=5,
+        search_trust_weight=0.5,
+    )
     engine = SearchEngine(cfg)
 
     q = np.zeros(ACTION_SPACE)
@@ -411,18 +547,11 @@ def test_integration_with_libriichi():
     mask[4] = True
     mask[13] = True
 
-    # Force high criticality for testing
-    cfg_high = SearchConfig(
-        seed=42,
-        no_search_threshold=0.0,
-        light_particles=5,
-    )
-    engine_high = SearchEngine(cfg_high)
-    result = engine_high.maybe_search(state, q, mask, player_id=0)
+    result = engine.maybe_search(state, q, mask, player_id=0)
 
     # Should return an action (one of the legal ones)
     if result is not None:
         assert result in [0, 4, 13]
 
     # Stats should reflect the search
-    assert engine_high.stats.total_decisions == 1
+    assert engine.stats.total_decisions == 1

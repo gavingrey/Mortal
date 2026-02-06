@@ -65,11 +65,13 @@ def compute_criticality(state, q_values=None, masks=None):
         score += _compute_entropy_factor(q_values, masks)
 
     # --- Factor 4: Game phase ---
-    # kyoku is 0-indexed: 0-3 = East 1-4, 4-7 = South 1-4
-    kyoku = state.kyoku
-    if kyoku >= 4:  # South round
+    # state.kyoku is within-wind (0-3). Compute absolute kyoku using bakaze.
+    # bakaze is a tile ID: E=27, S=28, W=29. Absolute kyoku = (bakaze-27)*4 + kyoku.
+    bakaze = state.bakaze()  # u8 tile ID
+    abs_kyoku = (bakaze - 27) * 4 + state.kyoku
+    if abs_kyoku >= 4:  # South round or later
         score += 0.10
-    if kyoku == 7:  # All-Last (South 4)
+    if abs_kyoku == 7:  # All-Last (South 4)
         score += 0.10
 
     # --- Factor 5: Score proximity (close placement battle) ---

@@ -30,17 +30,11 @@ class SearchConfig:
     light_budget_ms: float = 200.0
     standard_budget_ms: float = 500.0
     deep_budget_ms: float = 1500.0
-    maximum_budget_ms: float = 2000.0
 
     # --- Blending ---
     # Weight for search values vs policy prior when combining.
     # 0.0 = pure policy, 1.0 = pure search values.
-    search_trust_weight: float = 0.7
-
-    # Whether to use temperature-based sampling for final action selection.
-    # If False, select argmax of blended scores.
-    use_temperature: bool = False
-    temperature: float = 0.5
+    search_trust_weight: float = 0.5
 
     # --- Action pruning ---
     # Maximum number of candidate actions to evaluate during search.

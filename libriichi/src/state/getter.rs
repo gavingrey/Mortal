@@ -171,6 +171,15 @@ impl PlayerState {
     pub const fn riichi_accepted_py(&self) -> [bool; 4] {
         self.riichi_accepted
     }
+
+    /// Prevailing wind as u8 tile ID (E=27, S=28, W=29).
+    /// Exposed to Python for the search criticality module.
+    #[inline]
+    #[must_use]
+    #[pyo3(name = "bakaze")]
+    pub const fn bakaze_py(&self) -> u8 {
+        self.bakaze.as_u8()
+    }
 }
 
 impl PlayerState {
@@ -197,6 +206,13 @@ impl PlayerState {
     }
 
     // --- Getters for search module ---
+
+    /// Prevailing wind tile (E for East round, S for South round).
+    #[inline]
+    #[must_use]
+    pub const fn bakaze(&self) -> Tile {
+        self.bakaze
+    }
 
     #[inline]
     #[must_use]

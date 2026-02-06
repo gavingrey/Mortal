@@ -21,6 +21,10 @@ class MortalEngine:
         boltzmann_epsilon = 0,
         boltzmann_temp = 1,
         top_p = 1,
+        enable_search = False,
+        search_seed = None,
+        search_particles = 50,
+        search_weight = 0.5,
     ):
         self.engine_type = 'mortal'
         self.device = device or torch.device('cpu')
@@ -39,6 +43,11 @@ class MortalEngine:
         self.boltzmann_epsilon = boltzmann_epsilon
         self.boltzmann_temp = boltzmann_temp
         self.top_p = top_p
+
+        self.enable_search = enable_search
+        self.search_seed = search_seed
+        self.search_particles = search_particles
+        self.search_weight = search_weight
 
     def react_batch(self, obs, masks, invisible_obs):
         try:

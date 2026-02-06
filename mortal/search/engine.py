@@ -1,10 +1,10 @@
 import time
 import logging
 import numpy as np
-from typing import List, Optional, Tuple
+from typing import Dict, List, Optional, Tuple
 
 from .config import SearchConfig
-from .criticality import compute_criticality, ACTION_SPACE
+from .criticality import compute_criticality, ACTION_SPACE, IDX_RIICHI
 
 log = logging.getLogger(__name__)
 
@@ -12,11 +12,11 @@ log = logging.getLogger(__name__)
 class SearchEngine:
     """Orchestrates search-enhanced decision making for Mortal.
 
-    Phase 1 implementation:
-    - Uses tsumogiri rollouts (simplest agent) via Rust SearchModule
-    - Uniform particle weights (no importance sampling)
-    - Blends search values with policy q-values for final action selection
+    Phase 2 implementation:
+    - Per-action rollouts: each candidate action is evaluated separately
+    - Value blending: combines search values with policy probabilities
     - Criticality-based conditional activation (skip search for easy decisions)
+    - Tsumogiri rollout policy (agents always discard drawn tile after our move)
 
     Usage:
         search_engine = SearchEngine(config)
@@ -115,7 +115,10 @@ class SearchEngine:
         n_particles: int,
         budget_ms: float,
     ) -> Optional[int]:
-        """Core search logic: generate particles, simulate, blend, select.
+        """Core search logic: generate particles, simulate per-action, blend.
+
+        For each candidate action, runs rollouts across particles to get
+        expected score deltas. Then blends with policy probabilities.
 
         Returns action index or None if search is inconclusive.
         """
@@ -133,56 +136,51 @@ class SearchEngine:
         # Get candidate actions to evaluate
         candidates = self._get_candidates(q_values, masks)
         if len(candidates) <= 1:
-            # Only one legal action (or none), no need to search
             return candidates[0] if candidates else None
 
-        # Simulate: for each particle, run a rollout and collect score deltas
-        # Phase 1: tsumogiri rollouts, evaluate the *default* action (no per-action branching)
-        # This gives us a Monte Carlo estimate of the expected outcome from this state.
-        #
-        # For Phase 1, we use a simplified approach:
-        # Run rollouts for each particle to get baseline expected values,
-        # then compare against q-value-implied preferences.
-        #
-        # Note: True per-action search would require branching (simulate each
-        # candidate action separately for each particle). Phase 1 uses the
-        # rollout delta as a "state value" signal to adjust policy confidence.
-        rollout_deltas = []
+        # Round-robin: cycle through actions one particle at a time.
+        # This ensures all actions get equal sample counts and avoids
+        # biasing earlier (higher q-value) actions with more samples.
         start = time.monotonic()
+        action_deltas: Dict[int, List[float]] = {a: [] for a in candidates}
 
         for particle in particles:
             elapsed = (time.monotonic() - start) * 1000
             if elapsed > budget_ms:
                 break
 
-            try:
-                result = self._search_module.simulate_particle(state, particle)
-                # Get delta for our player
-                delta = result.player_delta(player_id)
-                rollout_deltas.append(delta)
-            except Exception:
-                # Individual particle failures are not fatal
-                continue
+            for action in candidates:
+                try:
+                    result = self._search_module.simulate_action(
+                        state, particle, action
+                    )
+                    delta = result.player_delta(player_id)
+                    action_deltas[action].append(float(delta))
+                except Exception:
+                    # Individual simulation failures are not fatal
+                    continue
 
-        if len(rollout_deltas) == 0:
-            log.warning("All rollouts failed, falling back to policy")
+        # Filter out actions with no successful rollouts
+        action_deltas = {
+            a: deltas for a, deltas in action_deltas.items() if len(deltas) > 0
+        }
+
+        if len(action_deltas) == 0:
+            log.warning("All per-action rollouts failed, falling back to policy")
             return None
 
-        # Compute state value estimate from rollouts
-        mean_delta = np.mean(rollout_deltas)
-        std_delta = np.std(rollout_deltas) if len(rollout_deltas) > 1 else 0.0
+        # Compute mean delta per action
+        action_values = {
+            a: float(np.mean(deltas)) for a, deltas in action_deltas.items()
+        }
 
-        # Phase 1 action selection: blend policy q-values with rollout signal.
-        # Since we don't have per-action rollouts yet, we use the rollout
-        # information to modulate confidence in the policy:
-        # - If rollout variance is high, trust policy more (uncertain state)
-        # - If rollout variance is low, the state is more predictable
-        #
-        # For now, select best action using blended q-values + policy prior.
-        return self._select_action(q_values, masks, candidates, mean_delta, std_delta)
+        return self._select_action(q_values, masks, candidates, action_values)
 
     def _get_candidates(self, q_values: np.ndarray, masks: np.ndarray) -> List[int]:
-        """Get candidate actions to evaluate, pruned by policy."""
+        """Get candidate actions to evaluate, pruned by policy.
+
+        Skips riichi (action 37) from search candidates per team lead decision.
+        """
         q = np.asarray(q_values, dtype=np.float64)
         mask = np.asarray(masks, dtype=bool)
 
@@ -191,10 +189,10 @@ class SearchEngine:
         if len(legal) == 0:
             return []
 
-        # Always include special actions (non-discard)
+        # Always include special actions (non-discard), except riichi
         must_include = set()
         for a in legal:
-            if a >= 37:  # riichi, chi, pon, kan, agari, ryukyoku, pass
+            if a >= 37 and a != IDX_RIICHI:
                 must_include.add(int(a))
 
         # Sort by q-value (descending) and take top-k
@@ -202,7 +200,10 @@ class SearchEngine:
         candidates = set()
 
         for a in sorted_actions:
-            candidates.add(int(a))
+            a_int = int(a)
+            if a_int == IDX_RIICHI:
+                continue  # Skip riichi from search candidates
+            candidates.add(a_int)
             if len(candidates) >= self.config.max_candidates:
                 break
 
@@ -214,15 +215,15 @@ class SearchEngine:
         legal_q = legal_q - legal_q.max()
         probs = np.exp(legal_q) / np.exp(legal_q).sum()
 
-        # Build lookup from action -> index in legal array
-        legal_set = set(int(a) for a in legal)
         action_to_prob_idx = {int(a): i for i, a in enumerate(legal)}
 
         total_prob = sum(probs[action_to_prob_idx[a]]
-                         for a in candidates if a in legal_set)
+                         for a in candidates if a in action_to_prob_idx)
         if total_prob < self.config.min_prob_coverage:
             for a in sorted_actions:
                 a_int = int(a)
+                if a_int == IDX_RIICHI:
+                    continue
                 if a_int not in candidates:
                     candidates.add(a_int)
                     total_prob += probs[action_to_prob_idx[a_int]]
@@ -236,42 +237,57 @@ class SearchEngine:
         q_values: np.ndarray,
         masks: np.ndarray,
         candidates: List[int],
-        mean_delta: float,
-        std_delta: float,
+        action_values: Dict[int, float],
     ) -> Optional[int]:
-        """Blend search signal with policy for final action selection.
+        """Blend search values with policy for final action selection.
 
-        Phase 1: Since we don't have per-action rollout values, we use
-        the policy q-values directly but adjust confidence based on
-        rollout statistics. In Phase 2, this will be replaced with
-        true per-action value estimates.
-
-        For now, this simply returns the argmax of q-values among candidates,
-        which is equivalent to the policy action but restricted to the
-        pruned candidate set. The infrastructure is in place for Phase 2
-        to plug in per-action search values.
+        Formula:
+            blended[a] = w * normalize(V_search(a)) + (1-w) * pi_policy(a)
+        where:
+            V_search(a) = mean delta for action a across particles
+            normalize(x) = (x - min) / (max - min) over evaluated actions
+            pi_policy(a) = softmax(q_values)[a] over legal actions
+            w = config.search_trust_weight
         """
         q = np.asarray(q_values, dtype=np.float64)
         mask = np.asarray(masks, dtype=bool)
+        w = self.config.search_trust_weight
 
-        # Normalize q-values to policy probabilities over legal actions
+        # Compute policy probabilities via softmax over legal actions
         legal_mask = mask.copy()
         legal_q = np.where(legal_mask, q, -np.inf)
-        legal_q_shifted = legal_q - np.max(legal_q[legal_mask])
+        max_legal_q = np.max(legal_q[legal_mask])
+        legal_q_shifted = legal_q - max_legal_q
         probs = np.zeros(ACTION_SPACE, dtype=np.float64)
         probs[legal_mask] = np.exp(legal_q_shifted[legal_mask])
         prob_sum = probs.sum()
         if prob_sum > 0:
             probs /= prob_sum
 
-        # Phase 1: No per-action search values, so "search values" = q-values.
-        # The search_trust_weight blending will be meaningful in Phase 2.
-        # For now, select the best candidate by q-value.
+        # Normalize search values to [0, 1]
+        evaluated = [a for a in candidates if a in action_values]
+        if len(evaluated) == 0:
+            # No actions evaluated, fall back to policy argmax
+            best_action = None
+            best_q = -np.inf
+            for a in candidates:
+                if mask[a] and q[a] > best_q:
+                    best_q = q[a]
+                    best_action = a
+            return best_action
+
+        search_vals = np.array([action_values[a] for a in evaluated])
+        normalized = _normalize_values(search_vals)
+
+        # Blend: w * normalized_search + (1-w) * policy_prob
         best_action = None
-        best_q = -np.inf
-        for a in candidates:
-            if mask[a] and q[a] > best_q:
-                best_q = q[a]
+        best_score = -np.inf
+        for i, a in enumerate(evaluated):
+            if not mask[a]:
+                continue
+            blended = w * normalized[i] + (1.0 - w) * probs[a]
+            if blended > best_score:
+                best_score = blended
                 best_action = a
 
         return best_action
@@ -284,6 +300,21 @@ class SearchEngine:
     def reset_stats(self):
         """Reset accumulated statistics."""
         self._stats = SearchStats()
+
+
+def _normalize_values(values: np.ndarray) -> np.ndarray:
+    """Normalize values to [0, 1] range using min-max scaling.
+
+    If all values are identical, returns uniform 0.5 for all.
+    """
+    if len(values) == 0:
+        return values
+    vmin = values.min()
+    vmax = values.max()
+    spread = vmax - vmin
+    if spread < 1e-10:
+        return np.full_like(values, 0.5)
+    return (values - vmin) / spread
 
 
 class SearchStats:

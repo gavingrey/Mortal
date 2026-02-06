@@ -86,6 +86,50 @@ impl SearchModule {
         }
         Ok(results)
     }
+
+    /// Simulate a single particle rollout with a specific action injected.
+    ///
+    /// The action is applied at our player's first matching decision point,
+    /// then the rest of the game runs with tsumogiri.
+    pub fn simulate_action(
+        &self,
+        state: &PlayerState,
+        particle: &Particle,
+        action: usize,
+    ) -> PyResult<RolloutResult> {
+        simulator::simulate_particle_action(state, particle, action)
+            .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))
+    }
+
+    /// Evaluate multiple actions across multiple particles.
+    ///
+    /// For each action, runs a rollout on each particle and collects results.
+    /// Returns a dict mapping action index to list of RolloutResults.
+    pub fn evaluate_actions(
+        &self,
+        state: &PlayerState,
+        particles: Vec<Particle>,
+        actions: Vec<usize>,
+    ) -> PyResult<std::collections::HashMap<usize, Vec<RolloutResult>>> {
+        let mut results = std::collections::HashMap::new();
+
+        for &action in &actions {
+            let mut action_results = Vec::with_capacity(particles.len());
+            for particle in &particles {
+                match simulator::simulate_particle_action(state, particle, action) {
+                    Ok(result) => action_results.push(result),
+                    Err(e) => {
+                        return Err(pyo3::exceptions::PyRuntimeError::new_err(format!(
+                            "action {action}: {e}"
+                        )));
+                    }
+                }
+            }
+            results.insert(action, action_results);
+        }
+
+        Ok(results)
+    }
 }
 
 pub(crate) fn register_module(
