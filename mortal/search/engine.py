@@ -214,15 +214,18 @@ class SearchEngine:
         legal_q = legal_q - legal_q.max()
         probs = np.exp(legal_q) / np.exp(legal_q).sum()
 
-        total_prob = sum(probs[np.where(legal == a)[0][0]]
-                         for a in candidates if a in set(legal))
+        # Build lookup from action -> index in legal array
+        legal_set = set(int(a) for a in legal)
+        action_to_prob_idx = {int(a): i for i, a in enumerate(legal)}
+
+        total_prob = sum(probs[action_to_prob_idx[a]]
+                         for a in candidates if a in legal_set)
         if total_prob < self.config.min_prob_coverage:
             for a in sorted_actions:
                 a_int = int(a)
                 if a_int not in candidates:
                     candidates.add(a_int)
-                    idx = np.where(legal == a)[0][0]
-                    total_prob += probs[idx]
+                    total_prob += probs[action_to_prob_idx[a_int]]
                     if total_prob >= self.config.min_prob_coverage:
                         break
 
@@ -235,7 +238,7 @@ class SearchEngine:
         candidates: List[int],
         mean_delta: float,
         std_delta: float,
-    ) -> int:
+    ) -> Optional[int]:
         """Blend search signal with policy for final action selection.
 
         Phase 1: Since we don't have per-action rollout values, we use

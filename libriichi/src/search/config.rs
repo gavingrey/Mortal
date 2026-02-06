@@ -23,7 +23,7 @@ pub struct ParticleConfig {
 impl ParticleConfig {
     #[new]
     #[must_use]
-    pub fn new(n_particles: usize) -> Self {
+    pub const fn new(n_particles: usize) -> Self {
         Self {
             n_particles,
             max_attempts_factor: 20,
@@ -32,7 +32,7 @@ impl ParticleConfig {
     }
 
     #[must_use]
-    pub fn max_attempts(&self) -> usize {
+    pub const fn max_attempts(&self) -> usize {
         self.n_particles * self.max_attempts_factor
     }
 }

@@ -34,7 +34,7 @@ pub struct RolloutResult {
 impl RolloutResult {
     /// Get the score delta for a specific player (absolute seat).
     #[must_use]
-    pub fn player_delta(&self, player_id: u8) -> i32 {
+    pub const fn player_delta(&self, player_id: u8) -> i32 {
         self.deltas[player_id as usize]
     }
 
@@ -65,7 +65,7 @@ pub fn build_board_from_particle(
     // Oya is absolute seat = kyoku % 4
     // Un-rotate scores from relative (scores[0]=self) to absolute
     let rel_scores = state.scores();
-    let mut abs_scores = [0i32; 4];
+    let mut abs_scores = [0_i32; 4];
     for i in 0..4 {
         abs_scores[(player_id as usize + i) % 4] = rel_scores[i];
     }
@@ -77,8 +77,7 @@ pub fn build_board_from_particle(
     let tehai = state.tehai();
     let akas = state.akas_in_hand();
     let mut our_tiles = Vec::with_capacity(14);
-    for tid in 0..34 {
-        let count = tehai[tid];
+    for (tid, &count) in tehai.iter().enumerate() {
         if count == 0 {
             continue;
         }
@@ -133,11 +132,12 @@ pub fn build_board_from_particle(
             for (i, &tile) in hand.iter().enumerate() {
                 haipai[abs_seat][i] = tile;
             }
-            // Opponent has fewer than 13 tiles (has melds). Pad with tiles
-            // from the particle wall (they'll be drawn and discarded anyway).
-            // We'll adjust the wall below.
-            for i in hand.len()..13 {
-                haipai[abs_seat][i] = must_tile!(0u8); // placeholder, fixed below
+            // Phase 1 limitation: opponent has fewer than 13 tiles (has melds).
+            // We pad with dummy tiles to satisfy Board's 13-tile haipai requirement.
+            // This means the simulation starts a fresh kyoku that doesn't preserve
+            // the actual meld state. Phase 2 will need proper mid-game continuation.
+            for slot in &mut haipai[abs_seat][hand.len()..13] {
+                *slot = must_tile!(0_u8); // dummy padding
             }
         }
     }
@@ -160,7 +160,7 @@ pub fn build_board_from_particle(
 
     let tiles_in_particle = particle.wall.len();
     let tiles_with_tsumo = tiles_in_particle + our_tsumo_tile.is_some() as usize;
-    let padding_needed = 70usize.saturating_sub(tiles_with_tsumo);
+    let padding_needed = 70_usize.saturating_sub(tiles_with_tsumo);
 
     // Compute consumed tiles: tiles we've observed that are NOT in our hand.
     // These are discards, open meld tiles, and dora indicators - all visible
@@ -168,16 +168,16 @@ pub fn build_board_from_particle(
     // We can safely reuse these as padding for the yama.
     let tiles_seen = state.tiles_seen();
     let tehai = state.tehai();
-    let mut consumed_counts = [0u8; 34];
-    for tid in 0..34 {
-        consumed_counts[tid] = tiles_seen[tid].saturating_sub(tehai[tid]);
+    let mut consumed_counts = [0_u8; 34];
+    for (tid, count) in consumed_counts.iter_mut().enumerate() {
+        *count = tiles_seen[tid].saturating_sub(tehai[tid]);
     }
 
     // Expand consumed counts into actual tiles for padding
     let mut padding_tiles = Vec::with_capacity(padding_needed);
     if padding_needed > 0 {
-        'outer: for tid in 0..34 {
-            for _ in 0..consumed_counts[tid] {
+        'outer: for (tid, &count) in consumed_counts.iter().enumerate() {
+            for _ in 0..count {
                 padding_tiles.push(must_tile!(tid));
                 if padding_tiles.len() >= padding_needed {
                     break 'outer;
@@ -221,7 +221,7 @@ pub fn build_board_from_particle(
     // - Dora indicators only matter for scoring (we need at least the first one)
     //
     // We need at least 1 dora indicator for StartKyoku to work.
-    let dummy = must_tile!(0u8); // 1m
+    let dummy = must_tile!(0_u8); // 1m
     let rinshan = vec![dummy; 4];
     let dora_indicators = vec![dummy; 5]; // First one gets popped as initial dora
     let ura_indicators = vec![dummy; 5];

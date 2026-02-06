@@ -29,7 +29,6 @@ impl SearchModule {
             config: ParticleConfig::new(n_particles),
             rng: ChaCha12Rng::from_os_rng(),
         }
-
     }
 
     /// Create with a fixed seed for reproducibility.
@@ -57,7 +56,7 @@ impl SearchModule {
 
     /// Set the particle configuration.
     #[setter]
-    pub fn set_config(&mut self, config: ParticleConfig) {
+    pub const fn set_config(&mut self, config: ParticleConfig) {
         self.config = config;
     }
 

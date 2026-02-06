@@ -1,5 +1,5 @@
 from dataclasses import dataclass, field
-from typing import Tuple
+from typing import Optional, Tuple
 
 
 @dataclass
@@ -50,7 +50,7 @@ class SearchConfig:
 
     # --- Rollout settings (Phase 1: fixed) ---
     # Seed for reproducibility (None = random seed each time).
-    seed: int = None
+    seed: Optional[int] = None
 
     # Whether search is enabled at all.
     enabled: bool = True

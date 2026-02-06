@@ -146,7 +146,7 @@ pub struct Metadata {
     pub eval_time_ns: Option<u64>,
     pub shanten: Option<i8>,
     pub at_furiten: Option<bool>,
-    pub kan_select: Option<Box<Metadata>>,
+    pub kan_select: Option<Box<Self>>,
 }
 
 #[derive(Serialize, Deserialize)]

@@ -153,6 +153,24 @@ impl PlayerState {
     pub const fn at_furiten(&self) -> bool {
         self.at_furiten
     }
+
+    /// All four players' scores, relative (index 0 = self).
+    /// Exposed to Python for the search criticality module.
+    #[inline]
+    #[must_use]
+    #[pyo3(name = "scores")]
+    pub const fn scores_py(&self) -> [i32; 4] {
+        self.scores
+    }
+
+    /// All four players' riichi accepted status, relative (index 0 = self).
+    /// Exposed to Python for the search criticality module.
+    #[inline]
+    #[must_use]
+    #[pyo3(name = "riichi_accepted")]
+    pub const fn riichi_accepted_py(&self) -> [bool; 4] {
+        self.riichi_accepted
+    }
 }
 
 impl PlayerState {
@@ -240,10 +258,10 @@ impl PlayerState {
     /// depending on whose turn it is.
     #[must_use]
     pub fn opponent_hand_sizes(&self) -> [u8; 3] {
-        let mut sizes = [0u8; 3];
+        let mut sizes = [0_u8; 3];
 
-        for opp_rel_minus1 in 0..3 {
-            let opp_rel = opp_rel_minus1 + 1;
+        for (opp_idx, size) in sizes.iter_mut().enumerate() {
+            let opp_rel = opp_idx + 1;
 
             // Count number of melds (each reduces tehai_len_div3 by 1)
             let n_fuuro = self.fuuro_overview[opp_rel].len() as u8;
@@ -251,13 +269,13 @@ impl PlayerState {
             let total_melds = n_fuuro + n_ankan;
 
             // tehai_len_div3 = 4 - total_melds
-            let tehai_len_div3 = 4u8.saturating_sub(total_melds);
+            let tehai_len_div3 = 4_u8.saturating_sub(total_melds);
 
             // Base hand size is 3*n + 1 (waiting for draw or just discarded)
             // It's 3*n + 2 if the opponent just drew and hasn't discarded yet.
             // From our perspective, we can't always know this precisely,
             // so we use 3*n + 1 as the default (post-discard state).
-            sizes[opp_rel_minus1] = tehai_len_div3 * 3 + 1;
+            *size = tehai_len_div3 * 3 + 1;
         }
 
         // Use the accounting identity to get the exact total opponent tiles.
@@ -265,9 +283,9 @@ impl PlayerState {
         // hidden = opponent_hands + live_wall + dead_wall_unseen
         // Therefore: total_opp = 136 - tiles_seen_total - tiles_left - dead_wall_unseen
         let total_seen: u16 = self.tiles_seen.iter().map(|&c| c as u16).sum();
-        let dead_wall_unseen = 14u16 - self.dora_indicators.len() as u16;
+        let dead_wall_unseen = 14_u16 - self.dora_indicators.len() as u16;
         let expected_opp =
-            136u16.saturating_sub(total_seen + self.tiles_left as u16 + dead_wall_unseen);
+            136_u16.saturating_sub(total_seen + self.tiles_left as u16 + dead_wall_unseen);
         let total_opp: u16 = sizes.iter().map(|&s| s as u16).sum();
 
         if expected_opp > total_opp {
@@ -277,13 +295,13 @@ impl PlayerState {
             let active_rel = self.rel(self.last_cans.target_actor);
             let diff = (expected_opp - total_opp) as u8;
 
-            if diff == 1 && active_rel >= 1 && active_rel <= 3 {
+            if diff == 1 && (1..=3).contains(&active_rel) {
                 // Give the extra tile to the active turn player
                 sizes[active_rel - 1] += 1;
             } else if diff <= 3 {
                 // Fallback: distribute evenly (shouldn't happen in practice)
-                for i in 0..diff.min(3) as usize {
-                    sizes[i] += 1;
+                for size in sizes.iter_mut().take(diff.min(3) as usize) {
+                    *size += 1;
                 }
             }
         }

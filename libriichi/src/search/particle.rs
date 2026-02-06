@@ -31,13 +31,13 @@ pub struct Particle {
 impl Particle {
     /// Number of tiles in opponent i's hand (0-indexed relative).
     #[must_use]
-    pub fn opponent_hand_size(&self, opp_idx: usize) -> usize {
+    pub const fn opponent_hand_size(&self, opp_idx: usize) -> usize {
         self.opponent_hands[opp_idx].len()
     }
 
     /// Number of tiles remaining in the wall.
     #[must_use]
-    pub fn wall_size(&self) -> usize {
+    pub const fn wall_size(&self) -> usize {
         self.wall.len()
     }
 
@@ -125,13 +125,11 @@ impl VisibleTiles {
     fn compute_hidden_tiles(&self) -> Vec<Tile> {
         // Build a 34-count array of seen tiles, then subtract from full set.
         // For aka handling: we track seen akas separately.
-        let mut remaining_counts = [0u8; 34];
+        let mut remaining_counts = [0_u8; 34];
         let mut remaining_akas = [false; 3]; // whether the aka is still hidden
 
         // Start with 4 of each tile type
-        for count in &mut remaining_counts {
-            *count = 4;
-        }
+        remaining_counts.fill(4);
 
         // Subtract all seen tiles
         for (tid, &seen) in self.seen_counts.iter().enumerate() {
@@ -139,8 +137,8 @@ impl VisibleTiles {
         }
 
         // Track aka status: if not seen, the aka is still in the hidden pool
-        for i in 0..3 {
-            remaining_akas[i] = !self.akas_seen[i];
+        for (i, aka) in remaining_akas.iter_mut().enumerate() {
+            *aka = !self.akas_seen[i];
         }
 
         // Also subtract our own hand (which is part of tiles_seen already,
@@ -150,8 +148,7 @@ impl VisibleTiles {
 
         // Expand 34-counts into actual 136-format tiles
         let mut hidden = Vec::with_capacity(136);
-        for tid in 0..34 {
-            let count = remaining_counts[tid];
+        for (tid, &count) in remaining_counts.iter().enumerate() {
             if count == 0 {
                 continue;
             }
@@ -226,11 +223,12 @@ pub fn generate_particles(
     let max_attempts = config.max_attempts();
     let mut particles = Vec::with_capacity(config.n_particles);
     let mut attempts = 0;
+    let mut shuffled = hidden_tiles.clone();
 
     while particles.len() < config.n_particles && attempts < max_attempts {
         attempts += 1;
 
-        let mut shuffled = hidden_tiles.clone();
+        shuffled.copy_from_slice(&hidden_tiles);
         shuffled.shuffle(rng);
 
         // Deal tiles to opponents
@@ -278,6 +276,15 @@ pub fn generate_particles(
         });
     }
 
+    ensure!(
+        particles.len() >= config.min_particles,
+        "only generated {} particles out of {} requested ({} min) after {} attempts",
+        particles.len(),
+        config.n_particles,
+        config.min_particles,
+        attempts,
+    );
+
     // Normalize weights (uniform in Phase 1, but structure is ready)
     let total_weight: f32 = particles.iter().map(|p| p.weight).sum();
     if total_weight > 0.0 {
@@ -320,7 +327,7 @@ pub fn is_particle_consistent(particle: &Particle, state: &PlayerState) -> bool 
     }
 
     // Check 3: No tile appears more than its remaining count
-    let mut used_counts = [0u8; 34];
+    let mut used_counts = [0_u8; 34];
     let mut used_akas = [false; 3];
 
     for hand in &particle.opponent_hands {
@@ -350,16 +357,16 @@ pub fn is_particle_consistent(particle: &Particle, state: &PlayerState) -> bool 
 
     // Verify counts don't exceed what's available
     // (some hidden tiles may be in the unseen dead wall, so <= not ==)
-    for tid in 0..34 {
-        let available = 4 - visible.seen_counts[tid];
-        if used_counts[tid] > available {
+    for (&used, &seen) in used_counts.iter().zip(visible.seen_counts.iter()) {
+        let available = 4 - seen;
+        if used > available {
             return false;
         }
     }
 
     // Verify aka consistency
-    for i in 0..3 {
-        if visible.akas_seen[i] && used_akas[i] {
+    for (&seen, &used) in visible.akas_seen.iter().zip(used_akas.iter()) {
+        if seen && used {
             return false; // Aka was already seen but appears in particle
         }
     }
@@ -496,7 +503,7 @@ mod test {
 
         for particle in &particles {
             // Collect all particle tiles into counts
-            let mut counts = [0u8; 34];
+            let mut counts = [0_u8; 34];
             for hand in &particle.opponent_hands {
                 for &tile in hand {
                     counts[tile.deaka().as_usize()] += 1;
