@@ -225,15 +225,42 @@ pub fn build_board_from_particle(
     );
 
     // Dead wall: rinshan (4 tiles) + dora indicators (5) + ura indicators (5) = 14
-    // For Phase 1, we use dummy tiles for the dead wall since:
-    // - Tsumogiri agents never kan (no rinshan draws)
-    // - Dora indicators only matter for scoring (we need at least the first one)
     //
-    // We need at least 1 dora indicator for StartKyoku to work.
-    let dummy = must_tile!(0_u8); // 1m
-    let rinshan = vec![dummy; 4];
-    let dora_indicators = vec![dummy; 5]; // First one gets popped as initial dora
-    let ura_indicators = vec![dummy; 5];
+    // The particle's dead_wall contains the unseen dead wall tiles
+    // (14 - num_revealed_dora_indicators). Combined with the actual revealed
+    // dora indicators from the game state, we have all 14 tiles.
+    //
+    // Layout: dora_indicators = [revealed..., unseen_dora...]
+    //         rinshan = [unseen...]
+    //         ura_indicators = [unseen...]
+    let revealed_dora = state.dora_indicators();
+    let num_revealed = revealed_dora.len();
+    let unseen = &particle.dead_wall;
+
+    // Split unseen dead wall: unrevealed dora, then rinshan, then ura
+    let unrevealed_dora_count = 5 - num_revealed;
+    let fallback = must_tile!(0_u8); // only used if unseen is unexpectedly short
+
+    let mut dora_indicators = Vec::with_capacity(5);
+    dora_indicators.extend_from_slice(revealed_dora);
+    for i in 0..unrevealed_dora_count {
+        dora_indicators.push(unseen.get(i).copied().unwrap_or(fallback));
+    }
+
+    let mut rinshan = Vec::with_capacity(4);
+    for i in 0..4 {
+        rinshan.push(unseen.get(unrevealed_dora_count + i).copied().unwrap_or(fallback));
+    }
+
+    let mut ura_indicators = Vec::with_capacity(5);
+    for i in 0..5 {
+        ura_indicators.push(
+            unseen
+                .get(unrevealed_dora_count + 4 + i)
+                .copied()
+                .unwrap_or(fallback),
+        );
+    }
 
     Ok(Board {
         kyoku,

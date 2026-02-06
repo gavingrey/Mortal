@@ -6,6 +6,7 @@ use crate::search::{particle, simulator};
 use crate::state::PlayerState;
 use crate::{must_tile, tu8};
 use std::mem;
+use std::panic;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -107,9 +108,12 @@ impl SearchIntegration {
 
         for p in &particles {
             for (ai, &action) in actions.iter().enumerate() {
-                if let Ok(result) =
+                // Use catch_unwind as a safety net: search rollouts can panic
+                // on edge-case board states, and we must not crash the arena.
+                let rollout = panic::catch_unwind(panic::AssertUnwindSafe(|| {
                     simulator::simulate_particle_action(state, p, action)
-                {
+                }));
+                if let Ok(Ok(result)) = rollout {
                     action_sums[ai] += f64::from(result.deltas[actor as usize]);
                     action_counts[ai] += 1;
                 }

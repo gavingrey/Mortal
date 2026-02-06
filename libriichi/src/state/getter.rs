@@ -253,6 +253,13 @@ impl PlayerState {
         self.dora_indicators.len() as u8
     }
 
+    /// The revealed dora indicator tiles (in order of revelation).
+    #[inline]
+    #[must_use]
+    pub fn dora_indicators(&self) -> &[Tile] {
+        &self.dora_indicators
+    }
+
     /// Compute the number of tiles in each opponent's closed hand.
     ///
     /// Each opponent is indexed by relative seat (1, 2, 3) mapped to (0, 1, 2).

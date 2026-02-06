@@ -22,6 +22,10 @@ pub struct Particle {
     /// Remaining wall tiles in draw order.
     pub wall: Vec<Tile>,
 
+    /// Unseen dead wall tiles (14 - num_revealed_dora_indicators).
+    /// Used by `build_board_from_particle` to construct the dead wall.
+    pub dead_wall: Vec<Tile>,
+
     /// Importance weight for weighted sampling (Phase 1: uniform = 1.0).
     #[pyo3(get, set)]
     pub weight: f32,
@@ -259,8 +263,10 @@ pub fn generate_particles(
             continue;
         }
         let wall = shuffled[idx..wall_end].to_vec();
-        // Remaining tiles (shuffled[wall_end..]) are unseen dead wall tiles;
-        // we don't need to track them in the particle.
+        // Remaining tiles are unseen dead wall tiles; save them in the
+        // particle so build_board_from_particle can use real tiles instead
+        // of dummies (which can cause "fifth tile" panics).
+        let dead_wall = shuffled[wall_end..].to_vec();
 
         // Phase 1: no additional consistency checks beyond tile accounting.
         // The hidden tile computation already ensures we only use tiles that
@@ -272,6 +278,7 @@ pub fn generate_particles(
         particles.push(Particle {
             opponent_hands,
             wall,
+            dead_wall,
             weight: 1.0,
         });
     }
