@@ -365,14 +365,14 @@ def test_integration_with_libriichi():
     """
     try:
         from libriichi.state import PlayerState
-        from libriichi.mjai import Event
     except ImportError:
         pytest.skip("libriichi not available")
 
-    # Set up a basic game state
-    state = PlayerState(0)
-    # We need to use the Rust Event type, construct via JSON
     import json
+
+    # Set up a basic game state.
+    # PlayerState.update() takes a JSON string directly (not an Event object).
+    state = PlayerState(0)
 
     events = [
         json.dumps({
@@ -395,8 +395,7 @@ def test_integration_with_libriichi():
     ]
 
     for ev_json in events:
-        ev = Event.from_json(ev_json)
-        state.update(ev)
+        state.update(ev_json)
 
     # Run search
     cfg = SearchConfig(seed=42, light_particles=5, standard_particles=10, deep_particles=20)
