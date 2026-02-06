@@ -130,7 +130,42 @@ pub fn build_board_from_particle(
     );
     haipai[player_id as usize].copy_from_slice(&our_tiles);
 
-    // Opponent hands from particle -> haipai
+    // --- Build the consumed tile pool ---
+    //
+    // Consumed tiles = tiles we've observed that are NOT in our hand.
+    // These include discards, open meld tiles, and revealed dora indicators.
+    // Each consumed tile must go to EXACTLY one destination:
+    //   1. Dead wall (revealed dora indicators)
+    //   2. Opponent haipai padding (for players with melds)
+    //   3. Yama padding (to reach the required 70 tiles)
+    //
+    // To avoid double-counting, we first remove the revealed dora indicators
+    // from the consumed pool, then use remaining tiles for haipai + yama padding.
+    let tiles_seen = state.tiles_seen();
+    let mut consumed_counts = [0_u8; 34];
+    for (tid, count) in consumed_counts.iter_mut().enumerate() {
+        *count = tiles_seen[tid].saturating_sub(tehai[tid]);
+    }
+
+    // Remove revealed dora indicator tiles from consumed pool (they go to dead wall)
+    let revealed_dora = state.dora_indicators();
+    for &dora_tile in revealed_dora {
+        let tid = dora_tile.deaka().as_usize();
+        consumed_counts[tid] = consumed_counts[tid].saturating_sub(1);
+    }
+
+    // Expand remaining consumed counts into a flat tile list for padding
+    let mut consumed_tiles: Vec<Tile> = Vec::new();
+    for (tid, &count) in consumed_counts.iter().enumerate() {
+        for _ in 0..count {
+            consumed_tiles.push(must_tile!(tid));
+        }
+    }
+
+    // --- Opponent hands from particle -> haipai ---
+    // When opponents have melds, their closed hand < 13 tiles.
+    // We pad with consumed tiles (NOT dummy 1m) to reach 13.
+    let mut consumed_idx = 0;
     for opp in 0..3 {
         let abs_seat = (player_id as usize + opp + 1) % 4;
         let hand = &particle.opponent_hands[opp];
@@ -141,74 +176,40 @@ pub fn build_board_from_particle(
             for (i, &tile) in hand.iter().enumerate() {
                 haipai[abs_seat][i] = tile;
             }
-            // Phase 1 limitation: opponent has fewer than 13 tiles (has melds).
-            // We pad with dummy tiles to satisfy Board's 13-tile haipai requirement.
-            // This means the simulation starts a fresh kyoku that doesn't preserve
-            // the actual meld state. Phase 2 will need proper mid-game continuation.
+            // Pad with consumed tiles to reach 13
             for slot in &mut haipai[abs_seat][hand.len()..13] {
-                *slot = must_tile!(0_u8); // dummy padding
-            }
-        }
-    }
-
-    // Build yama (wall). BoardState expects exactly 70 tiles.
-    //
-    // The particle has tiles_left wall tiles + possibly our tsumo tile.
-    // At game start that's 69 + 1 = 70, but mid-game we have fewer because
-    // tiles were drawn (and discarded) before our current state.
-    //
-    // To reach 70, we need padding tiles. These represent the draws that
-    // already happened in the real game. We reconstruct them from the
-    // "consumed" tiles: tiles that are in tiles_seen but NOT in our hand
-    // and NOT in the particle (opponent hands + wall).
-    //
-    // Consumed = tiles_seen - our_hand (these are discards, open melds,
-    // and dora indicators that we've witnessed).
-    let oya = (kyoku % 4) as usize;
-    let our_offset = (player_id as usize + 4 - oya) % 4;
-
-    let tiles_in_particle = particle.wall.len();
-    let tiles_with_tsumo = tiles_in_particle + our_tsumo_tile.is_some() as usize;
-    let padding_needed = 70_usize.saturating_sub(tiles_with_tsumo);
-
-    // Compute consumed tiles: tiles we've observed that are NOT in our hand.
-    // These are discards, open meld tiles, and dora indicators - all visible
-    // and NOT in the particle (which only contains hidden tiles).
-    // We can safely reuse these as padding for the yama.
-    let tiles_seen = state.tiles_seen();
-    let tehai = state.tehai();
-    let mut consumed_counts = [0_u8; 34];
-    for (tid, count) in consumed_counts.iter_mut().enumerate() {
-        *count = tiles_seen[tid].saturating_sub(tehai[tid]);
-    }
-
-    // Expand consumed counts into actual tiles for padding
-    let mut padding_tiles = Vec::with_capacity(padding_needed);
-    if padding_needed > 0 {
-        'outer: for (tid, &count) in consumed_counts.iter().enumerate() {
-            for _ in 0..count {
-                padding_tiles.push(must_tile!(tid));
-                if padding_tiles.len() >= padding_needed {
-                    break 'outer;
+                if consumed_idx < consumed_tiles.len() {
+                    *slot = consumed_tiles[consumed_idx];
+                    consumed_idx += 1;
+                } else {
+                    *slot = must_tile!(0_u8); // last-resort fallback
                 }
             }
         }
     }
 
-    // Build yama: index 0 = drawn last, end = drawn first (pop from back).
+    // --- Build yama (wall) ---
+    // BoardState expects exactly 70 tiles.
+    // Remaining consumed tiles (after haipai padding) go to yama padding.
+    let oya = (kyoku % 4) as usize;
+    let our_offset = (player_id as usize + 4 - oya) % 4;
+
+    let tiles_in_particle = particle.wall.len();
+    let tiles_with_tsumo = tiles_in_particle + our_tsumo_tile.is_some() as usize;
+    let yama_padding_needed = 70_usize.saturating_sub(tiles_with_tsumo);
+
     let mut yama = Vec::with_capacity(70);
 
     // Future wall tiles (drawn after current state, lowest indices).
     // particle.wall is in draw order, reverse for pop-from-back.
     yama.extend(particle.wall.iter().copied().rev());
 
-    // Padding tiles (drawn before current state, higher indices = popped first).
-    yama.extend(padding_tiles.iter().copied());
+    // Padding tiles from remaining consumed pool
+    let yama_padding_available = consumed_tiles.len() - consumed_idx;
+    let yama_padding_count = yama_padding_needed.min(yama_padding_available);
+    yama.extend(consumed_tiles[consumed_idx..consumed_idx + yama_padding_count].iter().copied());
 
     // Insert our tsumo tile at the correct yama position for our turn.
-    // Draw order: oya (0th pop), oya+1 (1st pop), ...
-    // Our turn is the our_offset-th pop.
-    // In a yama of length N, the k-th pop is at index N-1-k.
     if let Some(tile) = our_tsumo_tile {
         let insert_idx = yama.len() - our_offset;
         yama.insert(insert_idx, tile);
@@ -220,24 +221,17 @@ pub fn build_board_from_particle(
         yama.len(),
         tiles_in_particle,
         our_tsumo_tile.is_some() as usize,
-        padding_tiles.len(),
-        padding_needed,
+        yama_padding_count,
+        yama_padding_needed,
     );
 
-    // Dead wall: rinshan (4 tiles) + dora indicators (5) + ura indicators (5) = 14
+    // --- Dead wall ---
+    // rinshan (4) + dora_indicators (5) + ura_indicators (5) = 14
     //
-    // The particle's dead_wall contains the unseen dead wall tiles
-    // (14 - num_revealed_dora_indicators). Combined with the actual revealed
-    // dora indicators from the game state, we have all 14 tiles.
-    //
-    // Layout: dora_indicators = [revealed..., unseen_dora...]
-    //         rinshan = [unseen...]
-    //         ura_indicators = [unseen...]
-    let revealed_dora = state.dora_indicators();
+    // Revealed dora indicators come from the game state (already removed
+    // from consumed pool above). Unseen tiles come from the particle.
     let num_revealed = revealed_dora.len();
     let unseen = &particle.dead_wall;
-
-    // Split unseen dead wall: unrevealed dora, then rinshan, then ura
     let unrevealed_dora_count = 5 - num_revealed;
     let fallback = must_tile!(0_u8); // only used if unseen is unexpectedly short
 
