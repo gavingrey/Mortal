@@ -115,6 +115,9 @@ pub mod tile;
 pub mod algo;
 pub mod hand;
 
+// search module for SMCPG-OA search algorithm
+pub mod search;
+
 use pyo3::prelude::*;
 
 #[cfg(feature = "mimalloc")]
@@ -154,6 +157,7 @@ fn libriichi(py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
     arena::register_module(py, name, m)?;
     stat::register_module(py, name, m)?;
     mjai::register_module(py, name, m)?;
+    search::register_module(py, name, m)?;
 
     Ok(())
 }
