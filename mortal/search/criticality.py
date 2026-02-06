@@ -67,7 +67,7 @@ def compute_criticality(state, q_values=None, masks=None):
     # --- Factor 4: Game phase ---
     # state.kyoku is within-wind (0-3). Compute absolute kyoku using bakaze.
     # bakaze is a tile ID: E=27, S=28, W=29. Absolute kyoku = (bakaze-27)*4 + kyoku.
-    bakaze = state.bakaze()  # u8 tile ID
+    bakaze = state.bakaze  # u8 tile ID
     abs_kyoku = (bakaze - 27) * 4 + state.kyoku
     if abs_kyoku >= 4:  # South round or later
         score += 0.10

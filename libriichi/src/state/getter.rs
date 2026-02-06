@@ -174,6 +174,7 @@ impl PlayerState {
 
     /// Prevailing wind as u8 tile ID (E=27, S=28, W=29).
     /// Exposed to Python for the search criticality module.
+    #[getter]
     #[inline]
     #[must_use]
     #[pyo3(name = "bakaze")]
