@@ -1,11 +1,13 @@
 pub mod config;
 pub mod particle;
+pub mod simulator;
 
 use crate::py_helper::add_submodule;
 use crate::state::PlayerState;
 
 use config::ParticleConfig;
 use particle::Particle;
+use simulator::RolloutResult;
 
 use pyo3::prelude::*;
 use rand::SeedableRng;
@@ -58,6 +60,33 @@ impl SearchModule {
     pub fn set_config(&mut self, config: ParticleConfig) {
         self.config = config;
     }
+
+    /// Simulate a single particle rollout using tsumogiri strategy.
+    pub fn simulate_particle(
+        &self,
+        state: &PlayerState,
+        particle: &Particle,
+    ) -> PyResult<RolloutResult> {
+        simulator::simulate_particle(state, particle)
+            .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))
+    }
+
+    /// Generate particles and simulate all of them, returning results.
+    pub fn generate_and_simulate(
+        &mut self,
+        state: &PlayerState,
+    ) -> PyResult<Vec<RolloutResult>> {
+        let particles = particle::generate_particles(state, &self.config, &mut self.rng)
+            .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))?;
+
+        let mut results = Vec::with_capacity(particles.len());
+        for p in &particles {
+            let result = simulator::simulate_particle(state, p)
+                .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))?;
+            results.push(result);
+        }
+        Ok(results)
+    }
 }
 
 pub(crate) fn register_module(
@@ -69,5 +98,6 @@ pub(crate) fn register_module(
     m.add_class::<SearchModule>()?;
     m.add_class::<ParticleConfig>()?;
     m.add_class::<Particle>()?;
+    m.add_class::<RolloutResult>()?;
     add_submodule(py, prefix, super_mod, &m)
 }

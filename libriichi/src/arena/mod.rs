@@ -4,7 +4,7 @@ mod one_vs_three;
 mod result;
 mod two_vs_two;
 
-pub use board::Board;
+pub use board::{Board, Poll};
 pub use result::GameResult;
 
 use crate::py_helper::add_submodule;
