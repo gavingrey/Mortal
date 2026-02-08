@@ -206,7 +206,7 @@ pub fn generate_particles(
     state: &PlayerState,
     config: &ParticleConfig,
     rng: &mut ChaCha12Rng,
-) -> Result<Vec<Particle>> {
+) -> Result<(Vec<Particle>, usize)> {
     let visible = VisibleTiles::from_player_state(state);
     let hidden_tiles = visible.compute_hidden_tiles();
 
@@ -307,7 +307,7 @@ pub fn generate_particles(
         }
     }
 
-    Ok(particles)
+    Ok((particles, attempts))
 }
 
 /// Verify that a particle is consistent with the observed game state.
@@ -422,7 +422,7 @@ mod test {
         let config = ParticleConfig::new(50);
         let mut rng = ChaCha12Rng::seed_from_u64(42);
 
-        let particles = generate_particles(&state, &config, &mut rng).unwrap();
+        let (particles, _attempts) = generate_particles(&state, &config, &mut rng).unwrap();
         assert!(
             !particles.is_empty(),
             "should generate at least some particles"
@@ -440,7 +440,7 @@ mod test {
         let config = ParticleConfig::new(100);
         let mut rng = ChaCha12Rng::seed_from_u64(123);
 
-        let particles = generate_particles(&state, &config, &mut rng).unwrap();
+        let (particles, _attempts) = generate_particles(&state, &config, &mut rng).unwrap();
         for (i, particle) in particles.iter().enumerate() {
             assert!(
                 is_particle_consistent(particle, &state),
@@ -455,7 +455,7 @@ mod test {
         let config = ParticleConfig::new(50);
         let mut rng = ChaCha12Rng::seed_from_u64(99);
 
-        let particles = generate_particles(&state, &config, &mut rng).unwrap();
+        let (particles, _attempts) = generate_particles(&state, &config, &mut rng).unwrap();
         if !particles.is_empty() {
             let total: f32 = particles.iter().map(|p| p.weight).sum();
             assert!(
@@ -472,7 +472,7 @@ mod test {
         let config = ParticleConfig::new(50);
         let mut rng = ChaCha12Rng::seed_from_u64(77);
 
-        let particles = generate_particles(&state, &config, &mut rng).unwrap();
+        let (particles, _attempts) = generate_particles(&state, &config, &mut rng).unwrap();
 
         for particle in &particles {
             // Collect all particle tiles into counts
@@ -609,7 +609,7 @@ mod test {
         // Generate particles
         let config = ParticleConfig::new(50);
         let mut rng = ChaCha12Rng::seed_from_u64(42);
-        let particles = generate_particles(&state, &config, &mut rng).unwrap();
+        let (particles, _attempts) = generate_particles(&state, &config, &mut rng).unwrap();
         assert!(!particles.is_empty(), "should generate particles");
 
         // Verify no particle contains any aka dora
@@ -650,7 +650,7 @@ mod test {
         let config = ParticleConfig::new(200);
         let mut rng = ChaCha12Rng::seed_from_u64(555);
 
-        let particles = generate_particles(&state, &config, &mut rng).unwrap();
+        let (particles, _attempts) = generate_particles(&state, &config, &mut rng).unwrap();
         let visible = VisibleTiles::from_player_state(&state);
 
         let mut tile_appeared = [false; 34];
@@ -683,7 +683,7 @@ mod test {
         let state = setup_basic_game();
         let config = ParticleConfig::new(1);
         let mut rng = ChaCha12Rng::seed_from_u64(42);
-        let particles = generate_particles(&state, &config, &mut rng).unwrap();
+        let (particles, _attempts) = generate_particles(&state, &config, &mut rng).unwrap();
         let mut bad = particles[0].clone();
         // Add an extra tile to the wall, breaking the total count
         bad.wall.push(must_tile!(0_u8)); // extra 1m
@@ -698,7 +698,7 @@ mod test {
         let state = setup_basic_game();
         let config = ParticleConfig::new(1);
         let mut rng = ChaCha12Rng::seed_from_u64(42);
-        let particles = generate_particles(&state, &config, &mut rng).unwrap();
+        let (particles, _attempts) = generate_particles(&state, &config, &mut rng).unwrap();
         let mut bad = particles[0].clone();
         // Force duplicate aka: put 5mr in two different opponent hands.
         // First, ensure both hands have at least 1 tile we can replace.
@@ -718,7 +718,7 @@ mod test {
         let state = setup_basic_game();
         let config = ParticleConfig::new(1);
         let mut rng = ChaCha12Rng::seed_from_u64(42);
-        let particles = generate_particles(&state, &config, &mut rng).unwrap();
+        let (particles, _attempts) = generate_particles(&state, &config, &mut rng).unwrap();
         let mut bad = particles[0].clone();
         // Remove a tile from opponent 0's hand, making it the wrong size
         if !bad.opponent_hands[0].is_empty() {
@@ -738,7 +738,7 @@ mod test {
         let state = setup_basic_game();
         let config = ParticleConfig::new(1);
         let mut rng = ChaCha12Rng::seed_from_u64(42);
-        let particles = generate_particles(&state, &config, &mut rng).unwrap();
+        let (particles, _attempts) = generate_particles(&state, &config, &mut rng).unwrap();
         let mut bad = particles[0].clone();
         // Replace first 3 tiles in opponent 0's hand with 1m.
         // tiles_seen[0] == 2 (hand + dora), so available = 4 - 2 = 2.

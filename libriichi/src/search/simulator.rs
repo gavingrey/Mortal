@@ -32,6 +32,10 @@ pub struct RolloutResult {
     /// Whether the kyoku ended with an abortive draw.
     #[pyo3(get)]
     pub has_abortive_ryukyoku: bool,
+
+    /// Number of poll iterations (game steps) in the rollout.
+    #[pyo3(get)]
+    pub steps: u32,
 }
 
 #[pymethods]
@@ -48,8 +52,8 @@ impl RolloutResult {
 
     fn __repr__(&self) -> String {
         format!(
-            "RolloutResult(scores={:?}, deltas={:?}, hora={}, abort={})",
-            self.scores, self.deltas, self.has_hora, self.has_abortive_ryukyoku,
+            "RolloutResult(scores={:?}, deltas={:?}, hora={}, abort={}, steps={})",
+            self.scores, self.deltas, self.has_hora, self.has_abortive_ryukyoku, self.steps,
         )
     }
 }
@@ -866,10 +870,12 @@ fn run_rollout(
 ) -> Result<RolloutResult> {
     let mut reactions: [EventExt; 4] = Default::default();
     let mut action_injected = inject_action.is_none(); // already "injected" if None
+    let mut steps = 0_u32;
 
     loop {
         match board_state.poll(reactions)? {
             Poll::InGame => {
+                steps += 1;
                 reactions = Default::default();
                 let ctx = board_state.agent_context();
 
@@ -935,6 +941,7 @@ fn run_rollout(
                     deltas,
                     has_hora: result.has_hora,
                     has_abortive_ryukyoku: result.has_abortive_ryukyoku,
+                    steps,
                 });
             }
         }
@@ -1065,7 +1072,7 @@ mod test {
         let config = ParticleConfig::new(1);
         let mut rng = ChaCha12Rng::seed_from_u64(42);
 
-        let particles = generate_particles(&state, &config, &mut rng).unwrap();
+        let (particles, _attempts) = generate_particles(&state, &config, &mut rng).unwrap();
         assert!(!particles.is_empty());
 
         let bs = build_midgame_board_state(&state, &particles[0]).unwrap();
@@ -1085,7 +1092,7 @@ mod test {
         let config = ParticleConfig::new(5);
         let mut rng = ChaCha12Rng::seed_from_u64(42);
 
-        let particles = generate_particles(&state, &config, &mut rng).unwrap();
+        let (particles, _attempts) = generate_particles(&state, &config, &mut rng).unwrap();
         assert!(!particles.is_empty());
 
         // Simulate each particle
@@ -1114,7 +1121,7 @@ mod test {
         let config = ParticleConfig::new(20);
         let mut rng = ChaCha12Rng::seed_from_u64(123);
 
-        let particles = generate_particles(&state, &config, &mut rng).unwrap();
+        let (particles, _attempts) = generate_particles(&state, &config, &mut rng).unwrap();
 
         let mut results: Vec<RolloutResult> = Vec::new();
         for particle in &particles {
@@ -1214,7 +1221,7 @@ mod test {
         let config = ParticleConfig::new(5);
         let mut rng = ChaCha12Rng::seed_from_u64(42);
 
-        let particles = generate_particles(&state, &config, &mut rng).unwrap();
+        let (particles, _attempts) = generate_particles(&state, &config, &mut rng).unwrap();
         assert!(!particles.is_empty());
 
         let bs = build_midgame_board_state(&state, &particles[0]).unwrap();
@@ -1244,7 +1251,7 @@ mod test {
         let config = ParticleConfig::new(5);
         let mut rng = ChaCha12Rng::seed_from_u64(42);
 
-        let particles = generate_particles(&state, &config, &mut rng).unwrap();
+        let (particles, _attempts) = generate_particles(&state, &config, &mut rng).unwrap();
         assert!(!particles.is_empty());
 
         for (i, particle) in particles.iter().enumerate() {
@@ -1271,6 +1278,7 @@ mod test {
             deltas: [1000, 0, -1000, 0],
             has_hora: false,
             has_abortive_ryukyoku: false,
+            steps: 0,
         };
         assert_eq!(result.player_delta(0).unwrap(), 1000);
         assert_eq!(result.player_delta(2).unwrap(), -1000);
@@ -1866,7 +1874,7 @@ mod test {
         let config = ParticleConfig::new(5);
         let mut rng = ChaCha12Rng::seed_from_u64(42);
 
-        let particles = generate_particles(&state, &config, &mut rng).unwrap();
+        let (particles, _attempts) = generate_particles(&state, &config, &mut rng).unwrap();
         assert!(!particles.is_empty());
 
         // Discard 1m (action 0)
@@ -1896,7 +1904,7 @@ mod test {
         let config = ParticleConfig::new(3);
         let mut rng = ChaCha12Rng::seed_from_u64(42);
 
-        let particles = generate_particles(&state, &config, &mut rng).unwrap();
+        let (particles, _attempts) = generate_particles(&state, &config, &mut rng).unwrap();
         assert!(!particles.is_empty());
 
         // Action 13 = 5p = the tsumo tile (tsumogiri)
@@ -1919,7 +1927,7 @@ mod test {
         let config = ParticleConfig::new(20);
         let mut rng = ChaCha12Rng::seed_from_u64(42);
 
-        let particles = generate_particles(&state, &config, &mut rng).unwrap();
+        let (particles, _attempts) = generate_particles(&state, &config, &mut rng).unwrap();
         assert!(!particles.is_empty());
 
         // Discard 1m (action 0) vs 9m (action 8) should both complete
@@ -1945,7 +1953,7 @@ mod test {
         let config = ParticleConfig::new(5);
         let mut rng = ChaCha12Rng::seed_from_u64(42);
 
-        let particles = generate_particles(&state, &config, &mut rng).unwrap();
+        let (particles, _attempts) = generate_particles(&state, &config, &mut rng).unwrap();
         assert!(!particles.is_empty());
 
         // Player 2 discards S (tile 28, the tsumo tile) - tsumogiri
@@ -2045,7 +2053,7 @@ mod test {
         let config = ParticleConfig::new(1);
         let mut rng = ChaCha12Rng::seed_from_u64(42);
 
-        let particles = generate_particles(&state, &config, &mut rng).unwrap();
+        let (particles, _attempts) = generate_particles(&state, &config, &mut rng).unwrap();
         assert!(!particles.is_empty());
 
         let bs = build_midgame_board_state(&state, &particles[0]).unwrap();
@@ -2062,7 +2070,7 @@ mod test {
         let config = ParticleConfig::new(3);
         let mut rng = ChaCha12Rng::seed_from_u64(42);
 
-        let particles = generate_particles(&state, &config, &mut rng).unwrap();
+        let (particles, _attempts) = generate_particles(&state, &config, &mut rng).unwrap();
         assert!(!particles.is_empty());
 
         for particle in &particles {
@@ -2088,7 +2096,7 @@ mod test {
         let config = ParticleConfig::new(3);
         let mut rng = ChaCha12Rng::seed_from_u64(42);
 
-        let particles = generate_particles(&state, &config, &mut rng).unwrap();
+        let (particles, _attempts) = generate_particles(&state, &config, &mut rng).unwrap();
         assert!(!particles.is_empty());
 
         for particle in &particles {
@@ -2156,7 +2164,7 @@ mod test {
         let config = ParticleConfig::new(5);
         let mut rng = ChaCha12Rng::seed_from_u64(42);
 
-        let particles = generate_particles(&state, &config, &mut rng).unwrap();
+        let (particles, _attempts) = generate_particles(&state, &config, &mut rng).unwrap();
         assert!(!particles.is_empty());
 
         for (i, particle) in particles.iter().enumerate() {
@@ -2191,7 +2199,7 @@ mod test {
         let config = ParticleConfig::new(1);
         let mut rng = ChaCha12Rng::seed_from_u64(42);
 
-        let particles = generate_particles(&state, &config, &mut rng).unwrap();
+        let (particles, _attempts) = generate_particles(&state, &config, &mut rng).unwrap();
         let bs = build_midgame_board_state(&state, &particles[0]).unwrap();
 
         // Unrotate scores from the PlayerState's relative to absolute
@@ -2318,7 +2326,7 @@ mod test {
         let config = ParticleConfig::new(10);
         let mut rng = ChaCha12Rng::seed_from_u64(42);
 
-        let particles = generate_particles(&state, &config, &mut rng).unwrap();
+        let (particles, _attempts) = generate_particles(&state, &config, &mut rng).unwrap();
         assert!(!particles.is_empty());
 
         for (i, particle) in particles.iter().enumerate() {
@@ -2345,7 +2353,7 @@ mod test {
         let config = ParticleConfig::new(5);
         let mut rng = ChaCha12Rng::seed_from_u64(42);
 
-        let particles = generate_particles(&state, &config, &mut rng).unwrap();
+        let (particles, _attempts) = generate_particles(&state, &config, &mut rng).unwrap();
 
         // Discard F (the tsumo tile) via tsumogiri
         let f_tile: Tile = "F".parse().unwrap();
@@ -2454,7 +2462,7 @@ mod test {
             "expected 26 events in deep game history"
         );
 
-        let particles = generate_particles(&state, &config, &mut rng).unwrap();
+        let (particles, _attempts) = generate_particles(&state, &config, &mut rng).unwrap();
         assert!(!particles.is_empty());
 
         for (i, particle) in particles.iter().enumerate() {
@@ -2474,7 +2482,7 @@ mod test {
         let config = ParticleConfig::new(5);
         let mut rng = ChaCha12Rng::seed_from_u64(42);
 
-        let particles = generate_particles(&state, &config, &mut rng).unwrap();
+        let (particles, _attempts) = generate_particles(&state, &config, &mut rng).unwrap();
 
         // Discard 1m (action 0) — we still have it in hand
         for (i, particle) in particles.iter().enumerate() {
@@ -2495,7 +2503,7 @@ mod test {
         let config = ParticleConfig::new(3);
         let mut rng = ChaCha12Rng::seed_from_u64(42);
 
-        let particles = generate_particles(&state, &config, &mut rng).unwrap();
+        let (particles, _attempts) = generate_particles(&state, &config, &mut rng).unwrap();
         for particle in &particles {
             let bs = build_midgame_board_state(&state, particle).unwrap();
             assert_eq!(
@@ -2515,7 +2523,7 @@ mod test {
         let config = ParticleConfig::new(1);
         let mut rng = ChaCha12Rng::seed_from_u64(42);
 
-        let particles = generate_particles(&state, &config, &mut rng).unwrap();
+        let (particles, _attempts) = generate_particles(&state, &config, &mut rng).unwrap();
         let bs = build_midgame_board_state(&state, &particles[0]).unwrap();
 
         // Player 0 (oya) just drew, should be able to discard
@@ -2534,7 +2542,7 @@ mod test {
         let config = ParticleConfig::new(1);
         let mut rng = ChaCha12Rng::seed_from_u64(42);
 
-        let particles = generate_particles(&state, &config, &mut rng).unwrap();
+        let (particles, _attempts) = generate_particles(&state, &config, &mut rng).unwrap();
         let particle = &particles[0];
 
         let result1 = simulate_particle(&state, particle).unwrap();
@@ -2636,7 +2644,7 @@ mod test {
 
         let config = ParticleConfig::new(5);
         let mut rng = ChaCha12Rng::seed_from_u64(42);
-        let particles = generate_particles(&state, &config, &mut rng).unwrap();
+        let (particles, _attempts) = generate_particles(&state, &config, &mut rng).unwrap();
 
         for (i, particle) in particles.iter().enumerate() {
             let bs = build_midgame_board_state(&state, particle);
@@ -2779,7 +2787,7 @@ mod test {
 
         let config = ParticleConfig::new(5);
         let mut rng = ChaCha12Rng::seed_from_u64(42);
-        let particles = generate_particles(&state, &config, &mut rng).unwrap();
+        let (particles, _attempts) = generate_particles(&state, &config, &mut rng).unwrap();
 
         for (i, particle) in particles.iter().enumerate() {
             let result = simulate_particle(&state, particle);
@@ -2894,7 +2902,7 @@ mod test {
 
         let config = ParticleConfig::new(5);
         let mut rng = ChaCha12Rng::seed_from_u64(42);
-        let particles = generate_particles(&state, &config, &mut rng).unwrap();
+        let (particles, _attempts) = generate_particles(&state, &config, &mut rng).unwrap();
 
         for (i, particle) in particles.iter().enumerate() {
             let result = simulate_particle(&state, particle);
@@ -3088,7 +3096,7 @@ mod test {
         // Player 1 now has 2 melds (chi + pon), 8 closed tiles
         let config = ParticleConfig::new(5);
         let mut rng = ChaCha12Rng::seed_from_u64(42);
-        let particles = generate_particles(&state, &config, &mut rng).unwrap();
+        let (particles, _attempts) = generate_particles(&state, &config, &mut rng).unwrap();
 
         for (i, particle) in particles.iter().enumerate() {
             let result = simulate_particle(&state, particle);
@@ -3213,7 +3221,7 @@ mod test {
 
         let config = ParticleConfig::new(3);
         let mut rng = ChaCha12Rng::seed_from_u64(42);
-        let particles = generate_particles(&state, &config, &mut rng).unwrap();
+        let (particles, _attempts) = generate_particles(&state, &config, &mut rng).unwrap();
 
         for (i, particle) in particles.iter().enumerate() {
             let result = simulate_particle(&state, particle);
@@ -3291,7 +3299,7 @@ mod test {
 
         let config = ParticleConfig::new(5);
         let mut rng = ChaCha12Rng::seed_from_u64(42);
-        let particles = generate_particles(&state, &config, &mut rng).unwrap();
+        let (particles, _attempts) = generate_particles(&state, &config, &mut rng).unwrap();
 
         for (i, particle) in particles.iter().enumerate() {
             // Verify opponent hands have 3 entries
@@ -3314,7 +3322,7 @@ mod test {
         let config = ParticleConfig::new(50);
         let mut rng = ChaCha12Rng::seed_from_u64(42);
 
-        let particles = generate_particles(&state, &config, &mut rng).unwrap();
+        let (particles, _attempts) = generate_particles(&state, &config, &mut rng).unwrap();
         assert!(particles.len() >= 10);
 
         let mut results: Vec<RolloutResult> = Vec::new();
@@ -3400,7 +3408,7 @@ mod test {
         let config = ParticleConfig::new(5);
         let mut rng = ChaCha12Rng::seed_from_u64(42);
 
-        let particles = generate_particles(&state, &config, &mut rng).unwrap();
+        let (particles, _attempts) = generate_particles(&state, &config, &mut rng).unwrap();
         let replayed = replay_player_states(&state).unwrap();
 
         for (i, particle) in particles.iter().enumerate() {
@@ -3547,7 +3555,7 @@ mod test {
 
         let config = ParticleConfig::new(5);
         let mut rng = ChaCha12Rng::seed_from_u64(42);
-        let particles = generate_particles(&state, &config, &mut rng).unwrap();
+        let (particles, _attempts) = generate_particles(&state, &config, &mut rng).unwrap();
         assert!(!particles.is_empty(), "should generate particles with kans");
 
         // Verify dead wall size in particles
@@ -3585,7 +3593,7 @@ mod test {
         let config = ParticleConfig::new(5);
         let mut rng = ChaCha12Rng::seed_from_u64(42);
 
-        let particles = generate_particles(&state, &config, &mut rng).unwrap();
+        let (particles, _attempts) = generate_particles(&state, &config, &mut rng).unwrap();
         let replayed = replay_player_states(&state).unwrap();
 
         for (i, particle) in particles.iter().enumerate() {
@@ -3822,7 +3830,7 @@ mod test {
 
         let config = ParticleConfig::new(5);
         let mut rng = ChaCha12Rng::seed_from_u64(42);
-        let particles = generate_particles(&state, &config, &mut rng).unwrap();
+        let (particles, _attempts) = generate_particles(&state, &config, &mut rng).unwrap();
         assert!(!particles.is_empty());
 
         for (i, particle) in particles.iter().enumerate() {
@@ -3844,7 +3852,7 @@ mod test {
         let state2 = setup_game_with_chi();
         let config2 = ParticleConfig::new(5);
         let mut rng2 = ChaCha12Rng::seed_from_u64(123);
-        let particles2 = generate_particles(&state2, &config2, &mut rng2).unwrap();
+        let (particles2, _attempts2) = generate_particles(&state2, &config2, &mut rng2).unwrap();
 
         for (i, particle) in particles2.iter().enumerate() {
             let result = simulate_particle(&state2, particle);
@@ -4277,7 +4285,7 @@ mod test {
         let config = ParticleConfig::new(5);
         let mut rng = ChaCha12Rng::seed_from_u64(42);
 
-        let particles = generate_particles(&state, &config, &mut rng).unwrap();
+        let (particles, _attempts) = generate_particles(&state, &config, &mut rng).unwrap();
         let replayed = replay_player_states(&state).unwrap();
         let base = derive_midgame_context_base(state.event_history());
 
@@ -4314,7 +4322,7 @@ mod test {
         let config = ParticleConfig::new(5);
         let mut rng = ChaCha12Rng::seed_from_u64(42);
 
-        let particles = generate_particles(&state, &config, &mut rng).unwrap();
+        let (particles, _attempts) = generate_particles(&state, &config, &mut rng).unwrap();
         let replayed = replay_player_states(&state).unwrap();
         let base = derive_midgame_context_base(state.event_history());
 
@@ -4735,7 +4743,7 @@ mod test {
         let config = ParticleConfig::new(5);
         let mut rng = ChaCha12Rng::seed_from_u64(42);
 
-        let particles = generate_particles(&state, &config, &mut rng).unwrap();
+        let (particles, _attempts) = generate_particles(&state, &config, &mut rng).unwrap();
         let replayed = replay_player_states(&state).unwrap();
 
         for (i, particle) in particles.iter().enumerate() {
@@ -4760,7 +4768,7 @@ mod test {
         let config = ParticleConfig::new(5);
         let mut rng = ChaCha12Rng::seed_from_u64(42);
 
-        let particles = generate_particles(&state, &config, &mut rng).unwrap();
+        let (particles, _attempts) = generate_particles(&state, &config, &mut rng).unwrap();
         let replayed = replay_player_states(&state).unwrap();
         let base = derive_midgame_context_base(state.event_history());
 
@@ -4783,7 +4791,7 @@ mod test {
         let config = ParticleConfig::new(5);
         let mut rng = ChaCha12Rng::seed_from_u64(42);
 
-        let particles = generate_particles(&state, &config, &mut rng).unwrap();
+        let (particles, _attempts) = generate_particles(&state, &config, &mut rng).unwrap();
         let replayed = replay_player_states(&state).unwrap();
         let base = derive_midgame_context_base(state.event_history());
 
@@ -4898,7 +4906,7 @@ mod test {
 
         let config = ParticleConfig::new(5);
         let mut rng = ChaCha12Rng::seed_from_u64(42);
-        let particles = generate_particles(&state, &config, &mut rng).unwrap();
+        let (particles, _attempts) = generate_particles(&state, &config, &mut rng).unwrap();
         let replayed = replay_player_states(&state).unwrap();
         let base = derive_midgame_context_base(state.event_history());
 
@@ -5047,7 +5055,7 @@ mod test {
         // Verify rollout completes
         let config = ParticleConfig::new(5);
         let mut rng = ChaCha12Rng::seed_from_u64(42);
-        let particles = generate_particles(&state, &config, &mut rng).unwrap();
+        let (particles, _attempts) = generate_particles(&state, &config, &mut rng).unwrap();
         assert!(!particles.is_empty());
 
         for (i, particle) in particles.iter().enumerate() {
@@ -5238,7 +5246,7 @@ mod test {
         // Build and rollout
         let config = ParticleConfig::new(5);
         let mut rng = ChaCha12Rng::seed_from_u64(42);
-        let particles = generate_particles(&state, &config, &mut rng).unwrap();
+        let (particles, _attempts) = generate_particles(&state, &config, &mut rng).unwrap();
         assert!(!particles.is_empty());
 
         let replayed = replay_player_states(&state).unwrap();
@@ -5363,7 +5371,7 @@ mod test {
         // Build and rollout
         let config = ParticleConfig::new(5);
         let mut rng = ChaCha12Rng::seed_from_u64(42);
-        let particles = generate_particles(&state, &config, &mut rng).unwrap();
+        let (particles, _attempts) = generate_particles(&state, &config, &mut rng).unwrap();
         assert!(!particles.is_empty());
 
         let replayed = replay_player_states(&state).unwrap();
@@ -5534,7 +5542,7 @@ mod test {
         // Build and rollout
         let config = ParticleConfig::new(5);
         let mut rng = ChaCha12Rng::seed_from_u64(42);
-        let particles = generate_particles(&state, &config, &mut rng).unwrap();
+        let (particles, _attempts) = generate_particles(&state, &config, &mut rng).unwrap();
         assert!(!particles.is_empty());
 
         let replayed = replay_player_states(&state).unwrap();
@@ -5633,7 +5641,7 @@ mod test {
         // on the next step when it processes the draw)
         let config = ParticleConfig::new(5);
         let mut rng = ChaCha12Rng::seed_from_u64(42);
-        let particles = generate_particles(&state, &config, &mut rng).unwrap();
+        let (particles, _attempts) = generate_particles(&state, &config, &mut rng).unwrap();
         assert!(!particles.is_empty());
 
         let replayed = replay_player_states(&state).unwrap();

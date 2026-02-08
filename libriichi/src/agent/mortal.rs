@@ -96,7 +96,7 @@ impl SearchIntegration {
         let actions: Vec<usize> = candidates.iter().map(|&(a, _)| a).collect();
 
         // Generate particles
-        let particles = particle::generate_particles(state, &self.config, &mut self.rng).ok()?;
+        let (particles, _attempts) = particle::generate_particles(state, &self.config, &mut self.rng).ok()?;
         if particles.is_empty() {
             return None;
         }

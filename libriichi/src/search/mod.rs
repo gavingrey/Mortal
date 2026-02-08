@@ -20,6 +20,8 @@ pub struct SearchModule {
     config: ParticleConfig,
     rng: ChaCha12Rng,
     use_smart_policy: bool,
+    last_gen_attempts: usize,
+    last_gen_accepted: usize,
 }
 
 #[pymethods]
@@ -31,6 +33,8 @@ impl SearchModule {
             config: ParticleConfig::new(n_particles),
             rng: ChaCha12Rng::from_os_rng(),
             use_smart_policy: true,
+            last_gen_attempts: 0,
+            last_gen_accepted: 0,
         }
     }
 
@@ -42,13 +46,19 @@ impl SearchModule {
             config: ParticleConfig::new(n_particles),
             rng: ChaCha12Rng::seed_from_u64(seed),
             use_smart_policy: true,
+            last_gen_attempts: 0,
+            last_gen_accepted: 0,
         }
     }
 
     /// Generate particles from the current game state.
     pub fn generate_particles(&mut self, state: &PlayerState) -> PyResult<Vec<Particle>> {
-        particle::generate_particles(state, &self.config, &mut self.rng)
-            .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))
+        let (particles, attempts) =
+            particle::generate_particles(state, &self.config, &mut self.rng)
+                .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))?;
+        self.last_gen_attempts = attempts;
+        self.last_gen_accepted = particles.len();
+        Ok(particles)
     }
 
     /// Get the current configuration.
@@ -79,6 +89,20 @@ impl SearchModule {
         self.use_smart_policy = value;
     }
 
+    /// Number of attempts made during the last `generate_particles` call.
+    #[getter]
+    #[must_use]
+    pub const fn last_gen_attempts(&self) -> usize {
+        self.last_gen_attempts
+    }
+
+    /// Number of accepted particles during the last `generate_particles` call.
+    #[getter]
+    #[must_use]
+    pub const fn last_gen_accepted(&self) -> usize {
+        self.last_gen_accepted
+    }
+
     /// Simulate a single particle rollout using tsumogiri strategy.
     pub fn simulate_particle(
         &self,
@@ -97,8 +121,11 @@ impl SearchModule {
         &mut self,
         state: &PlayerState,
     ) -> PyResult<Vec<RolloutResult>> {
-        let particles = particle::generate_particles(state, &self.config, &mut self.rng)
-            .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))?;
+        let (particles, attempts) =
+            particle::generate_particles(state, &self.config, &mut self.rng)
+                .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))?;
+        self.last_gen_attempts = attempts;
+        self.last_gen_accepted = particles.len();
 
         let replayed = simulator::replay_player_states(state)
             .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))?;

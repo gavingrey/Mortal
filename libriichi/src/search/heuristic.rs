@@ -490,7 +490,7 @@ mod test {
         let config = ParticleConfig::new(5);
         let mut rng = ChaCha12Rng::seed_from_u64(42);
 
-        let particles = generate_particles(&state, &config, &mut rng).unwrap();
+        let (particles, _attempts) = generate_particles(&state, &config, &mut rng).unwrap();
         assert!(!particles.is_empty());
 
         let replayed = simulator::replay_player_states(&state).unwrap();
@@ -880,7 +880,7 @@ mod test {
         let config = ParticleConfig::new(5);
         let mut rng = ChaCha12Rng::seed_from_u64(42);
 
-        let particles = generate_particles(&state, &config, &mut rng).unwrap();
+        let (particles, _attempts) = generate_particles(&state, &config, &mut rng).unwrap();
         assert!(!particles.is_empty());
 
         let replayed = simulator::replay_player_states(&state).unwrap();

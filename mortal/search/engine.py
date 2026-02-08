@@ -5,6 +5,7 @@ from typing import Dict, List, Optional, Tuple
 
 from .config import SearchConfig
 from .criticality import compute_criticality, ACTION_SPACE, IDX_RIICHI
+from .metrics import SearchMetricsCollector
 
 log = logging.getLogger(__name__)
 
@@ -35,7 +36,7 @@ class SearchEngine:
     def __init__(self, config: Optional[SearchConfig] = None):
         self.config = config or SearchConfig()
         self._search_module = None
-        self._stats = SearchStats()
+        self._stats = SearchMetricsCollector()
 
     def _ensure_module(self):
         """Lazily initialize the Rust SearchModule."""
@@ -75,7 +76,7 @@ class SearchEngine:
 
         # Step 1: Compute criticality
         crit = compute_criticality(state, q_values, masks)
-        self._stats.record_criticality(crit)
+        self._stats.record_decision(crit)
 
         # Step 2: Allocate budget
         budget_ms, n_particles = self.config.allocate(crit)
@@ -83,12 +84,20 @@ class SearchEngine:
             self._stats.record_skip()
             return None
 
+        # Determine search tier
+        if n_particles <= self.config.light_particles:
+            tier = "light"
+        elif n_particles <= self.config.standard_particles:
+            tier = "standard"
+        else:
+            tier = "deep"
+
         # Step 3: Run search
         self._ensure_module()
         start = time.monotonic()
 
         try:
-            action = self._run_search(
+            action, search_data = self._run_search(
                 state=state,
                 q_values=q_values,
                 masks=masks,
@@ -102,7 +111,26 @@ class SearchEngine:
             return None
 
         elapsed_ms = (time.monotonic() - start) * 1000
-        self._stats.record_search(elapsed_ms, n_particles, crit)
+
+        # Determine game phase from bakaze
+        try:
+            bakaze_u8 = state.bakaze
+            phase = {27: "East", 28: "South", 29: "West", 30: "North"}.get(bakaze_u8, "Unknown")
+        except Exception:
+            phase = "Unknown"
+
+        self._stats.record_search(
+            elapsed_ms=elapsed_ms,
+            tier=tier,
+            n_particles_actual=search_data.get("n_particles", 0),
+            gen_attempts=self._search_module.last_gen_attempts,
+            gen_accepted=self._search_module.last_gen_accepted,
+            policy_action=search_data.get("policy_action", -1),
+            search_action=action,
+            action_deltas=search_data.get("action_deltas", {}),
+            rollout_results=search_data.get("rollout_results", {}),
+            game_phase=phase,
+        )
 
         return action
 
@@ -114,15 +142,21 @@ class SearchEngine:
         player_id: int,
         n_particles: int,
         budget_ms: float,
-    ) -> Optional[int]:
+    ) -> Tuple[Optional[int], Dict]:
         """Core search logic: generate particles, simulate per-action, blend.
 
         For each candidate action, runs rollouts across particles to get
         expected score deltas. Then blends with policy probabilities.
 
-        Returns action index or None if search is inconclusive.
+        Returns (action_index, search_data) where action_index is None if
+        search is inconclusive, and search_data contains intermediate metrics.
         """
         from libriichi.search import ParticleConfig
+
+        # Compute policy action (argmax over legal actions) for override tracking
+        q = np.asarray(q_values, dtype=np.float64)
+        mask = np.asarray(masks, dtype=bool)
+        policy_action = int(np.argmax(np.where(mask, q, -np.inf)))
 
         # Configure particle count
         self._search_module.config = ParticleConfig(n_particles)
@@ -131,12 +165,15 @@ class SearchEngine:
         particles = self._search_module.generate_particles(state)
         if len(particles) == 0:
             log.warning("No particles generated, falling back to policy")
-            return None
+            return (None, {})
+
+        n_particles_actual = len(particles)
 
         # Get candidate actions to evaluate
         candidates = self._get_candidates(q_values, masks)
         if len(candidates) <= 1:
-            return candidates[0] if candidates else None
+            action = candidates[0] if candidates else None
+            return (action, {"n_particles": n_particles_actual, "policy_action": policy_action})
 
         # Use batch API: replays event history once, derives context once
         start = time.monotonic()
@@ -158,14 +195,22 @@ class SearchEngine:
 
         if len(action_deltas) == 0:
             log.warning("All per-action rollouts failed, falling back to policy")
-            return None
+            return (None, {"n_particles": n_particles_actual, "policy_action": policy_action,
+                           "rollout_results": results})
 
         # Compute mean delta per action
         action_values = {
             a: float(np.mean(deltas)) for a, deltas in action_deltas.items()
         }
 
-        return self._select_action(q_values, masks, candidates, action_values)
+        selected = self._select_action(q_values, masks, candidates, action_values)
+        search_data = {
+            "n_particles": n_particles_actual,
+            "action_deltas": action_deltas,
+            "rollout_results": results,
+            "policy_action": policy_action,
+        }
+        return (selected, search_data)
 
     def _get_candidates(self, q_values: np.ndarray, masks: np.ndarray) -> List[int]:
         """Get candidate actions to evaluate, pruned by policy.
@@ -284,13 +329,13 @@ class SearchEngine:
         return best_action
 
     @property
-    def stats(self) -> 'SearchStats':
+    def stats(self) -> SearchMetricsCollector:
         """Access search performance statistics."""
         return self._stats
 
     def reset_stats(self):
         """Reset accumulated statistics."""
-        self._stats = SearchStats()
+        self._stats = SearchMetricsCollector()
 
 
 def _normalize_values(values: np.ndarray) -> np.ndarray:
@@ -306,56 +351,3 @@ def _normalize_values(values: np.ndarray) -> np.ndarray:
     if spread < 1e-10:
         return np.full_like(values, 0.5)
     return (values - vmin) / spread
-
-
-class SearchStats:
-    """Tracks search performance statistics for monitoring."""
-
-    def __init__(self):
-        self.total_decisions = 0
-        self.searches_performed = 0
-        self.searches_skipped = 0
-        self.search_errors = 0
-        self.total_search_ms = 0.0
-        self.total_particles = 0
-        self.criticality_sum = 0.0
-        self.criticality_max = 0.0
-
-    def record_criticality(self, crit: float):
-        self.total_decisions += 1
-        self.criticality_sum += crit
-        self.criticality_max = max(self.criticality_max, crit)
-
-    def record_skip(self):
-        self.searches_skipped += 1
-
-    def record_error(self):
-        self.search_errors += 1
-
-    def record_search(self, elapsed_ms: float, n_particles: int, crit: float):
-        self.searches_performed += 1
-        self.total_search_ms += elapsed_ms
-        self.total_particles += n_particles
-
-    @property
-    def avg_criticality(self) -> float:
-        return self.criticality_sum / self.total_decisions if self.total_decisions > 0 else 0.0
-
-    @property
-    def avg_search_ms(self) -> float:
-        return self.total_search_ms / self.searches_performed if self.searches_performed > 0 else 0.0
-
-    @property
-    def search_rate(self) -> float:
-        return self.searches_performed / self.total_decisions if self.total_decisions > 0 else 0.0
-
-    def summary(self) -> str:
-        return (
-            f"SearchStats: {self.total_decisions} decisions, "
-            f"{self.searches_performed} searches ({self.search_rate:.1%}), "
-            f"{self.searches_skipped} skipped, "
-            f"{self.search_errors} errors, "
-            f"avg_crit={self.avg_criticality:.3f}, "
-            f"max_crit={self.criticality_max:.3f}, "
-            f"avg_time={self.avg_search_ms:.1f}ms"
-        )
