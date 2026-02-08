@@ -4,6 +4,7 @@
 //! decisions during rollouts, using shanten-based discard selection with
 //! ukeire (acceptance count) and safety scoring.
 
+use crate::algo::agari::has_valid_agari;
 use crate::algo::shanten;
 use crate::mjai::Event;
 use crate::state::PlayerState;
@@ -215,8 +216,10 @@ pub fn smart_reaction(seat: u8, state: &PlayerState, rng: &mut ChaCha12Rng) -> E
         return Event::None;
     }
 
-    // Always accept wins
-    if cans.can_tsumo_agari {
+    // Accept wins only if the hand pattern is in the agari table.
+    // shanten::calc_all() can report shanten=-1 for patterns that
+    // AGARI_TABLE doesn't contain, which causes "not a hora hand" errors.
+    if cans.can_tsumo_agari && has_valid_agari(&state.tehai()) {
         return Event::Hora {
             actor: seat,
             target: seat,
@@ -224,7 +227,7 @@ pub fn smart_reaction(seat: u8, state: &PlayerState, rng: &mut ChaCha12Rng) -> E
             ura_markers: None,
         };
     }
-    if cans.can_ron_agari {
+    if cans.can_ron_agari && has_valid_agari(&state.tehai()) {
         return Event::Hora {
             actor: seat,
             target: cans.target_actor,

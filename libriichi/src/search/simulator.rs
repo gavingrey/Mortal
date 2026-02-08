@@ -1,3 +1,4 @@
+use crate::algo::agari::has_valid_agari;
 use crate::arena::{Board, BoardState, MidgameContextBase, Poll};
 #[cfg(test)]
 use crate::arena::MidgameContext;
@@ -803,7 +804,9 @@ pub fn default_reaction(seat: u8, state: &PlayerState) -> Event {
         return Event::None;
     }
 
-    if cans.can_tsumo_agari {
+    // Validate agari before accepting: shanten::calc_all() can report
+    // shanten=-1 for patterns not in AGARI_TABLE, causing "not a hora hand".
+    if cans.can_tsumo_agari && has_valid_agari(&state.tehai()) {
         return Event::Hora {
             actor: seat,
             target: seat,
@@ -811,7 +814,7 @@ pub fn default_reaction(seat: u8, state: &PlayerState) -> Event {
             ura_markers: None,
         };
     }
-    if cans.can_ron_agari {
+    if cans.can_ron_agari && has_valid_agari(&state.tehai()) {
         return Event::Hora {
             actor: seat,
             target: cans.target_actor,

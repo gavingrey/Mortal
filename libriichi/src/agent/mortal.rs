@@ -60,6 +60,13 @@ struct SearchIntegration {
     config: ParticleConfig,
     max_candidates: usize,
     search_weight: f32,
+
+    // Metrics
+    search_count: u32,
+    override_count: u32,
+    skip_count: u32,
+    error_count: u32,
+    total_time_us: u64,
 }
 
 impl SearchIntegration {
@@ -73,8 +80,11 @@ impl SearchIntegration {
         masks: &[bool; ACTION_SPACE],
         actor: u8,
     ) -> Option<usize> {
+        let start = Instant::now();
+
         // Quick criticality check: skip search for trivial decisions
         if !Self::is_critical(state) {
+            self.skip_count += 1;
             return None;
         }
 
@@ -90,6 +100,7 @@ impl SearchIntegration {
 
         // Need at least 2 candidates to justify search
         if candidates.len() < 2 {
+            self.skip_count += 1;
             return None;
         }
 
@@ -98,8 +109,11 @@ impl SearchIntegration {
         // Generate particles
         let (particles, _attempts) = particle::generate_particles(state, &self.config, &mut self.rng).ok()?;
         if particles.is_empty() {
+            self.skip_count += 1;
             return None;
         }
+
+        self.search_count += 1;
 
         // Replay event history once, then reuse for all particle/action pairs.
         // This avoids re-replaying O(particles * actions) times.
@@ -129,10 +143,12 @@ impl SearchIntegration {
                     }
                     Ok(Err(e)) => {
                         // Rollout returned an error (non-panic failure)
-                        log::warn!("search rollout error: {e}");
+                        self.error_count += 1;
+                        log::debug!("search rollout error: {e}");
                     }
                     Err(panic_info) => {
                         // Rollout panicked — log it
+                        self.error_count += 1;
                         let msg = panic_info
                             .downcast_ref::<String>()
                             .map(String::as_str)
@@ -177,6 +193,7 @@ impl SearchIntegration {
                 .collect()
         } else {
             // All search values are the same; search is inconclusive
+            self.record_elapsed(start);
             return None;
         };
 
@@ -211,12 +228,23 @@ impl SearchIntegration {
         let best_action = actions[best_idx];
         let dqn_action = candidates[0].0;
 
+        self.record_elapsed(start);
+
         // Only override if search disagrees with DQN
         if best_action != dqn_action {
+            self.override_count += 1;
             Some(best_action)
         } else {
             None
         }
+    }
+
+    /// Record elapsed time from `start` into `total_time_us`.
+    fn record_elapsed(&mut self, start: Instant) {
+        let elapsed = Instant::now()
+            .checked_duration_since(start)
+            .unwrap_or(Duration::ZERO);
+        self.total_time_us = self.total_time_us.saturating_add(elapsed.as_micros() as u64);
     }
 
     /// Check if the current decision point is critical enough to warrant search.
@@ -260,6 +288,33 @@ impl SearchIntegration {
 
         // Threshold: 0.25 means at least one significant factor must be present
         score >= 0.25
+    }
+}
+
+impl Drop for SearchIntegration {
+    fn drop(&mut self) {
+        if self.search_count > 0 || self.skip_count > 0 {
+            let avg_us = if self.search_count > 0 {
+                self.total_time_us / u64::from(self.search_count)
+            } else {
+                0
+            };
+            let msg = format!(
+                "search metrics: searches={}, overrides={}, skips={}, errors={}, \
+                 total_time={}ms, avg_time={}us",
+                self.search_count,
+                self.override_count,
+                self.skip_count,
+                self.error_count,
+                self.total_time_us / 1000,
+                avg_us,
+            );
+            if self.error_count > 0 {
+                log::warn!("{msg}");
+            } else {
+                log::info!("{msg}");
+            }
+        }
     }
 }
 
@@ -335,6 +390,11 @@ impl MortalBatchAgent {
                 config: ParticleConfig::new(n_particles),
                 max_candidates: 5,
                 search_weight: weight,
+                search_count: 0_u32,
+                override_count: 0_u32,
+                skip_count: 0_u32,
+                error_count: 0_u32,
+                total_time_us: 0_u64,
             }
         });
 

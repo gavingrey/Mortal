@@ -764,6 +764,25 @@ pub fn ensure_init() {
     assert_eq!(AGARI_TABLE.len(), AGARI_TABLE_SIZE);
 }
 
+/// Check if the hand pattern exists in `AGARI_TABLE`.
+///
+/// Returns `true` if the hand (which must be 3n+2 tiles) is recognized as a
+/// valid agari pattern. This is a lightweight hash lookup that avoids the
+/// full yaku calculation. Kokushi is also accepted.
+///
+/// Use this to guard against the "not a hora hand" error that occurs when
+/// `shanten::calc_all()` reports shanten=-1 but the hand pattern is not in
+/// the agari table.
+#[must_use]
+pub fn has_valid_agari(tehai: &[u8; 34]) -> bool {
+    // Kokushi is a special pattern not in AGARI_TABLE
+    if shanten::calc_kokushi(tehai) == -1 {
+        return true;
+    }
+    let (_, key) = get_tile14_and_key(tehai);
+    AGARI_TABLE.get(&key).is_some()
+}
+
 fn get_tile14_and_key(tiles: &[u8; 34]) -> ([u8; 14], u32) {
     let mut tile14 = [0; 14];
     let mut tile14_iter = tile14.iter_mut();
