@@ -865,4 +865,8 @@ impl BatchAgent for MortalBatchAgent {
             meta: Some(meta),
         })
     }
+
+    fn needs_record_events(&self) -> bool {
+        self.search.is_some()
+    }
 }

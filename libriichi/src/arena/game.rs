@@ -52,6 +52,8 @@ struct Game {
     /// > サドンデスルールは、30000点(供託未収)以上になった時点で終了、ただし親の
     /// > 連荘がある場合は連荘を優先する
     in_renchan: bool,
+    /// Whether any agent in this game needs event recording on PlayerStates.
+    needs_record_events: bool,
 }
 
 impl Game {
@@ -84,6 +86,9 @@ impl Game {
             };
             next_board.init_from_seed(self.seed);
             self.board = next_board.into_state();
+            if self.needs_record_events {
+                self.board.enable_record_events();
+            }
             self.kyoku_started = true;
         }
 
@@ -248,9 +253,13 @@ impl BatchGame {
             .enumerate()
             .map(|(game_idx, (idxs, &seed))| {
                 let mut oracle_obs_versions = [None; 4];
+                let mut needs_record_events = false;
                 for (i, idx) in idxs.iter().enumerate() {
                     agents[idx.agent_idx].start_game(idx.player_id_idx)?;
                     oracle_obs_versions[i] = agents[idx.agent_idx].oracle_obs_version();
+                    if agents[idx.agent_idx].needs_record_events() {
+                        needs_record_events = true;
+                    }
                 }
 
                 let game = Box::new(Game {
@@ -259,6 +268,7 @@ impl BatchGame {
                     indexes: *idxs,
                     scores: self.init_scores,
                     oracle_obs_versions,
+                    needs_record_events,
                     ..Default::default()
                 });
                 Ok((game_idx, game))

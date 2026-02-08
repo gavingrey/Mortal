@@ -73,4 +73,12 @@ pub trait BatchAgent {
         let _ = game_result;
         Ok(())
     }
+
+    /// Whether this agent needs event recording on PlayerStates.
+    ///
+    /// When true, the arena enables `record_events` on all PlayerStates
+    /// so that `event_history()` is available for search replay.
+    fn needs_record_events(&self) -> bool {
+        false
+    }
 }

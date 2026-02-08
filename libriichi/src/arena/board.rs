@@ -271,6 +271,16 @@ impl BoardState {
         }
     }
 
+    /// Enable event recording on all player states.
+    ///
+    /// Must be called before the first event is processed so that the
+    /// full event history is available for search replay.
+    pub fn enable_record_events(&mut self) {
+        for ps in &mut self.player_states {
+            ps.set_record_events(true);
+        }
+    }
+
     #[inline]
     pub fn agent_context(&self) -> AgentContext<'_> {
         AgentContext {
