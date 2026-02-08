@@ -4,7 +4,10 @@ mod one_vs_three;
 mod result;
 mod two_vs_two;
 
-pub use board::{Board, Poll};
+pub use board::{Board, BoardState, MidgameContextBase, Poll};
+// MidgameContext is used internally by board.rs and by tests in simulator.rs
+#[cfg(test)]
+pub(crate) use board::MidgameContext;
 pub use result::GameResult;
 
 use crate::py_helper::add_submodule;

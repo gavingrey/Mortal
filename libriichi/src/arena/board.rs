@@ -50,38 +50,44 @@ pub struct Board {
 #[derive(Derivative)]
 #[derivative(Default)]
 pub struct BoardState {
-    board: Board,
+    pub(crate) board: Board,
     // Absolute seat, with the oya of E1 always being 0
-    oya: u8,
-    player_states: [PlayerState; 4],
+    pub(crate) oya: u8,
+    pub(crate) player_states: [PlayerState; 4],
 
-    can_renchan: bool,
-    has_hora: bool,
-    has_abortive_ryukyoku: bool,
-    kyoku_deltas: [i32; 4],
+    pub(crate) can_renchan: bool,
+    pub(crate) has_hora: bool,
+    pub(crate) has_abortive_ryukyoku: bool,
+    pub(crate) kyoku_deltas: [i32; 4],
 
     #[derivative(Default(value = "70"))]
-    tiles_left: u8,
-    tsumo_actor: u8,
+    pub(crate) tiles_left: u8,
+    pub(crate) tsumo_actor: u8,
     // Just a fancy bool
-    deal_from_rinshan: Option<()>,
-    need_new_dora_at_discard: Option<()>,
-    need_new_dora_at_tsumo: Option<()>,
-    riichi_to_be_accepted: Option<u8>,
+    pub(crate) deal_from_rinshan: Option<()>,
+    pub(crate) need_new_dora_at_discard: Option<()>,
+    pub(crate) need_new_dora_at_tsumo: Option<()>,
+    pub(crate) riichi_to_be_accepted: Option<u8>,
     #[derivative(Default(value = "[true; 4]"))]
-    can_nagashi_mangan: [bool; 4],
+    pub(crate) can_nagashi_mangan: [bool; 4],
     #[derivative(Default(value = "true"))]
-    can_four_wind: bool,
-    four_wind_tile: Option<Tile>,
-    accepted_riichis: u8,
-    kans: u8,
-    check_four_kan: bool,
-    paos: [Option<u8>; 4],
+    pub(crate) can_four_wind: bool,
+    pub(crate) four_wind_tile: Option<Tile>,
+    pub(crate) accepted_riichis: u8,
+    pub(crate) kans: u8,
+    pub(crate) check_four_kan: bool,
+    pub(crate) paos: [Option<u8>; 4],
 
-    log: Vec<EventExt>,
+    pub(crate) log: Vec<EventExt>,
 
     // For oracle_obs only
-    dora_indicators_full: Vec<Tile>,
+    pub(crate) dora_indicators_full: Vec<Tile>,
+
+    /// When true, `step()` returns InGame immediately on the first call
+    /// without processing reactions or drawing tiles. This is used for
+    /// mid-game BoardState construction where a player already has their
+    /// tiles and can_act(). Cleared after the first step().
+    pub(crate) midgame_start: bool,
 }
 
 pub struct AgentContext<'a> {
@@ -132,6 +138,111 @@ impl Board {
             player_states: array::from_fn(|i| PlayerState::new(i as u8)),
             dora_indicators_full,
             ..Default::default()
+        }
+    }
+
+    /// Construct a BoardState representing a mid-game position.
+    ///
+    /// Unlike `into_state()` which creates fresh PlayerStates and starts
+    /// from the beginning, this method accepts pre-built PlayerStates and
+    /// mid-game metadata derived from the event history, allowing the
+    /// search module to skip replaying from the deal.
+    pub fn into_midgame_state(self, ctx: MidgameContext) -> BoardState {
+        let oya = self.kyoku % 4;
+        BoardState {
+            board: self,
+            oya,
+            player_states: ctx.player_states,
+            tiles_left: ctx.tiles_left,
+            tsumo_actor: ctx.tsumo_actor,
+            kans: ctx.kans,
+            accepted_riichis: ctx.accepted_riichis,
+            can_nagashi_mangan: ctx.can_nagashi_mangan,
+            can_four_wind: ctx.can_four_wind,
+            four_wind_tile: ctx.four_wind_tile,
+            riichi_to_be_accepted: ctx.riichi_to_be_accepted,
+            deal_from_rinshan: ctx.deal_from_rinshan,
+            need_new_dora_at_discard: ctx.need_new_dora_at_discard,
+            need_new_dora_at_tsumo: ctx.need_new_dora_at_tsumo,
+            check_four_kan: ctx.check_four_kan,
+            paos: ctx.paos,
+            dora_indicators_full: ctx.dora_indicators_full,
+            // These start fresh for the rollout
+            can_renchan: false,
+            has_hora: false,
+            has_abortive_ryukyoku: false,
+            kyoku_deltas: [0; 4],
+            log: Vec::new(),
+            // Skip the first draw — a player already has tiles and can_act()
+            midgame_start: true,
+        }
+    }
+}
+
+/// Mid-game context derived from the event history.
+///
+/// Contains all the internal BoardState fields that need to be set
+/// correctly when constructing a mid-game BoardState for search rollouts.
+pub struct MidgameContext {
+    pub player_states: [PlayerState; 4],
+    pub tiles_left: u8,
+    pub tsumo_actor: u8,
+    pub kans: u8,
+    pub accepted_riichis: u8,
+    pub can_nagashi_mangan: [bool; 4],
+    pub can_four_wind: bool,
+    pub four_wind_tile: Option<Tile>,
+    pub riichi_to_be_accepted: Option<u8>,
+    pub deal_from_rinshan: Option<()>,
+    pub need_new_dora_at_discard: Option<()>,
+    pub need_new_dora_at_tsumo: Option<()>,
+    pub check_four_kan: bool,
+    pub paos: [Option<u8>; 4],
+    pub dora_indicators_full: Vec<Tile>,
+}
+
+/// Base mid-game context derived solely from the event history.
+///
+/// Contains all event-derived fields, but NOT `player_states` or `tiles_left`,
+/// which vary per particle. Compute this once per search, then combine with
+/// per-particle player states via `with_states()`.
+#[derive(Clone)]
+pub struct MidgameContextBase {
+    pub tsumo_actor: u8,
+    pub kans: u8,
+    pub accepted_riichis: u8,
+    pub can_nagashi_mangan: [bool; 4],
+    pub can_four_wind: bool,
+    pub four_wind_tile: Option<Tile>,
+    pub riichi_to_be_accepted: Option<u8>,
+    pub deal_from_rinshan: Option<()>,
+    pub need_new_dora_at_discard: Option<()>,
+    pub need_new_dora_at_tsumo: Option<()>,
+    pub check_four_kan: bool,
+    pub paos: [Option<u8>; 4],
+    pub dora_indicators_full: Vec<Tile>,
+}
+
+impl MidgameContextBase {
+    /// Combine this base context with per-particle player states and tiles_left
+    /// to produce a full `MidgameContext`.
+    pub fn with_states(self, player_states: [PlayerState; 4], tiles_left: u8) -> MidgameContext {
+        MidgameContext {
+            player_states,
+            tiles_left,
+            tsumo_actor: self.tsumo_actor,
+            kans: self.kans,
+            accepted_riichis: self.accepted_riichis,
+            can_nagashi_mangan: self.can_nagashi_mangan,
+            can_four_wind: self.can_four_wind,
+            four_wind_tile: self.four_wind_tile,
+            riichi_to_be_accepted: self.riichi_to_be_accepted,
+            deal_from_rinshan: self.deal_from_rinshan,
+            need_new_dora_at_discard: self.need_new_dora_at_discard,
+            need_new_dora_at_tsumo: self.need_new_dora_at_tsumo,
+            check_four_kan: self.check_four_kan,
+            paos: self.paos,
+            dora_indicators_full: self.dora_indicators_full,
         }
     }
 }
@@ -511,6 +622,13 @@ impl BoardState {
     }
 
     fn step(&mut self, reactions: &[EventExt; 4]) -> Result<Poll> {
+        // Mid-game start: a player already has tiles and can_act().
+        // Skip the first step entirely so poll() sees the existing state.
+        if self.midgame_start {
+            self.midgame_start = false;
+            return Ok(Poll::InGame);
+        }
+
         if self.tiles_left == 70 {
             self.haipai()?;
             return Ok(Poll::InGame);

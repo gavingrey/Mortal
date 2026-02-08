@@ -85,6 +85,10 @@ struct VisibleTiles {
 
     /// Number of revealed dora indicators (known dead wall tiles).
     num_dora_indicators: u8,
+
+    /// Total number of kans on the board (all players combined).
+    /// Each kan draws one rinshan tile from the dead wall.
+    num_kans: u8,
 }
 
 impl VisibleTiles {
@@ -118,6 +122,7 @@ impl VisibleTiles {
             opponent_hand_sizes: state.opponent_hand_sizes(),
             tiles_left: state.tiles_left(),
             num_dora_indicators: state.num_dora_indicators(),
+            num_kans: state.kans_on_board(),
         }
     }
 
@@ -206,9 +211,11 @@ pub fn generate_particles(
     let hidden_tiles = visible.compute_hidden_tiles();
 
     // Dead wall has 14 tiles total. Of those, num_dora_indicators are revealed
-    // (already counted in tiles_seen). The rest are hidden but not in
+    // (already counted in tiles_seen), and num_kans rinshan tiles have been
+    // drawn (also counted in tiles_seen). The rest are hidden but not in
     // opponent hands or the live wall.
-    let dead_wall_unseen = 14 - visible.num_dora_indicators as usize;
+    let dead_wall_unseen =
+        14 - visible.num_dora_indicators as usize - visible.num_kans as usize;
     let expected_hidden = {
         let total_hand_tiles: u8 = visible.opponent_hand_sizes.iter().sum();
         total_hand_tiles as usize + visible.tiles_left as usize + dead_wall_unseen
@@ -317,7 +324,8 @@ pub fn is_particle_consistent(particle: &Particle, state: &PlayerState) -> bool 
         .map(|h| h.len())
         .sum::<usize>()
         + particle.wall.len();
-    let dead_wall_unseen = 14 - visible.num_dora_indicators as usize;
+    let dead_wall_unseen =
+        14 - visible.num_dora_indicators as usize - visible.num_kans as usize;
     let visible_count = visible.seen_counts.iter().sum::<u8>();
     let total_hidden = 136 - visible_count as usize;
     // Particles contain hidden tiles minus the unseen dead wall

@@ -118,6 +118,13 @@ impl PlayerState {
             _ => (),
         };
 
+        // Record event for mid-game state reconstruction (opt-in).
+        // This is placed after processing so that StartKyoku's clear
+        // of event_history happens first, then we record the event.
+        if self.record_events {
+            self.event_history.push(event.clone());
+        }
+
         Ok(self.last_cans)
     }
 
@@ -201,6 +208,9 @@ impl PlayerState {
         self.last_self_tsumo = None;
         self.last_kawa_tile = None;
 
+        // Clear event history for this new kyoku
+        self.event_history.clear();
+
         // The updates must be in order and must be placed after all the
         // resets above.
         self.update_rank();
@@ -209,8 +219,12 @@ impl PlayerState {
             self.witness_tile(t)?;
             self.move_tile(t, MoveType::Tsumo)?;
         }
-        self.update_shanten();
-        self.update_waits_and_furiten();
+        // In replay_mode with unknown tiles, tehai may be empty.
+        // Skip shanten/waits calculation since they require valid hands.
+        if !self.replay_mode || self.tehai.iter().any(|&c| c > 0) {
+            self.update_shanten();
+            self.update_waits_and_furiten();
+        }
         self.pad_kawa_at_start();
 
         Ok(())
@@ -218,11 +232,17 @@ impl PlayerState {
 
     fn tsumo(&mut self, actor: u8, pai: Tile) -> Result<()> {
         ensure!(
-            self.tiles_left > 0,
+            self.tiles_left > 0 || self.replay_mode,
             "rule violation: attempt to tsumo from exhausted yama",
         );
-        self.tiles_left -= 1;
+        self.tiles_left = self.tiles_left.saturating_sub(1);
         if actor != self.player_id {
+            return Ok(());
+        }
+        // In replay_mode, unknown tiles (from opponent perspective) are
+        // treated as a no-op for self processing. The hand will be patched.
+        if pai.is_unknown() && self.replay_mode {
+            self.at_turn += 1;
             return Ok(());
         }
         self.at_turn += 1;
@@ -692,18 +712,23 @@ impl PlayerState {
     /// Updates `tiles_seen`, `doras_seen` and `akas_seen`.
     ///
     /// Returns an error if we have already witnessed 4 such tiles.
+    /// In replay_mode, unknown tiles and overflow are silently ignored.
     pub(super) fn witness_tile(&mut self, tile: Tile) -> Result<()> {
-        ensure!(
-            !tile.is_unknown(),
-            "rule violation: attempt to witness an unknown tile",
-        );
+        if tile.is_unknown() {
+            if self.replay_mode {
+                return Ok(());
+            }
+            anyhow::bail!("rule violation: attempt to witness an unknown tile");
+        }
         let tile_id = tile.deaka().as_usize();
 
         let seen = &mut self.tiles_seen[tile_id];
-        ensure!(
-            *seen < 4,
-            "rule violation: attempt to witness the fifth {tile}",
-        );
+        if *seen >= 4 {
+            if self.replay_mode {
+                return Ok(());
+            }
+            anyhow::bail!("rule violation: attempt to witness the fifth {tile}");
+        }
         *seen += 1;
 
         self.doras_seen += self.dora_factor[tile_id];
@@ -729,8 +754,11 @@ impl PlayerState {
     /// `tiles_seen` or `doras_seen`.
     ///
     /// Returns an error when trying to discard or consume a tile that the
-    /// player doesn't own.
+    /// player doesn't own. In replay_mode, underflow is silently ignored.
     pub(super) fn move_tile(&mut self, tile: Tile, move_type: MoveType) -> Result<()> {
+        if tile.is_unknown() && self.replay_mode {
+            return Ok(());
+        }
         let tile_id = tile.deaka().as_usize();
         let tehai_tile = &mut self.tehai[tile_id];
         match move_type {
@@ -739,18 +767,22 @@ impl PlayerState {
                 self.doras_owned[0] += self.dora_factor[tile_id];
             }
             MoveType::Discard => {
-                ensure!(
-                    *tehai_tile > 0,
-                    "rule violation: attempt to discard {tile} from void",
-                );
+                if *tehai_tile == 0 {
+                    if self.replay_mode {
+                        return Ok(());
+                    }
+                    anyhow::bail!("rule violation: attempt to discard {tile} from void");
+                }
                 *tehai_tile -= 1;
                 self.doras_owned[0] -= self.dora_factor[tile_id];
             }
             MoveType::FuuroConsume => {
-                ensure!(
-                    *tehai_tile > 0,
-                    "rule violation: attempt to consume {tile} from void",
-                );
+                if *tehai_tile == 0 {
+                    if self.replay_mode {
+                        return Ok(());
+                    }
+                    anyhow::bail!("rule violation: attempt to consume {tile} from void");
+                }
                 *tehai_tile -= 1;
             }
         }
@@ -874,12 +906,20 @@ impl PlayerState {
     /// `_shanten_discards` to be calculated properly.
     pub(super) fn update_shanten(&mut self) {
         self.shanten = shanten::calc_all(&self.tehai, self.tehai_len_div3).max(0);
-        debug_assert!(matches!(self.shanten, 0..=6));
+        // In replay_mode, tehai may be incoherent (unknown tiles skipped),
+        // so the shanten value may be outside the normal 0-6 range. Clamp it.
+        if self.replay_mode {
+            self.shanten = self.shanten.clamp(0, 6);
+        } else {
+            debug_assert!(matches!(self.shanten, 0..=6));
+        }
     }
 
     /// Must be called at 3n+2.
     pub(super) fn update_shanten_discards(&mut self) {
-        assert!(self.last_cans.can_discard, "tehai is not 3n+2");
+        if !self.replay_mode {
+            assert!(self.last_cans.can_discard, "tehai is not 3n+2");
+        }
 
         self.next_shanten_discards.fill(false);
         self.keep_shanten_discards.fill(false);
@@ -914,7 +954,9 @@ impl PlayerState {
     /// Caller must assure current tehai is 3n+1, and `self.shanten` must be up
     /// to date and correct.
     pub(super) fn update_waits_and_furiten(&mut self) {
-        assert!(!self.last_cans.can_discard, "tehai is not 3n+1");
+        if !self.replay_mode {
+            assert!(!self.last_cans.can_discard, "tehai is not 3n+1");
+        }
 
         // Reset the furiten flag here for:
         // 1. Clearing same-cycle furiten.

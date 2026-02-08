@@ -71,6 +71,9 @@ impl SearchModule {
     }
 
     /// Generate particles and simulate all of them, returning results.
+    ///
+    /// Replays event history once and derives the midgame context once,
+    /// then runs one tsumogiri rollout per particle.
     pub fn generate_and_simulate(
         &mut self,
         state: &PlayerState,
@@ -78,9 +81,19 @@ impl SearchModule {
         let particles = particle::generate_particles(state, &self.config, &mut self.rng)
             .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))?;
 
+        let replayed = simulator::replay_player_states(state)
+            .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))?;
+
+        // Derive event-dependent context once, reuse across all particles
+        let base = simulator::derive_midgame_context_base(state.event_history());
+
         let mut results = Vec::with_capacity(particles.len());
         for p in &particles {
-            let result = simulator::simulate_particle(state, p)
+            let board_state =
+                simulator::build_midgame_board_state_with_base(state, &replayed, p, &base)
+                    .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))?;
+            let initial_scores = board_state.board.scores;
+            let result = simulator::run_rollout_tsumogiri(board_state, initial_scores)
                 .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))?;
             results.push(result);
         }
@@ -103,7 +116,9 @@ impl SearchModule {
 
     /// Evaluate multiple actions across multiple particles.
     ///
-    /// For each action, runs a rollout on each particle and collects results.
+    /// Replays event history once and derives midgame context once, then
+    /// for each particle/action pair, clones the replayed states and runs
+    /// a rollout.
     /// Returns a dict mapping action index to list of RolloutResults.
     pub fn evaluate_actions(
         &self,
@@ -111,13 +126,27 @@ impl SearchModule {
         particles: Vec<Particle>,
         actions: Vec<usize>,
     ) -> PyResult<std::collections::HashMap<usize, Vec<RolloutResult>>> {
+        // Replay once
+        let replayed = simulator::replay_player_states(state)
+            .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))?;
+
+        // Derive event-dependent context once
+        let base = simulator::derive_midgame_context_base(state.event_history());
+
         let mut results = std::collections::HashMap::new();
 
+        // Round-robin: iterate particles first, then actions, to avoid
+        // sampling bias toward earlier candidates.
         for &action in &actions {
-            let mut action_results = Vec::with_capacity(particles.len());
-            for particle in &particles {
-                match simulator::simulate_particle_action(state, particle, action) {
-                    Ok(result) => action_results.push(result),
+            results.insert(action, Vec::with_capacity(particles.len()));
+        }
+
+        for particle in &particles {
+            for &action in &actions {
+                match simulator::simulate_action_rollout_with_base(
+                    state, &replayed, particle, action, &base,
+                ) {
+                    Ok(result) => results.get_mut(&action).unwrap().push(result),
                     Err(e) => {
                         return Err(pyo3::exceptions::PyRuntimeError::new_err(format!(
                             "action {action}: {e}"
@@ -125,7 +154,6 @@ impl SearchModule {
                     }
                 }
             }
-            results.insert(action, action_results);
         }
 
         Ok(results)

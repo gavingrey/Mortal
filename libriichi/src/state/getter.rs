@@ -1,4 +1,5 @@
 use super::{ActionCandidate, PlayerState};
+use crate::mjai::Event;
 use crate::tile::Tile;
 
 use pyo3::prelude::*;
@@ -181,6 +182,13 @@ impl PlayerState {
     pub const fn bakaze_py(&self) -> u8 {
         self.bakaze.as_u8()
     }
+
+    /// Enable or disable event recording from Python.
+    /// Must be called before processing events for the search module.
+    #[pyo3(name = "set_record_events")]
+    pub const fn set_record_events_py(&mut self, enabled: bool) {
+        self.record_events = enabled;
+    }
 }
 
 impl PlayerState {
@@ -246,11 +254,26 @@ impl PlayerState {
         self.riichi_accepted
     }
 
+    /// The sequence of events processed during this kyoku.
+    /// Used by the search module for mid-game board reconstruction.
+    #[inline]
+    #[must_use]
+    pub fn event_history(&self) -> &[Event] {
+        &self.event_history
+    }
+
     /// Number of revealed dora indicators.
     #[inline]
     #[must_use]
     pub fn num_dora_indicators(&self) -> u8 {
         self.dora_indicators.len() as u8
+    }
+
+    /// Total number of kans on the board (all players combined).
+    #[inline]
+    #[must_use]
+    pub const fn kans_on_board(&self) -> u8 {
+        self.kans_on_board
     }
 
     /// The revealed dora indicator tiles (in order of revelation).
@@ -307,7 +330,8 @@ impl PlayerState {
         // hidden = opponent_hands + live_wall + dead_wall_unseen
         // Therefore: total_opp = 136 - tiles_seen_total - tiles_left - dead_wall_unseen
         let total_seen: u16 = self.tiles_seen.iter().map(|&c| c as u16).sum();
-        let dead_wall_unseen = 14_u16 - self.dora_indicators.len() as u16;
+        let dead_wall_unseen =
+            14_u16 - self.dora_indicators.len() as u16 - self.kans_on_board as u16;
         let expected_opp =
             136_u16.saturating_sub(total_seen + self.tiles_left as u16 + dead_wall_unseen);
         let total_opp: u16 = sizes.iter().map(|&s| s as u16).sum();

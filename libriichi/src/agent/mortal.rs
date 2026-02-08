@@ -101,6 +101,13 @@ impl SearchIntegration {
             return None;
         }
 
+        // Replay event history once, then reuse for all particle/action pairs.
+        // This avoids re-replaying O(particles * actions) times.
+        let replayed = simulator::replay_player_states(state).ok()?;
+
+        // Derive event-dependent midgame context once (not per particle).
+        let base = simulator::derive_midgame_context_base(state.event_history());
+
         // Round-robin rollouts: particle-first, action-second
         // Collect mean deltas for each action
         let mut action_sums: Vec<f64> = vec![0.0; actions.len()];
@@ -111,7 +118,9 @@ impl SearchIntegration {
                 // Use catch_unwind as a safety net: search rollouts can panic
                 // on edge-case board states, and we must not crash the arena.
                 let rollout = panic::catch_unwind(panic::AssertUnwindSafe(|| {
-                    simulator::simulate_particle_action(state, p, action)
+                    simulator::simulate_action_rollout_with_base(
+                        state, &replayed, p, action, &base,
+                    )
                 }));
                 if let Ok(Ok(result)) = rollout {
                     action_sums[ai] += f64::from(result.deltas[actor as usize]);
