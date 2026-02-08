@@ -79,6 +79,9 @@ pub struct BoardState {
     pub(crate) paos: [Option<u8>; 4],
 
     pub(crate) log: Vec<EventExt>,
+    /// When true, `add_log` and `add_log_no_meta` become no-ops.
+    /// Used during search rollouts where the event log is never read.
+    pub(crate) suppress_log: bool,
 
     // For oracle_obs only
     pub(crate) dora_indicators_full: Vec<Tile>,
@@ -173,6 +176,8 @@ impl Board {
             has_abortive_ryukyoku: false,
             kyoku_deltas: [0; 4],
             log: Vec::new(),
+            // Suppress logging during search rollouts (log is never read)
+            suppress_log: true,
             // Skip the first draw — a player already has tiles and can_act()
             midgame_start: true,
         }
@@ -299,11 +304,17 @@ impl BoardState {
 
     #[inline]
     fn add_log(&mut self, ev: EventExt) {
+        if self.suppress_log {
+            return;
+        }
         self.log.push(ev);
     }
 
     #[inline]
     fn add_log_no_meta(&mut self, ev: Event) {
+        if self.suppress_log {
+            return;
+        }
         self.log.push(EventExt::no_meta(ev));
     }
 

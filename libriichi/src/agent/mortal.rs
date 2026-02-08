@@ -118,13 +118,28 @@ impl SearchIntegration {
                 // Use catch_unwind as a safety net: search rollouts can panic
                 // on edge-case board states, and we must not crash the arena.
                 let rollout = panic::catch_unwind(panic::AssertUnwindSafe(|| {
-                    simulator::simulate_action_rollout_with_base(
-                        state, &replayed, p, action, &base,
+                    simulator::simulate_action_rollout_with_base_smart(
+                        state, &replayed, p, action, &base, &mut self.rng,
                     )
                 }));
-                if let Ok(Ok(result)) = rollout {
-                    action_sums[ai] += f64::from(result.deltas[actor as usize]);
-                    action_counts[ai] += 1;
+                match rollout {
+                    Ok(Ok(result)) => {
+                        action_sums[ai] += f64::from(result.deltas[actor as usize]);
+                        action_counts[ai] += 1;
+                    }
+                    Ok(Err(e)) => {
+                        // Rollout returned an error (non-panic failure)
+                        log::warn!("search rollout error: {e}");
+                    }
+                    Err(panic_info) => {
+                        // Rollout panicked — log it
+                        let msg = panic_info
+                            .downcast_ref::<String>()
+                            .map(String::as_str)
+                            .or_else(|| panic_info.downcast_ref::<&str>().copied())
+                            .unwrap_or("unknown panic");
+                        log::warn!("search rollout panic: {msg}");
+                    }
                 }
             }
         }

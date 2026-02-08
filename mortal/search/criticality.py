@@ -77,11 +77,10 @@ def compute_criticality(state, q_values=None, masks=None):
     # --- Factor 5: Score proximity (close placement battle) ---
     scores = state.scores()  # Relative: scores[0] = self
     our_score = scores[0]
-    opp_scores = sorted(scores[1:], reverse=True)
 
     # Check if we're in 2nd or 3rd and close to adjacent placement
     all_scores = sorted(scores, reverse=True)
-    our_rank = sorted(scores, reverse=True).index(our_score)  # 0 = 1st
+    our_rank = all_scores.index(our_score)  # 0 = 1st
 
     if our_rank in (1, 2):
         # Gap to player above us

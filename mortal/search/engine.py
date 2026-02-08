@@ -138,32 +138,23 @@ class SearchEngine:
         if len(candidates) <= 1:
             return candidates[0] if candidates else None
 
-        # Round-robin: cycle through actions one particle at a time.
-        # This ensures all actions get equal sample counts and avoids
-        # biasing earlier (higher q-value) actions with more samples.
+        # Use batch API: replays event history once, derives context once
         start = time.monotonic()
-        action_deltas: Dict[int, List[float]] = {a: [] for a in candidates}
 
-        for particle in particles:
-            elapsed = (time.monotonic() - start) * 1000
-            if elapsed > budget_ms:
-                break
+        results = self._search_module.evaluate_actions(state, particles, candidates)
 
-            for action in candidates:
+        # Convert results to action_deltas format
+        action_deltas: Dict[int, List[float]] = {}
+        for action, rollout_results in results.items():
+            deltas = []
+            for result in rollout_results:
                 try:
-                    result = self._search_module.simulate_action(
-                        state, particle, action
-                    )
                     delta = result.player_delta(player_id)
-                    action_deltas[action].append(float(delta))
+                    deltas.append(float(delta))
                 except Exception:
-                    # Individual simulation failures are not fatal
                     continue
-
-        # Filter out actions with no successful rollouts
-        action_deltas = {
-            a: deltas for a, deltas in action_deltas.items() if len(deltas) > 0
-        }
+            if deltas:
+                action_deltas[action] = deltas
 
         if len(action_deltas) == 0:
             log.warning("All per-action rollouts failed, falling back to policy")
