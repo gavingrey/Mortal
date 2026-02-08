@@ -3,6 +3,7 @@ use crate::mjai::Event;
 use crate::tile::Tile;
 
 use pyo3::prelude::*;
+use tinyvec::ArrayVec;
 
 #[pymethods]
 impl PlayerState {
@@ -252,6 +253,18 @@ impl PlayerState {
     #[must_use]
     pub const fn riichi_accepted(&self) -> [bool; 4] {
         self.riichi_accepted
+    }
+
+    #[inline]
+    #[must_use]
+    pub const fn forbidden_tiles(&self) -> [bool; 34] {
+        self.forbidden_tiles
+    }
+
+    #[inline]
+    #[must_use]
+    pub const fn kawa_overview(&self) -> &[ArrayVec<[Tile; 24]>; 4] {
+        &self.kawa_overview
     }
 
     /// The sequence of events processed during this kyoku.

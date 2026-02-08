@@ -22,8 +22,8 @@ pub struct Particle {
     /// Remaining wall tiles in draw order.
     pub wall: Vec<Tile>,
 
-    /// Unseen dead wall tiles (14 - num_revealed_dora_indicators).
-    /// Used by `build_board_from_particle` to construct the dead wall.
+    /// Unseen dead wall tiles (14 - num_revealed_dora_indicators - num_kans).
+    /// Used by `build_remaining_board` to construct the dead wall.
     pub dead_wall: Vec<Tile>,
 
     /// Importance weight for weighted sampling (Phase 1: uniform = 1.0).
@@ -206,7 +206,7 @@ pub fn generate_particles(
     state: &PlayerState,
     config: &ParticleConfig,
     rng: &mut ChaCha12Rng,
-) -> Result<Vec<Particle>> {
+) -> Result<(Vec<Particle>, usize)> {
     let visible = VisibleTiles::from_player_state(state);
     let hidden_tiles = visible.compute_hidden_tiles();
 
@@ -271,7 +271,7 @@ pub fn generate_particles(
         }
         let wall = shuffled[idx..wall_end].to_vec();
         // Remaining tiles are unseen dead wall tiles; save them in the
-        // particle so build_board_from_particle can use real tiles instead
+        // particle so build_remaining_board can use real tiles instead
         // of dummies (which can cause "fifth tile" panics).
         let dead_wall = shuffled[wall_end..].to_vec();
 
@@ -307,7 +307,7 @@ pub fn generate_particles(
         }
     }
 
-    Ok(particles)
+    Ok((particles, attempts))
 }
 
 /// Verify that a particle is consistent with the observed game state.
@@ -393,50 +393,8 @@ pub fn is_particle_consistent(particle: &Particle, state: &PlayerState) -> bool 
 mod test {
     use super::*;
     use crate::mjai::Event;
+    use crate::search::test_utils::setup_basic_game;
     use crate::tile::Tile;
-
-    fn setup_basic_game() -> PlayerState {
-        let mut state = PlayerState::new(0);
-
-        // Create a basic game start
-        let bakaze: Tile = "E".parse().unwrap();
-        let dora_marker: Tile = "1m".parse().unwrap();
-
-        let tehais = [
-            // Player 0's hand
-            [
-                "1m", "2m", "3m", "4m", "5m", "6m", "7m", "8m", "9m", "1p", "2p", "3p", "4p",
-            ]
-            .map(|s| s.parse::<Tile>().unwrap()),
-            // Player 1's hand (unknown to us, shown as ?)
-            ["?"; 13].map(|s| s.parse::<Tile>().unwrap()),
-            // Player 2's hand
-            ["?"; 13].map(|s| s.parse::<Tile>().unwrap()),
-            // Player 3's hand
-            ["?"; 13].map(|s| s.parse::<Tile>().unwrap()),
-        ];
-
-        let start_event = Event::StartKyoku {
-            bakaze,
-            dora_marker,
-            kyoku: 1,
-            honba: 0,
-            kyotaku: 0,
-            oya: 0,
-            scores: [25000; 4],
-            tehais,
-        };
-        state.update(&start_event).unwrap();
-
-        // First tsumo
-        let tsumo_event = Event::Tsumo {
-            actor: 0,
-            pai: "5p".parse().unwrap(),
-        };
-        state.update(&tsumo_event).unwrap();
-
-        state
-    }
 
     #[test]
     fn hidden_tiles_count() {
@@ -464,7 +422,7 @@ mod test {
         let config = ParticleConfig::new(50);
         let mut rng = ChaCha12Rng::seed_from_u64(42);
 
-        let particles = generate_particles(&state, &config, &mut rng).unwrap();
+        let (particles, _attempts) = generate_particles(&state, &config, &mut rng).unwrap();
         assert!(
             !particles.is_empty(),
             "should generate at least some particles"
@@ -482,7 +440,7 @@ mod test {
         let config = ParticleConfig::new(100);
         let mut rng = ChaCha12Rng::seed_from_u64(123);
 
-        let particles = generate_particles(&state, &config, &mut rng).unwrap();
+        let (particles, _attempts) = generate_particles(&state, &config, &mut rng).unwrap();
         for (i, particle) in particles.iter().enumerate() {
             assert!(
                 is_particle_consistent(particle, &state),
@@ -497,7 +455,7 @@ mod test {
         let config = ParticleConfig::new(50);
         let mut rng = ChaCha12Rng::seed_from_u64(99);
 
-        let particles = generate_particles(&state, &config, &mut rng).unwrap();
+        let (particles, _attempts) = generate_particles(&state, &config, &mut rng).unwrap();
         if !particles.is_empty() {
             let total: f32 = particles.iter().map(|p| p.weight).sum();
             assert!(
@@ -514,7 +472,7 @@ mod test {
         let config = ParticleConfig::new(50);
         let mut rng = ChaCha12Rng::seed_from_u64(77);
 
-        let particles = generate_particles(&state, &config, &mut rng).unwrap();
+        let (particles, _attempts) = generate_particles(&state, &config, &mut rng).unwrap();
 
         for particle in &particles {
             // Collect all particle tiles into counts
@@ -541,13 +499,158 @@ mod test {
     }
 
     #[test]
+    fn all_aka_visible_particles() {
+        // Test particle generation when all 3 aka dora are visible.
+        // 5mr in our hand, 5pr in an opponent's discard, 5sr in another's discard.
+        // The hidden pool should have no aka tiles.
+        let mut state = PlayerState::new(0);
+
+        let bakaze: Tile = "E".parse().unwrap();
+        let dora_marker: Tile = "1s".parse().unwrap();
+
+        // Our hand has 5mr (aka 5m)
+        let tehais = [
+            [
+                "5mr", "1m", "2m", "3m", "6m", "7m", "8m", "1p", "2p", "3p", "1s", "2s", "3s",
+            ]
+            .map(|s| s.parse::<Tile>().unwrap()),
+            ["?"; 13].map(|s| s.parse::<Tile>().unwrap()),
+            ["?"; 13].map(|s| s.parse::<Tile>().unwrap()),
+            ["?"; 13].map(|s| s.parse::<Tile>().unwrap()),
+        ];
+
+        let start_event = Event::StartKyoku {
+            bakaze,
+            dora_marker,
+            kyoku: 1,
+            honba: 0,
+            kyotaku: 0,
+            oya: 0,
+            scores: [25000; 4],
+            tehais,
+        };
+        state.update(&start_event).unwrap();
+
+        // Oya tsumo
+        state
+            .update(&Event::Tsumo {
+                actor: 0,
+                pai: "9m".parse().unwrap(),
+            })
+            .unwrap();
+        // Oya discards 9m
+        state
+            .update(&Event::Dahai {
+                actor: 0,
+                pai: "9m".parse().unwrap(),
+                tsumogiri: true,
+            })
+            .unwrap();
+
+        // Player 1 draws and discards 5pr (aka 5p)
+        state
+            .update(&Event::Tsumo {
+                actor: 1,
+                pai: "?".parse().unwrap(),
+            })
+            .unwrap();
+        state
+            .update(&Event::Dahai {
+                actor: 1,
+                pai: "5pr".parse().unwrap(),
+                tsumogiri: false,
+            })
+            .unwrap();
+
+        // Player 2 draws and discards 5sr (aka 5s)
+        state
+            .update(&Event::Tsumo {
+                actor: 2,
+                pai: "?".parse().unwrap(),
+            })
+            .unwrap();
+        state
+            .update(&Event::Dahai {
+                actor: 2,
+                pai: "5sr".parse().unwrap(),
+                tsumogiri: false,
+            })
+            .unwrap();
+
+        // Player 3 draws and discards something normal
+        state
+            .update(&Event::Tsumo {
+                actor: 3,
+                pai: "?".parse().unwrap(),
+            })
+            .unwrap();
+        state
+            .update(&Event::Dahai {
+                actor: 3,
+                pai: "N".parse().unwrap(),
+                tsumogiri: false,
+            })
+            .unwrap();
+
+        // Our turn again: draw
+        state
+            .update(&Event::Tsumo {
+                actor: 0,
+                pai: "4s".parse().unwrap(),
+            })
+            .unwrap();
+
+        // Verify all 3 aka are seen
+        let visible = VisibleTiles::from_player_state(&state);
+        assert!(visible.akas_seen[0], "5mr should be seen (in our hand)");
+        assert!(visible.akas_seen[1], "5pr should be seen (discarded by p1)");
+        assert!(visible.akas_seen[2], "5sr should be seen (discarded by p2)");
+
+        // Generate particles
+        let config = ParticleConfig::new(50);
+        let mut rng = ChaCha12Rng::seed_from_u64(42);
+        let (particles, _attempts) = generate_particles(&state, &config, &mut rng).unwrap();
+        assert!(!particles.is_empty(), "should generate particles");
+
+        // Verify no particle contains any aka dora
+        for (pi, particle) in particles.iter().enumerate() {
+            for hand in &particle.opponent_hands {
+                for &tile in hand {
+                    assert!(
+                        !tile.is_aka(),
+                        "particle {pi}: opponent hand contains aka tile {tile}",
+                    );
+                }
+            }
+            for &tile in &particle.wall {
+                assert!(
+                    !tile.is_aka(),
+                    "particle {pi}: wall contains aka tile {tile}",
+                );
+            }
+            for &tile in &particle.dead_wall {
+                assert!(
+                    !tile.is_aka(),
+                    "particle {pi}: dead wall contains aka tile {tile}",
+                );
+            }
+
+            // Also verify consistency
+            assert!(
+                is_particle_consistent(particle, &state),
+                "particle {pi} is inconsistent",
+            );
+        }
+    }
+
+    #[test]
     fn particle_coverage() {
         // Ensure that across many particles, all hidden tile types appear
         let state = setup_basic_game();
         let config = ParticleConfig::new(200);
         let mut rng = ChaCha12Rng::seed_from_u64(555);
 
-        let particles = generate_particles(&state, &config, &mut rng).unwrap();
+        let (particles, _attempts) = generate_particles(&state, &config, &mut rng).unwrap();
         let visible = VisibleTiles::from_player_state(&state);
 
         let mut tile_appeared = [false; 34];
@@ -570,6 +673,84 @@ mod test {
                     "tile type {tid} has hidden copies but never appeared in particles"
                 );
             }
+        }
+    }
+
+    // ---- Negative tests for is_particle_consistent ----
+
+    #[test]
+    fn inconsistent_particle_wrong_total() {
+        let state = setup_basic_game();
+        let config = ParticleConfig::new(1);
+        let mut rng = ChaCha12Rng::seed_from_u64(42);
+        let (particles, _attempts) = generate_particles(&state, &config, &mut rng).unwrap();
+        let mut bad = particles[0].clone();
+        // Add an extra tile to the wall, breaking the total count
+        bad.wall.push(must_tile!(0_u8)); // extra 1m
+        assert!(
+            !is_particle_consistent(&bad, &state),
+            "should fail with extra tile in wall"
+        );
+    }
+
+    #[test]
+    fn inconsistent_particle_duplicate_aka() {
+        let state = setup_basic_game();
+        let config = ParticleConfig::new(1);
+        let mut rng = ChaCha12Rng::seed_from_u64(42);
+        let (particles, _attempts) = generate_particles(&state, &config, &mut rng).unwrap();
+        let mut bad = particles[0].clone();
+        // Force duplicate aka: put 5mr in two different opponent hands.
+        // First, ensure both hands have at least 1 tile we can replace.
+        if bad.opponent_hands[0].is_empty() || bad.opponent_hands[1].is_empty() {
+            return; // skip if degenerate particle
+        }
+        bad.opponent_hands[0][0] = must_tile!(tu8!(5mr));
+        bad.opponent_hands[1][0] = must_tile!(tu8!(5mr));
+        assert!(
+            !is_particle_consistent(&bad, &state),
+            "should fail with duplicate aka dora"
+        );
+    }
+
+    #[test]
+    fn inconsistent_particle_wrong_hand_size() {
+        let state = setup_basic_game();
+        let config = ParticleConfig::new(1);
+        let mut rng = ChaCha12Rng::seed_from_u64(42);
+        let (particles, _attempts) = generate_particles(&state, &config, &mut rng).unwrap();
+        let mut bad = particles[0].clone();
+        // Remove a tile from opponent 0's hand, making it the wrong size
+        if !bad.opponent_hands[0].is_empty() {
+            bad.opponent_hands[0].pop();
+            assert!(
+                !is_particle_consistent(&bad, &state),
+                "should fail with wrong opponent hand size"
+            );
+        }
+    }
+
+    #[test]
+    fn inconsistent_particle_overcount_tile() {
+        // Player 0's hand has 1m (tiles_seen includes it). Dora indicator is
+        // also 1m (seen again). So tiles_seen for 1m = 2, meaning only 2
+        // copies of 1m are hidden. Force 3 copies of 1m into the particle.
+        let state = setup_basic_game();
+        let config = ParticleConfig::new(1);
+        let mut rng = ChaCha12Rng::seed_from_u64(42);
+        let (particles, _attempts) = generate_particles(&state, &config, &mut rng).unwrap();
+        let mut bad = particles[0].clone();
+        // Replace first 3 tiles in opponent 0's hand with 1m.
+        // tiles_seen[0] == 2 (hand + dora), so available = 4 - 2 = 2.
+        // Putting 3 copies of 1m exceeds the available count.
+        if bad.opponent_hands[0].len() >= 3 {
+            bad.opponent_hands[0][0] = must_tile!(0_u8); // 1m
+            bad.opponent_hands[0][1] = must_tile!(0_u8); // 1m
+            bad.opponent_hands[0][2] = must_tile!(0_u8); // 1m
+            assert!(
+                !is_particle_consistent(&bad, &state),
+                "should fail with too many copies of 1m"
+            );
         }
     }
 }

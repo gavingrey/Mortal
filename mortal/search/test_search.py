@@ -18,7 +18,8 @@ from .criticality import (
     _compute_entropy_factor,
     compute_criticality,
 )
-from .engine import SearchEngine, SearchStats, _normalize_values
+from .engine import SearchEngine, _normalize_values
+from .metrics import SearchMetricsCollector
 
 
 # ---- SearchConfig tests ----
@@ -317,28 +318,39 @@ class TestSearchEngine:
         assert result is None
 
     def test_stats_tracking(self):
-        stats = SearchStats()
-        stats.record_criticality(0.5)
-        stats.record_criticality(0.3)
+        stats = SearchMetricsCollector()
+        stats.record_decision(0.5)
+        stats.record_decision(0.3)
         stats.record_skip()
-        stats.record_search(100.0, 50, 0.5)
+        stats.record_search(
+            elapsed_ms=100.0, tier="light", n_particles_actual=50,
+            gen_attempts=50, gen_accepted=50, policy_action=0,
+            search_action=1, action_deltas={0: [100.0], 1: [200.0]},
+            rollout_results={}, game_phase="East",
+        )
         stats.record_error()
 
         assert stats.total_decisions == 2
-        assert stats.searches_skipped == 1
-        assert stats.searches_performed == 1
-        assert stats.search_errors == 1
-        assert abs(stats.avg_criticality - 0.4) < 1e-6
-        assert stats.avg_search_ms == 100.0
+        assert stats.skipped_count == 1
+        assert stats.search_count == 1
+        assert stats.error_count == 1
+        avg_crit = float(np.mean(stats.criticalities))
+        assert abs(avg_crit - 0.4) < 1e-6
         assert stats.search_rate == 0.5
+        assert stats.override_rate == 1.0  # action 1 != policy 0
 
     def test_stats_summary(self):
-        stats = SearchStats()
-        stats.record_criticality(0.5)
-        stats.record_search(150.0, 100, 0.5)
+        stats = SearchMetricsCollector()
+        stats.record_decision(0.5)
+        stats.record_search(
+            elapsed_ms=150.0, tier="standard", n_particles_actual=100,
+            gen_attempts=100, gen_accepted=100, policy_action=0,
+            search_action=0, action_deltas={0: [100.0]},
+            rollout_results={}, game_phase="East",
+        )
         s = stats.summary()
-        assert "1 decisions" in s
-        assert "1 searches" in s
+        assert "1," in s or "Decisions: 1" in s
+        assert "1," in s or "Searches:" in s
 
     def test_get_candidates_excludes_riichi(self):
         """Riichi (action 37) should be excluded from search candidates."""

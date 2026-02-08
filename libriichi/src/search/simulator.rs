@@ -10,6 +10,7 @@ use super::particle::Particle;
 
 use anyhow::{Context, Result, bail, ensure};
 use pyo3::prelude::*;
+use rand_chacha::ChaCha12Rng;
 use std::array;
 
 /// Result of a single rollout simulation.
@@ -31,6 +32,10 @@ pub struct RolloutResult {
     /// Whether the kyoku ended with an abortive draw.
     #[pyo3(get)]
     pub has_abortive_ryukyoku: bool,
+
+    /// Number of poll iterations (game steps) in the rollout.
+    #[pyo3(get)]
+    pub steps: u32,
 }
 
 #[pymethods]
@@ -47,8 +52,8 @@ impl RolloutResult {
 
     fn __repr__(&self) -> String {
         format!(
-            "RolloutResult(scores={:?}, deltas={:?}, hora={}, abort={})",
-            self.scores, self.deltas, self.has_hora, self.has_abortive_ryukyoku,
+            "RolloutResult(scores={:?}, deltas={:?}, hora={}, abort={}, steps={})",
+            self.scores, self.deltas, self.has_hora, self.has_abortive_ryukyoku, self.steps,
         )
     }
 }
@@ -550,193 +555,6 @@ pub fn build_midgame_board_state(
     build_midgame_board_state_from_replayed(state, &replayed, particle)
 }
 
-/// Fix unknown ("?") tiles in events for replay through fresh PlayerStates.
-///
-/// During the actual game, opponent tehais in StartKyoku and opponent Tsumo
-/// events contain "?" tiles. These cause `witness_tile` to fail when replayed
-/// through a PlayerState that needs real tiles.
-///
-/// For StartKyoku: replace "?" opponent hands with dummy valid tiles.
-/// Legacy function kept for backward compatibility with existing tests.
-///
-/// Construct a Board from the current game state and a particle sample.
-/// This builds a fresh-start Board (not mid-game). The new
-/// `build_midgame_board_state` should be preferred for search rollouts.
-#[deprecated(
-    since = "0.2.0",
-    note = "Use build_midgame_board_state or build_remaining_board instead. \
-            This function builds a full 70-tile yama which is only valid at game start."
-)]
-pub fn build_board_from_particle(
-    state: &PlayerState,
-    particle: &Particle,
-) -> Result<Board> {
-    let player_id = state.player_id();
-
-    let bakaze = state.bakaze();
-    let kyoku = (bakaze.as_u8() - crate::tu8!(E)) * 4 + state.kyoku();
-
-    let rel_scores = state.scores();
-    let mut abs_scores = [0_i32; 4];
-    for i in 0..4 {
-        abs_scores[(player_id as usize + i) % 4] = rel_scores[i];
-    }
-
-    let mut haipai = [[Tile::default(); 13]; 4];
-
-    let tehai = state.tehai();
-    let akas = state.akas_in_hand();
-    let mut our_tiles = Vec::with_capacity(14);
-    for (tid, &count) in tehai.iter().enumerate() {
-        if count == 0 {
-            continue;
-        }
-        let aka_idx = match tid {
-            x if x == crate::tuz!(5m) => Some(0),
-            x if x == crate::tuz!(5p) => Some(1),
-            x if x == crate::tuz!(5s) => Some(2),
-            _ => None,
-        };
-        if let Some(ai) = aka_idx {
-            if akas[ai] {
-                our_tiles.push(must_tile!(tu8!(5mr) + ai as u8));
-                for _ in 0..count - 1 {
-                    our_tiles.push(must_tile!(tid));
-                }
-            } else {
-                for _ in 0..count {
-                    our_tiles.push(must_tile!(tid));
-                }
-            }
-        } else {
-            for _ in 0..count {
-                our_tiles.push(must_tile!(tid));
-            }
-        }
-    }
-
-    let our_tsumo_tile = if our_tiles.len() > 13 {
-        Some(our_tiles.pop().unwrap())
-    } else {
-        None
-    };
-
-    ensure!(
-        our_tiles.len() == 13,
-        "expected 13 tiles for our haipai, got {}",
-        our_tiles.len(),
-    );
-    haipai[player_id as usize].copy_from_slice(&our_tiles);
-
-    let tiles_seen = state.tiles_seen();
-    let mut consumed_counts = [0_u8; 34];
-    for (tid, count) in consumed_counts.iter_mut().enumerate() {
-        *count = tiles_seen[tid].saturating_sub(tehai[tid]);
-    }
-
-    let revealed_dora = state.dora_indicators();
-    for &dora_tile in revealed_dora {
-        let tid = dora_tile.deaka().as_usize();
-        consumed_counts[tid] = consumed_counts[tid].saturating_sub(1);
-    }
-
-    let mut consumed_tiles: Vec<Tile> = Vec::new();
-    for (tid, &count) in consumed_counts.iter().enumerate() {
-        for _ in 0..count {
-            consumed_tiles.push(must_tile!(tid));
-        }
-    }
-
-    let mut consumed_idx = 0;
-    for opp in 0..3 {
-        let abs_seat = (player_id as usize + opp + 1) % 4;
-        let hand = &particle.opponent_hands[opp];
-
-        if hand.len() >= 13 {
-            haipai[abs_seat].copy_from_slice(&hand[..13]);
-        } else {
-            for (i, &tile) in hand.iter().enumerate() {
-                haipai[abs_seat][i] = tile;
-            }
-            for slot in &mut haipai[abs_seat][hand.len()..13] {
-                if consumed_idx < consumed_tiles.len() {
-                    *slot = consumed_tiles[consumed_idx];
-                    consumed_idx += 1;
-                } else {
-                    *slot = must_tile!(0_u8);
-                }
-            }
-        }
-    }
-
-    let oya = (kyoku % 4) as usize;
-    let our_offset = (player_id as usize + 4 - oya) % 4;
-
-    let tiles_in_particle = particle.wall.len();
-    let tiles_with_tsumo = tiles_in_particle + our_tsumo_tile.is_some() as usize;
-    let yama_padding_needed = 70_usize.saturating_sub(tiles_with_tsumo);
-
-    let mut yama = Vec::with_capacity(70);
-    yama.extend(particle.wall.iter().copied().rev());
-
-    let yama_padding_available = consumed_tiles.len() - consumed_idx;
-    let yama_padding_count = yama_padding_needed.min(yama_padding_available);
-    yama.extend(consumed_tiles[consumed_idx..consumed_idx + yama_padding_count].iter().copied());
-
-    if let Some(tile) = our_tsumo_tile {
-        let insert_idx = yama.len() - our_offset;
-        yama.insert(insert_idx, tile);
-    }
-
-    ensure!(
-        yama.len() == 70,
-        "yama should have 70 tiles, got {} (wall={}, tsumo={}, padding={}/{})",
-        yama.len(),
-        tiles_in_particle,
-        our_tsumo_tile.is_some() as usize,
-        yama_padding_count,
-        yama_padding_needed,
-    );
-
-    let num_revealed = revealed_dora.len();
-    let unseen = &particle.dead_wall;
-    let unrevealed_dora_count = 5 - num_revealed;
-    let fallback = must_tile!(0_u8);
-
-    let mut dora_indicators = Vec::with_capacity(5);
-    dora_indicators.extend_from_slice(revealed_dora);
-    for i in 0..unrevealed_dora_count {
-        dora_indicators.push(unseen.get(i).copied().unwrap_or(fallback));
-    }
-
-    let mut rinshan = Vec::with_capacity(4);
-    for i in 0..4 {
-        rinshan.push(unseen.get(unrevealed_dora_count + i).copied().unwrap_or(fallback));
-    }
-
-    let mut ura_indicators = Vec::with_capacity(5);
-    for i in 0..5 {
-        ura_indicators.push(
-            unseen
-                .get(unrevealed_dora_count + 4 + i)
-                .copied()
-                .unwrap_or(fallback),
-        );
-    }
-
-    Ok(Board {
-        kyoku,
-        honba: state.honba(),
-        kyotaku: state.kyotaku(),
-        scores: abs_scores,
-        haipai,
-        yama,
-        rinshan,
-        dora_indicators,
-        ura_indicators,
-    })
-}
-
 /// Convert an action index (0-45) to a concrete game event.
 ///
 /// This mirrors the logic in `mortal.rs` `get_reaction()` but is standalone,
@@ -1009,13 +827,24 @@ pub fn default_reaction(seat: u8, state: &PlayerState) -> Event {
                 tsumogiri: true,
             };
         }
-        // Post-chi/pon: no tsumo tile, pick first available from hand
+        // Post-chi/pon: no tsumo tile, pick first available non-forbidden from hand
+        let tehai = state.tehai();
+        for (i, &count) in tehai.iter().enumerate() {
+            if count > 0 && !state.forbidden_tiles()[i] {
+                return Event::Dahai {
+                    actor: seat,
+                    pai: super::heuristic::resolve_aka(must_tile!(i as u8), state),
+                    tsumogiri: false,
+                };
+            }
+        }
+        // Fallback without kuikae check (shouldn't happen, but be defensive)
         let tehai = state.tehai();
         for (i, &count) in tehai.iter().enumerate() {
             if count > 0 {
                 return Event::Dahai {
                     actor: seat,
-                    pai: must_tile!(i),
+                    pai: super::heuristic::resolve_aka(must_tile!(i as u8), state),
                     tsumogiri: false,
                 };
             }
@@ -1037,13 +866,16 @@ fn run_rollout(
     initial_scores: [i32; 4],
     inject_player: Option<u8>,
     inject_action: Option<usize>,
+    mut smart_rng: Option<&mut ChaCha12Rng>,
 ) -> Result<RolloutResult> {
     let mut reactions: [EventExt; 4] = Default::default();
     let mut action_injected = inject_action.is_none(); // already "injected" if None
+    let mut steps = 0_u32;
 
     loop {
         match board_state.poll(reactions)? {
             Poll::InGame => {
+                steps += 1;
                 reactions = Default::default();
                 let ctx = board_state.agent_context();
 
@@ -1082,8 +914,14 @@ fn run_rollout(
                         } else {
                             // Not the right decision point yet (e.g., we got
                             // a can_discard but our action is chi). Use default.
-                            default_reaction(seat as u8, ps)
+                            if let Some(ref mut rng) = smart_rng {
+                                super::heuristic::smart_reaction(seat as u8, ps, rng)
+                            } else {
+                                default_reaction(seat as u8, ps)
+                            }
                         }
+                    } else if let Some(ref mut rng) = smart_rng {
+                        super::heuristic::smart_reaction(seat as u8, ps, rng)
                     } else {
                         default_reaction(seat as u8, ps)
                     };
@@ -1103,6 +941,7 @@ fn run_rollout(
                     deltas,
                     has_hora: result.has_hora,
                     has_abortive_ryukyoku: result.has_abortive_ryukyoku,
+                    steps,
                 });
             }
         }
@@ -1119,7 +958,7 @@ pub fn simulate_action_rollout(
     let player_id = state.player_id();
     let board_state = build_midgame_board_state(state, particle)?;
     let initial_scores = board_state.board.scores;
-    run_rollout(board_state, initial_scores, Some(player_id), Some(action))
+    run_rollout(board_state, initial_scores, Some(player_id), Some(action), None)
 }
 
 /// Run a rollout with a specific action, using pre-replayed PlayerStates.
@@ -1136,7 +975,7 @@ pub fn simulate_action_rollout_from_replayed(
     let player_id = state.player_id();
     let board_state = build_midgame_board_state_from_replayed(state, replayed, particle)?;
     let initial_scores = board_state.board.scores;
-    run_rollout(board_state, initial_scores, Some(player_id), Some(action))
+    run_rollout(board_state, initial_scores, Some(player_id), Some(action), None)
 }
 
 /// Run a rollout with a specific action, using pre-replayed PlayerStates
@@ -1155,17 +994,7 @@ pub fn simulate_action_rollout_with_base(
     let player_id = state.player_id();
     let board_state = build_midgame_board_state_with_base(state, replayed, particle, base)?;
     let initial_scores = board_state.board.scores;
-    run_rollout(board_state, initial_scores, Some(player_id), Some(action))
-}
-
-/// Convenience function: build a board from state + particle, then simulate
-/// with a specific action injected for our player.
-pub fn simulate_particle_action(
-    state: &PlayerState,
-    particle: &Particle,
-    action: usize,
-) -> Result<RolloutResult> {
-    simulate_action_rollout(state, particle, action)
+    run_rollout(board_state, initial_scores, Some(player_id), Some(action), None)
 }
 
 /// Run a tsumogiri rollout on a pre-built BoardState.
@@ -1175,7 +1004,7 @@ pub fn run_rollout_tsumogiri(
     board_state: BoardState,
     initial_scores: [i32; 4],
 ) -> Result<RolloutResult> {
-    run_rollout(board_state, initial_scores, None, None)
+    run_rollout(board_state, initial_scores, None, None, None)
 }
 
 /// Run a tsumogiri rollout: all players always discard their drawn tile.
@@ -1195,7 +1024,37 @@ pub fn simulate_particle(
 ) -> Result<RolloutResult> {
     let board_state = build_midgame_board_state(state, particle)?;
     let initial_scores = board_state.board.scores;
-    run_rollout(board_state, initial_scores, None, None)
+    run_rollout(board_state, initial_scores, None, None, None)
+}
+
+/// Run a smart-heuristic rollout on a pre-built BoardState.
+///
+/// All players use the `smart_reaction` heuristic policy (shanten-based
+/// discard with ukeire and safety scoring) instead of tsumogiri.
+pub fn run_rollout_smart(
+    board_state: BoardState,
+    initial_scores: [i32; 4],
+    rng: &mut ChaCha12Rng,
+) -> Result<RolloutResult> {
+    run_rollout(board_state, initial_scores, None, None, Some(rng))
+}
+
+/// Simulate a single particle rollout with a specific action and smart heuristic.
+///
+/// The action is injected at the first matching decision point, then all
+/// subsequent decisions use the smart heuristic policy.
+pub fn simulate_action_rollout_with_base_smart(
+    state: &PlayerState,
+    replayed: &[PlayerState; 4],
+    particle: &Particle,
+    action: usize,
+    base: &MidgameContextBase,
+    rng: &mut ChaCha12Rng,
+) -> Result<RolloutResult> {
+    let player_id = state.player_id();
+    let board_state = build_midgame_board_state_with_base(state, replayed, particle, base)?;
+    let initial_scores = board_state.board.scores;
+    run_rollout(board_state, initial_scores, Some(player_id), Some(action), Some(rng))
 }
 
 #[cfg(test)]
@@ -1203,68 +1062,28 @@ mod test {
     use super::*;
     use crate::search::config::ParticleConfig;
     use crate::search::particle::generate_particles;
+    use crate::search::test_utils::setup_basic_game;
     use rand::SeedableRng;
     use rand_chacha::ChaCha12Rng;
 
-    fn setup_basic_game() -> PlayerState {
-        let mut state = PlayerState::new(0);
-        state.set_record_events(true);
-
-        let bakaze: Tile = "E".parse().unwrap();
-        let dora_marker: Tile = "1m".parse().unwrap();
-
-        let tehais = [
-            [
-                "1m", "2m", "3m", "4m", "5m", "6m", "7m", "8m", "9m", "1p", "2p", "3p", "4p",
-            ]
-            .map(|s| s.parse::<Tile>().unwrap()),
-            ["?"; 13].map(|s| s.parse::<Tile>().unwrap()),
-            ["?"; 13].map(|s| s.parse::<Tile>().unwrap()),
-            ["?"; 13].map(|s| s.parse::<Tile>().unwrap()),
-        ];
-
-        let start_event = Event::StartKyoku {
-            bakaze,
-            dora_marker,
-            kyoku: 1,
-            honba: 0,
-            kyotaku: 0,
-            oya: 0,
-            scores: [25000; 4],
-            tehais,
-        };
-        state.update(&start_event).unwrap();
-
-        // First tsumo
-        let tsumo_event = Event::Tsumo {
-            actor: 0,
-            pai: "5p".parse().unwrap(),
-        };
-        state.update(&tsumo_event).unwrap();
-
-        state
-    }
-
     #[test]
-    #[allow(deprecated)]
     fn build_board_basic() {
         let state = setup_basic_game();
         let config = ParticleConfig::new(1);
         let mut rng = ChaCha12Rng::seed_from_u64(42);
 
-        let particles = generate_particles(&state, &config, &mut rng).unwrap();
+        let (particles, _attempts) = generate_particles(&state, &config, &mut rng).unwrap();
         assert!(!particles.is_empty());
 
-        let board = build_board_from_particle(&state, &particles[0]).unwrap();
+        let bs = build_midgame_board_state(&state, &particles[0]).unwrap();
 
         // Board should have correct metadata
-        assert_eq!(board.kyoku, 0); // kyoku is 0-indexed
-        assert_eq!(board.honba, 0);
-        assert_eq!(board.scores, [25000; 4]);
+        assert_eq!(bs.board.kyoku, 0); // kyoku is 0-indexed
+        assert_eq!(bs.board.honba, 0);
+        assert_eq!(bs.board.scores, [25000; 4]);
 
-        // Our haipai should have 13 tiles (the 14th is in yama)
-        // Yama should have wall tiles + our tsumo tile
-        assert!(board.yama.len() >= 1); // At least our tsumo tile
+        // Yama should have wall tiles
+        assert!(bs.board.yama.len() >= 1);
     }
 
     #[test]
@@ -1273,7 +1092,7 @@ mod test {
         let config = ParticleConfig::new(5);
         let mut rng = ChaCha12Rng::seed_from_u64(42);
 
-        let particles = generate_particles(&state, &config, &mut rng).unwrap();
+        let (particles, _attempts) = generate_particles(&state, &config, &mut rng).unwrap();
         assert!(!particles.is_empty());
 
         // Simulate each particle
@@ -1302,7 +1121,7 @@ mod test {
         let config = ParticleConfig::new(20);
         let mut rng = ChaCha12Rng::seed_from_u64(123);
 
-        let particles = generate_particles(&state, &config, &mut rng).unwrap();
+        let (particles, _attempts) = generate_particles(&state, &config, &mut rng).unwrap();
 
         let mut results: Vec<RolloutResult> = Vec::new();
         for particle in &particles {
@@ -1395,32 +1214,33 @@ mod test {
     }
 
     #[test]
-    #[allow(deprecated)]
     fn build_board_non_oya() {
-        // Verify that the tsumo tile is correctly placed in yama
-        // for a non-oya player (player_id=2, oya=0).
+        // Verify that mid-game board state works correctly for non-oya
+        // player (player_id=2, oya=0).
         let state = setup_non_oya_game();
         let config = ParticleConfig::new(5);
         let mut rng = ChaCha12Rng::seed_from_u64(42);
 
-        let particles = generate_particles(&state, &config, &mut rng).unwrap();
+        let (particles, _attempts) = generate_particles(&state, &config, &mut rng).unwrap();
         assert!(!particles.is_empty());
 
-        let board = build_board_from_particle(&state, &particles[0]).unwrap();
+        let bs = build_midgame_board_state(&state, &particles[0]).unwrap();
 
-        // oya = kyoku % 4 = 0. Our player is seat 2, offset k=2.
-        // The tsumo tile should be the 3rd pop (0-indexed: 2nd) from yama.
-        // Verify that the first pop (for oya) is NOT our tsumo tile "S".
-        let tsumo_tile: Tile = "S".parse().unwrap();
-        let yama_len = board.yama.len();
+        // Verify kyoku and scores
+        assert_eq!(bs.board.kyoku, 0); // East 1
+        assert_eq!(bs.board.scores, [25000; 4]);
 
-        // The tile at the end of yama (first pop, for oya) should not be S
-        // unless it happens to be a wall tile.
-        // More importantly, the tile at position yama_len-1-2 should be S.
+        // Player 2 should have a tsumo tile and be able to discard
+        assert!(
+            bs.player_states[2].last_cans().can_discard,
+            "player 2 should be able to discard after midgame reconstruction"
+        );
+
+        // Yama should match tiles_left from state
         assert_eq!(
-            board.yama[yama_len - 1 - 2],
-            tsumo_tile,
-            "tsumo tile should be at offset 2 from end (3rd pop, for seat 2)"
+            bs.board.yama.len(),
+            state.tiles_left() as usize,
+            "yama length should match tiles_left"
         );
     }
 
@@ -1431,7 +1251,7 @@ mod test {
         let config = ParticleConfig::new(5);
         let mut rng = ChaCha12Rng::seed_from_u64(42);
 
-        let particles = generate_particles(&state, &config, &mut rng).unwrap();
+        let (particles, _attempts) = generate_particles(&state, &config, &mut rng).unwrap();
         assert!(!particles.is_empty());
 
         for (i, particle) in particles.iter().enumerate() {
@@ -1458,6 +1278,7 @@ mod test {
             deltas: [1000, 0, -1000, 0],
             has_hora: false,
             has_abortive_ryukyoku: false,
+            steps: 0,
         };
         assert_eq!(result.player_delta(0).unwrap(), 1000);
         assert_eq!(result.player_delta(2).unwrap(), -1000);
@@ -1578,6 +1399,279 @@ mod test {
         }
     }
 
+    // ---- Tests for action_to_event: chi/pon/kan (actions 38-42) ----
+
+    /// Helper: set up player 0 (oya) state, play through one full round so
+    /// player 3 discards `target_tile`, enabling chi for player 0.
+    /// Player 0's hand must contain tiles for the desired chi type.
+    fn setup_for_chi(our_hand: [&str; 13], target_tile: &str) -> PlayerState {
+        let mut state = PlayerState::new(0);
+        state.set_record_events(true);
+
+        let bakaze: Tile = "E".parse().unwrap();
+        let dora_marker: Tile = "9s".parse().unwrap();
+
+        let tehais = [
+            our_hand.map(|s| s.parse::<Tile>().unwrap()),
+            ["?"; 13].map(|s| s.parse::<Tile>().unwrap()),
+            ["?"; 13].map(|s| s.parse::<Tile>().unwrap()),
+            ["?"; 13].map(|s| s.parse::<Tile>().unwrap()),
+        ];
+
+        state
+            .update(&Event::StartKyoku {
+                bakaze,
+                dora_marker,
+                kyoku: 1,
+                honba: 0,
+                kyotaku: 0,
+                oya: 0,
+                scores: [25000; 4],
+                tehais,
+            })
+            .unwrap();
+
+        // Player 0 (oya) draws and discards N
+        state.update(&Event::Tsumo { actor: 0, pai: "N".parse().unwrap() }).unwrap();
+        state.update(&Event::Dahai { actor: 0, pai: "N".parse().unwrap(), tsumogiri: true }).unwrap();
+
+        // Player 1 draws and discards W
+        state.update(&Event::Tsumo { actor: 1, pai: "?".parse().unwrap() }).unwrap();
+        state.update(&Event::Dahai { actor: 1, pai: "W".parse().unwrap(), tsumogiri: true }).unwrap();
+
+        // Player 2 draws and discards F
+        state.update(&Event::Tsumo { actor: 2, pai: "?".parse().unwrap() }).unwrap();
+        state.update(&Event::Dahai { actor: 2, pai: "F".parse().unwrap(), tsumogiri: true }).unwrap();
+
+        // Player 3 draws and discards the target tile (chi trigger)
+        state.update(&Event::Tsumo { actor: 3, pai: "?".parse().unwrap() }).unwrap();
+        state.update(&Event::Dahai {
+            actor: 3,
+            pai: target_tile.parse().unwrap(),
+            tsumogiri: false,
+        }).unwrap();
+
+        state
+    }
+
+    #[test]
+    fn action_to_event_chi_low() {
+        // Chi low: called tile is the lowest. E.g., 3 discards 1s, we have 2s+3s.
+        // Sequence: 1s(called)-2s-3s. consumed = [2s, 3s].
+        let state = setup_for_chi(
+            ["2s", "3s", "5m", "6m", "7m", "1p", "2p", "3p", "4p", "5p", "6p", "7p", "8p"],
+            "1s",
+        );
+
+        let cans = state.last_cans();
+        assert!(cans.can_chi_low, "test setup: expected can_chi_low");
+
+        let ev = action_to_event(38, 0, &state).unwrap();
+        match ev {
+            Event::Chi {
+                actor,
+                target,
+                pai,
+                consumed,
+            } => {
+                assert_eq!(actor, 0);
+                assert_eq!(target, cans.target_actor);
+                assert_eq!(pai, "1s".parse::<Tile>().unwrap());
+                // consumed should be [2s, 3s]
+                assert_eq!(consumed[0].deaka(), "2s".parse::<Tile>().unwrap());
+                assert_eq!(consumed[1].deaka(), "3s".parse::<Tile>().unwrap());
+            }
+            _ => panic!("expected Chi, got {ev:?}"),
+        }
+    }
+
+    #[test]
+    fn action_to_event_chi_mid() {
+        // Chi mid: called tile is the middle. E.g., 3 discards 5p, we have 4p+6p.
+        // Sequence: 4p-5p(called)-6p. consumed = [4p, 6p].
+        let state = setup_for_chi(
+            ["4p", "6p", "1m", "2m", "3m", "7m", "8m", "9m", "1s", "2s", "3s", "E", "E"],
+            "5p",
+        );
+
+        let cans = state.last_cans();
+        assert!(cans.can_chi_mid, "test setup: expected can_chi_mid");
+
+        let ev = action_to_event(39, 0, &state).unwrap();
+        match ev {
+            Event::Chi {
+                actor,
+                target,
+                pai,
+                consumed,
+            } => {
+                assert_eq!(actor, 0);
+                assert_eq!(target, cans.target_actor);
+                assert_eq!(pai, "5p".parse::<Tile>().unwrap());
+                // consumed should be [4p, 6p]
+                assert_eq!(consumed[0].deaka(), "4p".parse::<Tile>().unwrap());
+                assert_eq!(consumed[1].deaka(), "6p".parse::<Tile>().unwrap());
+            }
+            _ => panic!("expected Chi, got {ev:?}"),
+        }
+    }
+
+    #[test]
+    fn action_to_event_chi_high() {
+        // Chi high: called tile is the highest. E.g., 3 discards 9p, we have 7p+8p.
+        // Sequence: 7p-8p-9p(called). consumed = [7p, 8p].
+        let state = setup_for_chi(
+            ["7p", "8p", "1m", "2m", "3m", "4m", "5m", "6m", "1s", "2s", "3s", "E", "E"],
+            "9p",
+        );
+
+        let cans = state.last_cans();
+        assert!(cans.can_chi_high, "test setup: expected can_chi_high");
+
+        let ev = action_to_event(40, 0, &state).unwrap();
+        match ev {
+            Event::Chi {
+                actor,
+                target,
+                pai,
+                consumed,
+            } => {
+                assert_eq!(actor, 0);
+                assert_eq!(target, cans.target_actor);
+                assert_eq!(pai, "9p".parse::<Tile>().unwrap());
+                // consumed should be [7p, 8p]
+                assert_eq!(consumed[0].deaka(), "7p".parse::<Tile>().unwrap());
+                assert_eq!(consumed[1].deaka(), "8p".parse::<Tile>().unwrap());
+            }
+            _ => panic!("expected Chi, got {ev:?}"),
+        }
+    }
+
+    #[test]
+    fn action_to_event_pon() {
+        // Pon: we have 2 copies of E, opponent discards E.
+        let mut state = PlayerState::new(0);
+        state.set_record_events(true);
+
+        let bakaze: Tile = "E".parse().unwrap();
+        let dora_marker: Tile = "9s".parse().unwrap();
+
+        let tehais = [
+            [
+                "E", "E", "1m", "2m", "3m", "4m", "5m", "6m", "7m", "8m", "9m", "1p", "2p",
+            ]
+            .map(|s| s.parse::<Tile>().unwrap()),
+            ["?"; 13].map(|s| s.parse::<Tile>().unwrap()),
+            ["?"; 13].map(|s| s.parse::<Tile>().unwrap()),
+            ["?"; 13].map(|s| s.parse::<Tile>().unwrap()),
+        ];
+
+        state
+            .update(&Event::StartKyoku {
+                bakaze,
+                dora_marker,
+                kyoku: 1,
+                honba: 0,
+                kyotaku: 0,
+                oya: 0,
+                scores: [25000; 4],
+                tehais,
+            })
+            .unwrap();
+
+        // Player 0 draws and discards N
+        state.update(&Event::Tsumo { actor: 0, pai: "N".parse().unwrap() }).unwrap();
+        state.update(&Event::Dahai { actor: 0, pai: "N".parse().unwrap(), tsumogiri: true }).unwrap();
+
+        // Player 1 draws and discards E (we can pon)
+        state.update(&Event::Tsumo { actor: 1, pai: "?".parse().unwrap() }).unwrap();
+        state.update(&Event::Dahai { actor: 1, pai: "E".parse().unwrap(), tsumogiri: false }).unwrap();
+
+        let cans = state.last_cans();
+        assert!(cans.can_pon, "test setup: expected can_pon");
+
+        let ev = action_to_event(41, 0, &state).unwrap();
+        match ev {
+            Event::Pon {
+                actor,
+                target,
+                pai,
+                consumed,
+            } => {
+                assert_eq!(actor, 0);
+                assert_eq!(target, cans.target_actor);
+                assert_eq!(pai, "E".parse::<Tile>().unwrap());
+                // consumed should be [E, E] (both deaka'd)
+                assert_eq!(consumed[0].deaka(), "E".parse::<Tile>().unwrap());
+                assert_eq!(consumed[1].deaka(), "E".parse::<Tile>().unwrap());
+            }
+            _ => panic!("expected Pon, got {ev:?}"),
+        }
+    }
+
+    #[test]
+    fn action_to_event_daiminkan() {
+        // Daiminkan: we have 3 copies of S, opponent discards S.
+        let mut state = PlayerState::new(0);
+        state.set_record_events(true);
+
+        let bakaze: Tile = "E".parse().unwrap();
+        let dora_marker: Tile = "9s".parse().unwrap();
+
+        let tehais = [
+            [
+                "S", "S", "S", "1m", "2m", "3m", "4m", "5m", "6m", "7m", "8m", "9m", "1p",
+            ]
+            .map(|s| s.parse::<Tile>().unwrap()),
+            ["?"; 13].map(|s| s.parse::<Tile>().unwrap()),
+            ["?"; 13].map(|s| s.parse::<Tile>().unwrap()),
+            ["?"; 13].map(|s| s.parse::<Tile>().unwrap()),
+        ];
+
+        state
+            .update(&Event::StartKyoku {
+                bakaze,
+                dora_marker,
+                kyoku: 1,
+                honba: 0,
+                kyotaku: 0,
+                oya: 0,
+                scores: [25000; 4],
+                tehais,
+            })
+            .unwrap();
+
+        // Player 0 draws and discards N
+        state.update(&Event::Tsumo { actor: 0, pai: "N".parse().unwrap() }).unwrap();
+        state.update(&Event::Dahai { actor: 0, pai: "N".parse().unwrap(), tsumogiri: true }).unwrap();
+
+        // Player 1 draws and discards S (we can daiminkan)
+        state.update(&Event::Tsumo { actor: 1, pai: "?".parse().unwrap() }).unwrap();
+        state.update(&Event::Dahai { actor: 1, pai: "S".parse().unwrap(), tsumogiri: false }).unwrap();
+
+        let cans = state.last_cans();
+        assert!(cans.can_daiminkan, "test setup: expected can_daiminkan");
+
+        let ev = action_to_event(42, 0, &state).unwrap();
+        match ev {
+            Event::Daiminkan {
+                actor,
+                target,
+                pai,
+                consumed,
+            } => {
+                assert_eq!(actor, 0);
+                assert_eq!(target, cans.target_actor);
+                assert_eq!(pai, "S".parse::<Tile>().unwrap());
+                // consumed should be [S, S, S] (3 copies from our hand)
+                for &c in &consumed {
+                    assert_eq!(c.deaka(), "S".parse::<Tile>().unwrap());
+                }
+            }
+            _ => panic!("expected Daiminkan, got {ev:?}"),
+        }
+    }
+
     // ---- Tests for default_reaction ----
 
     #[test]
@@ -1679,6 +1773,99 @@ mod test {
         }
     }
 
+    #[test]
+    fn default_reaction_respects_kuikae() {
+        // After chi of 2m using 3m+4m from hand, kuikae forbids:
+        // - 2m (the called tile itself)
+        // - 5m (extends the sequence: 2-3-4 + 5 = another sequence)
+        // Verify default_reaction picks a tile that is NOT forbidden.
+        let mut state = PlayerState::new(1);
+
+        let bakaze: Tile = "E".parse().unwrap();
+        let dora_marker: Tile = "9s".parse().unwrap();
+        let tehais = [
+            ["?"; 13].map(|s| s.parse::<Tile>().unwrap()),
+            // Player 1: has 2m, 3m, 4m, 5m plus others.
+            // After chi of 2m with 3m+4m, forbidden = {2m, 5m}.
+            // Remaining tehai: 2m, 5m, 1p, 2p, 3p, 7s, 8s, 9s, E, E, S
+            // First non-forbidden: 1p (tid=9).
+            [
+                "2m", "3m", "4m", "5m", "1p", "2p", "3p", "7s", "8s", "9s", "E", "E", "S",
+            ]
+            .map(|s| s.parse::<Tile>().unwrap()),
+            ["?"; 13].map(|s| s.parse::<Tile>().unwrap()),
+            ["?"; 13].map(|s| s.parse::<Tile>().unwrap()),
+        ];
+
+        state
+            .update(&Event::StartKyoku {
+                bakaze,
+                dora_marker,
+                kyoku: 1,
+                honba: 0,
+                kyotaku: 0,
+                oya: 0,
+                scores: [25000; 4],
+                tehais,
+            })
+            .unwrap();
+
+        // Oya draws and discards 2m
+        state
+            .update(&Event::Tsumo {
+                actor: 0,
+                pai: "2m".parse().unwrap(),
+            })
+            .unwrap();
+        state
+            .update(&Event::Dahai {
+                actor: 0,
+                pai: "2m".parse().unwrap(),
+                tsumogiri: true,
+            })
+            .unwrap();
+
+        // Player 1 calls chi (2m from kawa, using 3m+4m from hand)
+        state
+            .update(&Event::Chi {
+                actor: 1,
+                target: 0,
+                pai: "2m".parse().unwrap(),
+                consumed: [
+                    "3m".parse::<Tile>().unwrap(),
+                    "4m".parse::<Tile>().unwrap(),
+                ],
+            })
+            .unwrap();
+
+        // Verify kuikae state
+        let cans = state.last_cans();
+        assert!(cans.can_discard, "should be able to discard after chi");
+        assert!(
+            state.last_self_tsumo().is_none(),
+            "last_self_tsumo should be None after chi"
+        );
+
+        let forbidden = state.forbidden_tiles();
+        // 2m (tid=1) and 5m (tid=4) should be forbidden
+        assert!(forbidden[1], "2m should be forbidden (kuikae)");
+        assert!(forbidden[4], "5m should be forbidden (kuikae)");
+
+        let ev = default_reaction(1, &state);
+        match ev {
+            Event::Dahai { actor, pai, .. } => {
+                assert_eq!(actor, 1);
+                let tid = pai.deaka().as_usize();
+                assert!(
+                    !forbidden[tid],
+                    "default_reaction chose forbidden tile {} (tid={}, kuikae)",
+                    pai, tid,
+                );
+            }
+            _ => panic!("expected Dahai after chi, got {ev:?}"),
+        }
+    }
+
     // ---- Tests for simulate_action_rollout ----
 
     #[test]
@@ -1687,7 +1874,7 @@ mod test {
         let config = ParticleConfig::new(5);
         let mut rng = ChaCha12Rng::seed_from_u64(42);
 
-        let particles = generate_particles(&state, &config, &mut rng).unwrap();
+        let (particles, _attempts) = generate_particles(&state, &config, &mut rng).unwrap();
         assert!(!particles.is_empty());
 
         // Discard 1m (action 0)
@@ -1717,7 +1904,7 @@ mod test {
         let config = ParticleConfig::new(3);
         let mut rng = ChaCha12Rng::seed_from_u64(42);
 
-        let particles = generate_particles(&state, &config, &mut rng).unwrap();
+        let (particles, _attempts) = generate_particles(&state, &config, &mut rng).unwrap();
         assert!(!particles.is_empty());
 
         // Action 13 = 5p = the tsumo tile (tsumogiri)
@@ -1740,7 +1927,7 @@ mod test {
         let config = ParticleConfig::new(20);
         let mut rng = ChaCha12Rng::seed_from_u64(42);
 
-        let particles = generate_particles(&state, &config, &mut rng).unwrap();
+        let (particles, _attempts) = generate_particles(&state, &config, &mut rng).unwrap();
         assert!(!particles.is_empty());
 
         // Discard 1m (action 0) vs 9m (action 8) should both complete
@@ -1766,7 +1953,7 @@ mod test {
         let config = ParticleConfig::new(5);
         let mut rng = ChaCha12Rng::seed_from_u64(42);
 
-        let particles = generate_particles(&state, &config, &mut rng).unwrap();
+        let (particles, _attempts) = generate_particles(&state, &config, &mut rng).unwrap();
         assert!(!particles.is_empty());
 
         // Player 2 discards S (tile 28, the tsumo tile) - tsumogiri
@@ -1861,21 +2048,20 @@ mod test {
     }
 
     #[test]
-    #[allow(deprecated)]
     fn build_board_south_round_kyoku() {
         let state = setup_south_round_game();
         let config = ParticleConfig::new(1);
         let mut rng = ChaCha12Rng::seed_from_u64(42);
 
-        let particles = generate_particles(&state, &config, &mut rng).unwrap();
+        let (particles, _attempts) = generate_particles(&state, &config, &mut rng).unwrap();
         assert!(!particles.is_empty());
 
-        let board = build_board_from_particle(&state, &particles[0]).unwrap();
+        let bs = build_midgame_board_state(&state, &particles[0]).unwrap();
 
         // South 3: bakaze=S, within-wind kyoku=2 (0-indexed), absolute kyoku=6
         // (S=1)*4 + 2 = 6
-        assert_eq!(board.kyoku, 6, "South 3 should have absolute kyoku 6");
-        assert_eq!(board.honba, 1);
+        assert_eq!(bs.board.kyoku, 6, "South 3 should have absolute kyoku 6");
+        assert_eq!(bs.board.honba, 1);
     }
 
     #[test]
@@ -1884,7 +2070,7 @@ mod test {
         let config = ParticleConfig::new(3);
         let mut rng = ChaCha12Rng::seed_from_u64(42);
 
-        let particles = generate_particles(&state, &config, &mut rng).unwrap();
+        let (particles, _attempts) = generate_particles(&state, &config, &mut rng).unwrap();
         assert!(!particles.is_empty());
 
         for particle in &particles {
@@ -1910,7 +2096,7 @@ mod test {
         let config = ParticleConfig::new(3);
         let mut rng = ChaCha12Rng::seed_from_u64(42);
 
-        let particles = generate_particles(&state, &config, &mut rng).unwrap();
+        let (particles, _attempts) = generate_particles(&state, &config, &mut rng).unwrap();
         assert!(!particles.is_empty());
 
         for particle in &particles {
@@ -1978,7 +2164,7 @@ mod test {
         let config = ParticleConfig::new(5);
         let mut rng = ChaCha12Rng::seed_from_u64(42);
 
-        let particles = generate_particles(&state, &config, &mut rng).unwrap();
+        let (particles, _attempts) = generate_particles(&state, &config, &mut rng).unwrap();
         assert!(!particles.is_empty());
 
         for (i, particle) in particles.iter().enumerate() {
@@ -2013,7 +2199,7 @@ mod test {
         let config = ParticleConfig::new(1);
         let mut rng = ChaCha12Rng::seed_from_u64(42);
 
-        let particles = generate_particles(&state, &config, &mut rng).unwrap();
+        let (particles, _attempts) = generate_particles(&state, &config, &mut rng).unwrap();
         let bs = build_midgame_board_state(&state, &particles[0]).unwrap();
 
         // Unrotate scores from the PlayerState's relative to absolute
@@ -2140,7 +2326,7 @@ mod test {
         let config = ParticleConfig::new(10);
         let mut rng = ChaCha12Rng::seed_from_u64(42);
 
-        let particles = generate_particles(&state, &config, &mut rng).unwrap();
+        let (particles, _attempts) = generate_particles(&state, &config, &mut rng).unwrap();
         assert!(!particles.is_empty());
 
         for (i, particle) in particles.iter().enumerate() {
@@ -2167,7 +2353,7 @@ mod test {
         let config = ParticleConfig::new(5);
         let mut rng = ChaCha12Rng::seed_from_u64(42);
 
-        let particles = generate_particles(&state, &config, &mut rng).unwrap();
+        let (particles, _attempts) = generate_particles(&state, &config, &mut rng).unwrap();
 
         // Discard F (the tsumo tile) via tsumogiri
         let f_tile: Tile = "F".parse().unwrap();
@@ -2276,7 +2462,7 @@ mod test {
             "expected 26 events in deep game history"
         );
 
-        let particles = generate_particles(&state, &config, &mut rng).unwrap();
+        let (particles, _attempts) = generate_particles(&state, &config, &mut rng).unwrap();
         assert!(!particles.is_empty());
 
         for (i, particle) in particles.iter().enumerate() {
@@ -2296,7 +2482,7 @@ mod test {
         let config = ParticleConfig::new(5);
         let mut rng = ChaCha12Rng::seed_from_u64(42);
 
-        let particles = generate_particles(&state, &config, &mut rng).unwrap();
+        let (particles, _attempts) = generate_particles(&state, &config, &mut rng).unwrap();
 
         // Discard 1m (action 0) — we still have it in hand
         for (i, particle) in particles.iter().enumerate() {
@@ -2317,7 +2503,7 @@ mod test {
         let config = ParticleConfig::new(3);
         let mut rng = ChaCha12Rng::seed_from_u64(42);
 
-        let particles = generate_particles(&state, &config, &mut rng).unwrap();
+        let (particles, _attempts) = generate_particles(&state, &config, &mut rng).unwrap();
         for particle in &particles {
             let bs = build_midgame_board_state(&state, particle).unwrap();
             assert_eq!(
@@ -2337,7 +2523,7 @@ mod test {
         let config = ParticleConfig::new(1);
         let mut rng = ChaCha12Rng::seed_from_u64(42);
 
-        let particles = generate_particles(&state, &config, &mut rng).unwrap();
+        let (particles, _attempts) = generate_particles(&state, &config, &mut rng).unwrap();
         let bs = build_midgame_board_state(&state, &particles[0]).unwrap();
 
         // Player 0 (oya) just drew, should be able to discard
@@ -2356,7 +2542,7 @@ mod test {
         let config = ParticleConfig::new(1);
         let mut rng = ChaCha12Rng::seed_from_u64(42);
 
-        let particles = generate_particles(&state, &config, &mut rng).unwrap();
+        let (particles, _attempts) = generate_particles(&state, &config, &mut rng).unwrap();
         let particle = &particles[0];
 
         let result1 = simulate_particle(&state, particle).unwrap();
@@ -2458,7 +2644,7 @@ mod test {
 
         let config = ParticleConfig::new(5);
         let mut rng = ChaCha12Rng::seed_from_u64(42);
-        let particles = generate_particles(&state, &config, &mut rng).unwrap();
+        let (particles, _attempts) = generate_particles(&state, &config, &mut rng).unwrap();
 
         for (i, particle) in particles.iter().enumerate() {
             let bs = build_midgame_board_state(&state, particle);
@@ -2482,7 +2668,7 @@ mod test {
             );
 
             // Run rollout to completion
-            let result = run_rollout(bs, [24000, 25000, 25000, 25000], None, None);
+            let result = run_rollout(bs, [24000, 25000, 25000, 25000], None, None, None);
             assert!(
                 result.is_ok(),
                 "riichi rollout failed for particle {i}: {:?}",
@@ -2601,7 +2787,7 @@ mod test {
 
         let config = ParticleConfig::new(5);
         let mut rng = ChaCha12Rng::seed_from_u64(42);
-        let particles = generate_particles(&state, &config, &mut rng).unwrap();
+        let (particles, _attempts) = generate_particles(&state, &config, &mut rng).unwrap();
 
         for (i, particle) in particles.iter().enumerate() {
             let result = simulate_particle(&state, particle);
@@ -2716,7 +2902,7 @@ mod test {
 
         let config = ParticleConfig::new(5);
         let mut rng = ChaCha12Rng::seed_from_u64(42);
-        let particles = generate_particles(&state, &config, &mut rng).unwrap();
+        let (particles, _attempts) = generate_particles(&state, &config, &mut rng).unwrap();
 
         for (i, particle) in particles.iter().enumerate() {
             let result = simulate_particle(&state, particle);
@@ -2910,7 +3096,7 @@ mod test {
         // Player 1 now has 2 melds (chi + pon), 8 closed tiles
         let config = ParticleConfig::new(5);
         let mut rng = ChaCha12Rng::seed_from_u64(42);
-        let particles = generate_particles(&state, &config, &mut rng).unwrap();
+        let (particles, _attempts) = generate_particles(&state, &config, &mut rng).unwrap();
 
         for (i, particle) in particles.iter().enumerate() {
             let result = simulate_particle(&state, particle);
@@ -3035,7 +3221,7 @@ mod test {
 
         let config = ParticleConfig::new(3);
         let mut rng = ChaCha12Rng::seed_from_u64(42);
-        let particles = generate_particles(&state, &config, &mut rng).unwrap();
+        let (particles, _attempts) = generate_particles(&state, &config, &mut rng).unwrap();
 
         for (i, particle) in particles.iter().enumerate() {
             let result = simulate_particle(&state, particle);
@@ -3113,7 +3299,7 @@ mod test {
 
         let config = ParticleConfig::new(5);
         let mut rng = ChaCha12Rng::seed_from_u64(42);
-        let particles = generate_particles(&state, &config, &mut rng).unwrap();
+        let (particles, _attempts) = generate_particles(&state, &config, &mut rng).unwrap();
 
         for (i, particle) in particles.iter().enumerate() {
             // Verify opponent hands have 3 entries
@@ -3136,7 +3322,7 @@ mod test {
         let config = ParticleConfig::new(50);
         let mut rng = ChaCha12Rng::seed_from_u64(42);
 
-        let particles = generate_particles(&state, &config, &mut rng).unwrap();
+        let (particles, _attempts) = generate_particles(&state, &config, &mut rng).unwrap();
         assert!(particles.len() >= 10);
 
         let mut results: Vec<RolloutResult> = Vec::new();
@@ -3222,7 +3408,7 @@ mod test {
         let config = ParticleConfig::new(5);
         let mut rng = ChaCha12Rng::seed_from_u64(42);
 
-        let particles = generate_particles(&state, &config, &mut rng).unwrap();
+        let (particles, _attempts) = generate_particles(&state, &config, &mut rng).unwrap();
         let replayed = replay_player_states(&state).unwrap();
 
         for (i, particle) in particles.iter().enumerate() {
@@ -3250,8 +3436,8 @@ mod test {
             // Run both to completion and verify identical results
             let initial1 = bs_full.board.scores;
             let initial2 = bs_replayed.board.scores;
-            let result1 = run_rollout(bs_full, initial1, None, None).unwrap();
-            let result2 = run_rollout(bs_replayed, initial2, None, None).unwrap();
+            let result1 = run_rollout(bs_full, initial1, None, None, None).unwrap();
+            let result2 = run_rollout(bs_replayed, initial2, None, None, None).unwrap();
 
             assert_eq!(
                 result1.deltas, result2.deltas,
@@ -3369,7 +3555,7 @@ mod test {
 
         let config = ParticleConfig::new(5);
         let mut rng = ChaCha12Rng::seed_from_u64(42);
-        let particles = generate_particles(&state, &config, &mut rng).unwrap();
+        let (particles, _attempts) = generate_particles(&state, &config, &mut rng).unwrap();
         assert!(!particles.is_empty(), "should generate particles with kans");
 
         // Verify dead wall size in particles
@@ -3407,7 +3593,7 @@ mod test {
         let config = ParticleConfig::new(5);
         let mut rng = ChaCha12Rng::seed_from_u64(42);
 
-        let particles = generate_particles(&state, &config, &mut rng).unwrap();
+        let (particles, _attempts) = generate_particles(&state, &config, &mut rng).unwrap();
         let replayed = replay_player_states(&state).unwrap();
 
         for (i, particle) in particles.iter().enumerate() {
@@ -3644,7 +3830,7 @@ mod test {
 
         let config = ParticleConfig::new(5);
         let mut rng = ChaCha12Rng::seed_from_u64(42);
-        let particles = generate_particles(&state, &config, &mut rng).unwrap();
+        let (particles, _attempts) = generate_particles(&state, &config, &mut rng).unwrap();
         assert!(!particles.is_empty());
 
         for (i, particle) in particles.iter().enumerate() {
@@ -3666,7 +3852,7 @@ mod test {
         let state2 = setup_game_with_chi();
         let config2 = ParticleConfig::new(5);
         let mut rng2 = ChaCha12Rng::seed_from_u64(123);
-        let particles2 = generate_particles(&state2, &config2, &mut rng2).unwrap();
+        let (particles2, _attempts2) = generate_particles(&state2, &config2, &mut rng2).unwrap();
 
         for (i, particle) in particles2.iter().enumerate() {
             let result = simulate_particle(&state2, particle);
@@ -4099,7 +4285,7 @@ mod test {
         let config = ParticleConfig::new(5);
         let mut rng = ChaCha12Rng::seed_from_u64(42);
 
-        let particles = generate_particles(&state, &config, &mut rng).unwrap();
+        let (particles, _attempts) = generate_particles(&state, &config, &mut rng).unwrap();
         let replayed = replay_player_states(&state).unwrap();
         let base = derive_midgame_context_base(state.event_history());
 
@@ -4119,8 +4305,8 @@ mod test {
                 "particle {i}: initial scores differ"
             );
 
-            let result_old = run_rollout(bs_old, initial_old, None, None).unwrap();
-            let result_new = run_rollout(bs_new, initial_new, None, None).unwrap();
+            let result_old = run_rollout(bs_old, initial_old, None, None, None).unwrap();
+            let result_new = run_rollout(bs_new, initial_new, None, None, None).unwrap();
 
             assert_eq!(
                 result_old.deltas, result_new.deltas,
@@ -4136,7 +4322,7 @@ mod test {
         let config = ParticleConfig::new(5);
         let mut rng = ChaCha12Rng::seed_from_u64(42);
 
-        let particles = generate_particles(&state, &config, &mut rng).unwrap();
+        let (particles, _attempts) = generate_particles(&state, &config, &mut rng).unwrap();
         let replayed = replay_player_states(&state).unwrap();
         let base = derive_midgame_context_base(state.event_history());
 
@@ -4557,7 +4743,7 @@ mod test {
         let config = ParticleConfig::new(5);
         let mut rng = ChaCha12Rng::seed_from_u64(42);
 
-        let particles = generate_particles(&state, &config, &mut rng).unwrap();
+        let (particles, _attempts) = generate_particles(&state, &config, &mut rng).unwrap();
         let replayed = replay_player_states(&state).unwrap();
 
         for (i, particle) in particles.iter().enumerate() {
@@ -4582,7 +4768,7 @@ mod test {
         let config = ParticleConfig::new(5);
         let mut rng = ChaCha12Rng::seed_from_u64(42);
 
-        let particles = generate_particles(&state, &config, &mut rng).unwrap();
+        let (particles, _attempts) = generate_particles(&state, &config, &mut rng).unwrap();
         let replayed = replay_player_states(&state).unwrap();
         let base = derive_midgame_context_base(state.event_history());
 
@@ -4605,7 +4791,7 @@ mod test {
         let config = ParticleConfig::new(5);
         let mut rng = ChaCha12Rng::seed_from_u64(42);
 
-        let particles = generate_particles(&state, &config, &mut rng).unwrap();
+        let (particles, _attempts) = generate_particles(&state, &config, &mut rng).unwrap();
         let replayed = replay_player_states(&state).unwrap();
         let base = derive_midgame_context_base(state.event_history());
 
@@ -4720,7 +4906,7 @@ mod test {
 
         let config = ParticleConfig::new(5);
         let mut rng = ChaCha12Rng::seed_from_u64(42);
-        let particles = generate_particles(&state, &config, &mut rng).unwrap();
+        let (particles, _attempts) = generate_particles(&state, &config, &mut rng).unwrap();
         let replayed = replay_player_states(&state).unwrap();
         let base = derive_midgame_context_base(state.event_history());
 
@@ -4869,7 +5055,7 @@ mod test {
         // Verify rollout completes
         let config = ParticleConfig::new(5);
         let mut rng = ChaCha12Rng::seed_from_u64(42);
-        let particles = generate_particles(&state, &config, &mut rng).unwrap();
+        let (particles, _attempts) = generate_particles(&state, &config, &mut rng).unwrap();
         assert!(!particles.is_empty());
 
         for (i, particle) in particles.iter().enumerate() {
@@ -5060,7 +5246,7 @@ mod test {
         // Build and rollout
         let config = ParticleConfig::new(5);
         let mut rng = ChaCha12Rng::seed_from_u64(42);
-        let particles = generate_particles(&state, &config, &mut rng).unwrap();
+        let (particles, _attempts) = generate_particles(&state, &config, &mut rng).unwrap();
         assert!(!particles.is_empty());
 
         let replayed = replay_player_states(&state).unwrap();
@@ -5185,7 +5371,7 @@ mod test {
         // Build and rollout
         let config = ParticleConfig::new(5);
         let mut rng = ChaCha12Rng::seed_from_u64(42);
-        let particles = generate_particles(&state, &config, &mut rng).unwrap();
+        let (particles, _attempts) = generate_particles(&state, &config, &mut rng).unwrap();
         assert!(!particles.is_empty());
 
         let replayed = replay_player_states(&state).unwrap();
@@ -5356,7 +5542,7 @@ mod test {
         // Build and rollout
         let config = ParticleConfig::new(5);
         let mut rng = ChaCha12Rng::seed_from_u64(42);
-        let particles = generate_particles(&state, &config, &mut rng).unwrap();
+        let (particles, _attempts) = generate_particles(&state, &config, &mut rng).unwrap();
         assert!(!particles.is_empty());
 
         let replayed = replay_player_states(&state).unwrap();
@@ -5371,7 +5557,7 @@ mod test {
 
             let bs = result.unwrap();
             let initial_scores = bs.board.scores;
-            let rollout = run_rollout(bs, initial_scores, None, None);
+            let rollout = run_rollout(bs, initial_scores, None, None, None);
             assert!(
                 rollout.is_ok(),
                 "multi-kan rollout particle {i} failed: {:?}",
@@ -5455,7 +5641,7 @@ mod test {
         // on the next step when it processes the draw)
         let config = ParticleConfig::new(5);
         let mut rng = ChaCha12Rng::seed_from_u64(42);
-        let particles = generate_particles(&state, &config, &mut rng).unwrap();
+        let (particles, _attempts) = generate_particles(&state, &config, &mut rng).unwrap();
         assert!(!particles.is_empty());
 
         let replayed = replay_player_states(&state).unwrap();
@@ -5470,7 +5656,7 @@ mod test {
 
             let bs = result.unwrap();
             let initial_scores = bs.board.scores;
-            let rollout = run_rollout(bs, initial_scores, None, None);
+            let rollout = run_rollout(bs, initial_scores, None, None, None);
             assert!(
                 rollout.is_ok(),
                 "pending riichi rollout particle {i} failed: {:?}",
