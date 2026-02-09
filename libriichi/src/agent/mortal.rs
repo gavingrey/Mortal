@@ -53,6 +53,52 @@ struct SyncFields {
     kan_action_idxs: Vec<Option<usize>>,
 }
 
+/// Tracks why a search was skipped.
+#[derive(Default)]
+struct SkipMetrics {
+    low_criticality: u32,
+    insufficient_candidates: u32,
+    no_particles: u32,
+    particle_gen_error: u32,
+    replay_error: u32,
+    inconclusive: u32,
+}
+
+/// Tracks error categories during search rollouts.
+#[derive(Default)]
+struct ErrorMetrics {
+    panics: u32,
+    rollout_errors: u32,
+    /// First N unique error messages for debugging.
+    unique_msgs: Vec<String>,
+}
+
+impl ErrorMetrics {
+    const MAX_UNIQUE_MSGS: usize = 10;
+
+    fn record_panic(&mut self, msg: &str) {
+        self.panics += 1;
+        self.record_msg(msg);
+    }
+
+    fn record_error(&mut self, msg: &str) {
+        self.rollout_errors += 1;
+        self.record_msg(msg);
+    }
+
+    fn record_msg(&mut self, msg: &str) {
+        if self.unique_msgs.len() < Self::MAX_UNIQUE_MSGS
+            && !self.unique_msgs.iter().any(|m| m == msg)
+        {
+            self.unique_msgs.push(msg.to_owned());
+        }
+    }
+
+    fn total(&self) -> u32 {
+        self.panics + self.rollout_errors
+    }
+}
+
 /// Optional search integration that overrides DQN actions with
 /// particle-based rollout evaluation at critical decision points.
 struct SearchIntegration {
@@ -61,12 +107,21 @@ struct SearchIntegration {
     max_candidates: usize,
     search_weight: f32,
 
-    // Metrics
+    // Core counts
     search_count: u32,
     override_count: u32,
-    skip_count: u32,
-    error_count: u32,
-    total_time_us: u64,
+
+    // Detailed breakdowns
+    skips: SkipMetrics,
+    errors: ErrorMetrics,
+
+    // Time tracking (per-search for percentiles)
+    search_times_us: Vec<u64>,
+
+    // Particle utilization
+    particles_requested: u32,
+    particles_generated: u32,
+    particle_gen_attempts: u32,
 }
 
 impl SearchIntegration {
@@ -84,7 +139,7 @@ impl SearchIntegration {
 
         // Quick criticality check: skip search for trivial decisions
         if !Self::is_critical(state) {
-            self.skip_count += 1;
+            self.skips.low_criticality += 1;
             return None;
         }
 
@@ -100,37 +155,54 @@ impl SearchIntegration {
 
         // Need at least 2 candidates to justify search
         if candidates.len() < 2 {
-            self.skip_count += 1;
+            self.skips.insufficient_candidates += 1;
             return None;
         }
 
         let actions: Vec<usize> = candidates.iter().map(|&(a, _)| a).collect();
+        let n_target = self.config.n_particles;
 
         // Generate particles
-        let (particles, _attempts) = particle::generate_particles(state, &self.config, &mut self.rng).ok()?;
+        let gen_result =
+            particle::generate_particles(state, &self.config, &mut self.rng);
+        let (particles, attempts) = match gen_result {
+            Ok(pair) => pair,
+            Err(e) => {
+                self.skips.particle_gen_error += 1;
+                log::debug!("particle gen error: {e}");
+                return None;
+            }
+        };
+        self.particle_gen_attempts += attempts as u32;
         if particles.is_empty() {
-            self.skip_count += 1;
+            self.skips.no_particles += 1;
             return None;
         }
+        self.particles_requested += n_target as u32;
+        self.particles_generated += particles.len() as u32;
 
         self.search_count += 1;
 
         // Replay event history once, then reuse for all particle/action pairs.
-        // This avoids re-replaying O(particles * actions) times.
-        let replayed = simulator::replay_player_states(state).ok()?;
+        let replayed = match simulator::replay_player_states(state) {
+            Ok(r) => r,
+            Err(e) => {
+                self.skips.replay_error += 1;
+                log::debug!("replay error: {e}");
+                self.record_elapsed(start);
+                return None;
+            }
+        };
 
         // Derive event-dependent midgame context once (not per particle).
         let base = simulator::derive_midgame_context_base(state.event_history());
 
         // Round-robin rollouts: particle-first, action-second
-        // Collect mean deltas for each action
         let mut action_sums: Vec<f64> = vec![0.0; actions.len()];
         let mut action_counts: Vec<usize> = vec![0; actions.len()];
 
         for p in &particles {
             for (ai, &action) in actions.iter().enumerate() {
-                // Use catch_unwind as a safety net: search rollouts can panic
-                // on edge-case board states, and we must not crash the arena.
                 let rollout = panic::catch_unwind(panic::AssertUnwindSafe(|| {
                     simulator::simulate_action_rollout_with_base_smart(
                         state, &replayed, p, action, &base, &mut self.rng,
@@ -142,18 +214,17 @@ impl SearchIntegration {
                         action_counts[ai] += 1;
                     }
                     Ok(Err(e)) => {
-                        // Rollout returned an error (non-panic failure)
-                        self.error_count += 1;
-                        log::debug!("search rollout error: {e}");
+                        let msg = e.to_string();
+                        self.errors.record_error(&msg);
+                        log::debug!("search rollout error: {msg}");
                     }
                     Err(panic_info) => {
-                        // Rollout panicked — log it
-                        self.error_count += 1;
                         let msg = panic_info
                             .downcast_ref::<String>()
                             .map(String::as_str)
                             .or_else(|| panic_info.downcast_ref::<&str>().copied())
                             .unwrap_or("unknown panic");
+                        self.errors.record_panic(msg);
                         log::warn!("search rollout panic: {msg}");
                     }
                 }
@@ -193,6 +264,7 @@ impl SearchIntegration {
                 .collect()
         } else {
             // All search values are the same; search is inconclusive
+            self.skips.inconclusive += 1;
             self.record_elapsed(start);
             return None;
         };
@@ -239,12 +311,13 @@ impl SearchIntegration {
         }
     }
 
-    /// Record elapsed time from `start` into `total_time_us`.
+    /// Record elapsed time from `start` into `search_times_us`.
     fn record_elapsed(&mut self, start: Instant) {
-        let elapsed = Instant::now()
+        let elapsed_us = Instant::now()
             .checked_duration_since(start)
-            .unwrap_or(Duration::ZERO);
-        self.total_time_us = self.total_time_us.saturating_add(elapsed.as_micros() as u64);
+            .unwrap_or(Duration::ZERO)
+            .as_micros() as u64;
+        self.search_times_us.push(elapsed_us);
     }
 
     /// Check if the current decision point is critical enough to warrant search.
@@ -291,29 +364,105 @@ impl SearchIntegration {
     }
 }
 
+impl SearchIntegration {
+    /// Compute percentile from a sorted slice. `p` is 0.0..=1.0.
+    fn percentile(sorted: &[u64], p: f64) -> u64 {
+        if sorted.is_empty() {
+            return 0;
+        }
+        let idx = ((sorted.len() as f64 - 1.0) * p).round() as usize;
+        sorted[idx.min(sorted.len() - 1)]
+    }
+}
+
 impl Drop for SearchIntegration {
     fn drop(&mut self) {
-        if self.search_count > 0 || self.skip_count > 0 {
-            let avg_us = if self.search_count > 0 {
-                self.total_time_us / u64::from(self.search_count)
+        let skip_total = self.skips.low_criticality
+            + self.skips.insufficient_candidates
+            + self.skips.no_particles
+            + self.skips.particle_gen_error
+            + self.skips.replay_error
+            + self.skips.inconclusive;
+        let error_total = self.errors.total();
+
+        if self.search_count == 0 && skip_total == 0 {
+            return;
+        }
+
+        // Time percentiles
+        self.search_times_us.sort_unstable();
+        let times = &self.search_times_us;
+        let total_time_us: u64 = times.iter().sum();
+        let p50 = Self::percentile(times, 0.5);
+        let p95 = Self::percentile(times, 0.95);
+        let p99 = Self::percentile(times, 0.99);
+        let avg_us = if self.search_count > 0 {
+            total_time_us / u64::from(self.search_count)
+        } else {
+            0
+        };
+
+        // Particle utilization
+        let particle_fill_pct = if self.particles_requested > 0 {
+            (f64::from(self.particles_generated) / f64::from(self.particles_requested)) * 100.0
+        } else {
+            0.0
+        };
+
+        let msg = format!(
+            "\n=== Search Metrics ===\n\
+             Searches: {} | Overrides: {} ({:.1}%) | Errors: {} ({:.1}%)\n\
+             Skips: {} (criticality={}, candidates={}, no_particles={}, \
+             particle_err={}, replay_err={}, inconclusive={})\n\
+             Errors: panics={}, rollout_errors={}\n\
+             Time: total={}ms, avg={}us, p50={}us, p95={}us, p99={}us\n\
+             Particles: requested={}, generated={} ({:.0}% fill), gen_attempts={}",
+            self.search_count,
+            self.override_count,
+            if self.search_count > 0 {
+                f64::from(self.override_count) / f64::from(self.search_count) * 100.0
             } else {
-                0
-            };
-            let msg = format!(
-                "search metrics: searches={}, overrides={}, skips={}, errors={}, \
-                 total_time={}ms, avg_time={}us",
-                self.search_count,
-                self.override_count,
-                self.skip_count,
-                self.error_count,
-                self.total_time_us / 1000,
-                avg_us,
-            );
-            if self.error_count > 0 {
-                log::warn!("{msg}");
+                0.0
+            },
+            error_total,
+            if self.search_count > 0 {
+                f64::from(error_total) / f64::from(self.search_count) * 100.0
             } else {
-                log::info!("{msg}");
+                0.0
+            },
+            skip_total,
+            self.skips.low_criticality,
+            self.skips.insufficient_candidates,
+            self.skips.no_particles,
+            self.skips.particle_gen_error,
+            self.skips.replay_error,
+            self.skips.inconclusive,
+            self.errors.panics,
+            self.errors.rollout_errors,
+            total_time_us / 1000,
+            avg_us,
+            p50,
+            p95,
+            p99,
+            self.particles_requested,
+            self.particles_generated,
+            particle_fill_pct,
+            self.particle_gen_attempts,
+        );
+
+        if error_total > 0 {
+            log::warn!("{msg}");
+            if !self.errors.unique_msgs.is_empty() {
+                log::warn!(
+                    "Unique error messages ({}):",
+                    self.errors.unique_msgs.len()
+                );
+                for (i, m) in self.errors.unique_msgs.iter().enumerate() {
+                    log::warn!("  [{}] {}", i + 1, m);
+                }
             }
+        } else {
+            log::info!("{msg}");
         }
     }
 }
@@ -392,9 +541,12 @@ impl MortalBatchAgent {
                 search_weight: weight,
                 search_count: 0_u32,
                 override_count: 0_u32,
-                skip_count: 0_u32,
-                error_count: 0_u32,
-                total_time_us: 0_u64,
+                skips: SkipMetrics::default(),
+                errors: ErrorMetrics::default(),
+                search_times_us: Vec::new(),
+                particles_requested: 0_u32,
+                particles_generated: 0_u32,
+                particle_gen_attempts: 0_u32,
             }
         });
 
@@ -943,5 +1095,129 @@ impl BatchAgent for MortalBatchAgent {
 
     fn needs_record_events(&self) -> bool {
         self.search.is_some()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn error_metrics_dedup_messages() {
+        let mut em = ErrorMetrics::default();
+        em.record_panic("index out of bounds: the len is 0 but the index is 0");
+        em.record_panic("index out of bounds: the len is 0 but the index is 0");
+        em.record_error("some other error");
+        em.record_error("some other error");
+        em.record_panic("yet another panic");
+
+        assert_eq!(em.panics, 3);
+        assert_eq!(em.rollout_errors, 2);
+        assert_eq!(em.total(), 5);
+        // Dedup: only 3 unique messages
+        assert_eq!(em.unique_msgs.len(), 3);
+    }
+
+    #[test]
+    fn error_metrics_caps_at_max() {
+        let mut em = ErrorMetrics::default();
+        for i in 0..20 {
+            em.record_error(&format!("error {i}"));
+        }
+        assert_eq!(em.rollout_errors, 20);
+        assert_eq!(em.unique_msgs.len(), ErrorMetrics::MAX_UNIQUE_MSGS);
+    }
+
+    #[test]
+    fn skip_metrics_default_all_zero() {
+        let sm = SkipMetrics::default();
+        assert_eq!(sm.low_criticality, 0);
+        assert_eq!(sm.insufficient_candidates, 0);
+        assert_eq!(sm.no_particles, 0);
+        assert_eq!(sm.particle_gen_error, 0);
+        assert_eq!(sm.replay_error, 0);
+        assert_eq!(sm.inconclusive, 0);
+    }
+
+    #[test]
+    fn percentile_empty_returns_zero() {
+        assert_eq!(SearchIntegration::percentile(&[], 0.5), 0);
+    }
+
+    #[test]
+    fn percentile_single_element() {
+        assert_eq!(SearchIntegration::percentile(&[42], 0.0), 42);
+        assert_eq!(SearchIntegration::percentile(&[42], 0.5), 42);
+        assert_eq!(SearchIntegration::percentile(&[42], 1.0), 42);
+    }
+
+    #[test]
+    fn percentile_multiple_elements() {
+        let data = [10, 20, 30, 40, 50, 60, 70, 80, 90, 100];
+        assert_eq!(SearchIntegration::percentile(&data, 0.0), 10);
+        assert_eq!(SearchIntegration::percentile(&data, 0.5), 60); // (10-1)*0.5 = 4.5 -> round to 5 -> data[5]=60
+        assert_eq!(SearchIntegration::percentile(&data, 0.95), 100); // (10-1)*0.95 = 8.55 -> round to 9 -> data[9]=100
+        assert_eq!(SearchIntegration::percentile(&data, 1.0), 100);
+    }
+
+    #[test]
+    fn is_critical_early_game_low_shanten() {
+        // Use the shared test helper: sets up East round, tsumo just happened,
+        // hand is 1-9m+1-5p (iishanten or better), tiles_left=69 (just drew).
+        // Early east round + many tiles left + no opponent riichi → not critical
+        // unless shanten is low enough to add 0.2-0.4.
+        let state = crate::search::test_utils::setup_basic_game();
+        // This hand (1-9m, 1-5p) is iishanten at best → score = 0.2, < 0.25 threshold
+        // If it happens to be tenpai, score = 0.4 which IS critical.
+        // Either way, this verifies is_critical doesn't panic on a real state.
+        let _ = SearchIntegration::is_critical(&state);
+    }
+
+    #[test]
+    fn search_integration_drop_does_not_panic() {
+        // Verify that dropping with zero counts doesn't panic
+        let si = SearchIntegration {
+            rng: ChaCha12Rng::seed_from_u64(0),
+            config: ParticleConfig::new(10),
+            max_candidates: 5,
+            search_weight: 0.5,
+            search_count: 0,
+            override_count: 0,
+            skips: SkipMetrics::default(),
+            errors: ErrorMetrics::default(),
+            search_times_us: Vec::new(),
+            particles_requested: 0,
+            particles_generated: 0,
+            particle_gen_attempts: 0,
+        };
+        drop(si); // should not panic
+    }
+
+    #[test]
+    fn search_integration_drop_with_data_does_not_panic() {
+        let mut si = SearchIntegration {
+            rng: ChaCha12Rng::seed_from_u64(0),
+            config: ParticleConfig::new(50),
+            max_candidates: 5,
+            search_weight: 0.5,
+            search_count: 10,
+            override_count: 3,
+            skips: SkipMetrics {
+                low_criticality: 20,
+                insufficient_candidates: 5,
+                no_particles: 2,
+                particle_gen_error: 1,
+                replay_error: 0,
+                inconclusive: 1,
+            },
+            errors: ErrorMetrics::default(),
+            search_times_us: vec![1000, 2000, 3000, 5000, 10000],
+            particles_requested: 500,
+            particles_generated: 450,
+            particle_gen_attempts: 600,
+        };
+        si.errors.record_panic("test panic");
+        si.errors.record_error("test error");
+        drop(si); // should not panic
     }
 }

@@ -76,16 +76,26 @@ impl Candidate {
             return Ordering::Equal;
         }
         match by {
-            CandidateColumn::EV => match self.exp_values[0].total_cmp(&other.exp_values[0]) {
-                Ordering::Equal => self.cmp(other, CandidateColumn::WinProb),
-                o => o,
-            },
-            CandidateColumn::WinProb => match self.win_probs[0].total_cmp(&other.win_probs[0]) {
-                Ordering::Equal => self.cmp(other, CandidateColumn::TenpaiProb),
-                o => o,
-            },
+            CandidateColumn::EV => {
+                let a = self.exp_values.first().copied().unwrap_or(0.0);
+                let b = other.exp_values.first().copied().unwrap_or(0.0);
+                match a.total_cmp(&b) {
+                    Ordering::Equal => self.cmp(other, CandidateColumn::WinProb),
+                    o => o,
+                }
+            }
+            CandidateColumn::WinProb => {
+                let a = self.win_probs.first().copied().unwrap_or(0.0);
+                let b = other.win_probs.first().copied().unwrap_or(0.0);
+                match a.total_cmp(&b) {
+                    Ordering::Equal => self.cmp(other, CandidateColumn::TenpaiProb),
+                    o => o,
+                }
+            }
             CandidateColumn::TenpaiProb => {
-                match self.tenpai_probs[0].total_cmp(&other.tenpai_probs[0]) {
+                let a = self.tenpai_probs.first().copied().unwrap_or(0.0);
+                let b = other.tenpai_probs.first().copied().unwrap_or(0.0);
+                match a.total_cmp(&b) {
                     Ordering::Equal => self.cmp(other, CandidateColumn::NotShantenDown),
                     o => o,
                 }
@@ -136,12 +146,27 @@ impl Candidate {
             .map(|r| format!("{}@{}", r.tile, r.count))
             .collect::<Vec<_>>()
             .join(",");
+
+        // For high-shanten hands (4+), probability arrays are empty — guard access.
+        let ev = self
+            .exp_values
+            .first()
+            .map_or_else(|| "N/A".to_owned(), |v| format!("{v:.03}"));
+        let win = self
+            .win_probs
+            .first()
+            .map_or_else(|| "N/A".to_owned(), |v| format!("{:.03}", v * 100.));
+        let tenpai = self
+            .tenpai_probs
+            .first()
+            .map_or_else(|| "N/A".to_owned(), |v| format!("{:.03}", v * 100.));
+
         if can_discard {
             vec![
                 self.tile.to_string(),
-                format!("{:.03}", self.exp_values[0]),
-                format!("{:.03}", self.win_probs[0] * 100.),
-                format!("{:.03}", self.tenpai_probs[0] * 100.),
+                ev,
+                win,
+                tenpai,
                 if self.shanten_down { "Yes" } else { "No" }.to_owned(),
                 self.required_tiles.len().to_string(),
                 self.num_required_tiles.to_string(),
@@ -149,9 +174,9 @@ impl Candidate {
             ]
         } else {
             vec![
-                format!("{:.03}", self.exp_values[0]),
-                format!("{:.03}", self.win_probs[0] * 100.),
-                format!("{:.03}", self.tenpai_probs[0] * 100.),
+                ev,
+                win,
+                tenpai,
                 self.required_tiles.len().to_string(),
                 self.num_required_tiles.to_string(),
                 required_tiles,
@@ -160,6 +185,7 @@ impl Candidate {
     }
 
     #[cfg(feature = "sp_reproduce_cpp_ver")]
+    #[allow(clippy::indexing_slicing)]
     pub(super) fn calibrate(mut self, real_max_tsumo: usize) -> Self {
         if self.shanten_down {
             // 向聴戻しをしない場合のパターンの確率が過小に算出されているような気がするため、
@@ -178,5 +204,113 @@ impl Candidate {
         self.exp_values.rotate_right(real_max_tsumo);
         self.exp_values.truncate(real_max_tsumo);
         self
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::t;
+
+    /// Helper: create a Candidate with empty probability arrays (simulates 4+-shanten).
+    fn empty_candidate(tile: Tile) -> Candidate {
+        Candidate {
+            tile,
+            tenpai_probs: ArrayVec::new(),
+            win_probs: ArrayVec::new(),
+            exp_values: ArrayVec::new(),
+            required_tiles: ArrayVec::new(),
+            num_required_tiles: 0,
+            shanten_down: false,
+        }
+    }
+
+    /// Helper: create a Candidate with populated probability arrays.
+    fn populated_candidate(tile: Tile, ev: f32, win: f32, tenpai: f32) -> Candidate {
+        let mut exp_values = ArrayVec::new();
+        exp_values.push(ev);
+        let mut win_probs = ArrayVec::new();
+        win_probs.push(win);
+        let mut tenpai_probs = ArrayVec::new();
+        tenpai_probs.push(tenpai);
+        Candidate {
+            tile,
+            tenpai_probs,
+            win_probs,
+            exp_values,
+            required_tiles: ArrayVec::new(),
+            num_required_tiles: 0,
+            shanten_down: false,
+        }
+    }
+
+    #[test]
+    fn csv_row_empty_arrays_discard_does_not_panic() {
+        let c = empty_candidate(t!(1m));
+        let row = c.csv_row(true);
+        assert_eq!(row.len(), 8);
+        assert_eq!(row[1], "N/A"); // EV
+        assert_eq!(row[2], "N/A"); // Win prob
+        assert_eq!(row[3], "N/A"); // Tenpai prob
+    }
+
+    #[test]
+    fn csv_row_empty_arrays_no_discard_does_not_panic() {
+        let c = empty_candidate(t!(5p));
+        let row = c.csv_row(false);
+        assert_eq!(row.len(), 6);
+        assert_eq!(row[0], "N/A"); // EV
+        assert_eq!(row[1], "N/A"); // Win prob
+        assert_eq!(row[2], "N/A"); // Tenpai prob
+    }
+
+    #[test]
+    fn csv_row_populated_arrays_discard() {
+        let c = populated_candidate(t!(3s), 1500.0, 0.25, 0.75);
+        let row = c.csv_row(true);
+        assert_eq!(row.len(), 8);
+        assert_eq!(row[0], "3s"); // Tile
+        assert_eq!(row[1], "1500.000"); // EV
+        assert_eq!(row[2], "25.000"); // Win prob %
+        assert_eq!(row[3], "75.000"); // Tenpai prob %
+    }
+
+    #[test]
+    fn csv_row_populated_arrays_no_discard() {
+        let c = populated_candidate(t!(W), 800.0, 0.1, 0.5);
+        let row = c.csv_row(false);
+        assert_eq!(row.len(), 6);
+        assert_eq!(row[0], "800.000"); // EV
+        assert_eq!(row[1], "10.000"); // Win prob %
+        assert_eq!(row[2], "50.000"); // Tenpai prob %
+    }
+
+    #[test]
+    fn cmp_empty_arrays_does_not_panic() {
+        let a = empty_candidate(t!(1m));
+        let b = empty_candidate(t!(9m));
+        // Both have EV=0.0 (empty fallback), so should fall through to lower columns
+        let result = a.cmp(&b, CandidateColumn::EV);
+        // Should not panic; exact ordering depends on tiebreak chain
+        assert!(matches!(
+            result,
+            Ordering::Less | Ordering::Equal | Ordering::Greater
+        ));
+    }
+
+    #[test]
+    fn cmp_empty_vs_populated() {
+        let empty = empty_candidate(t!(1m));
+        let pop = populated_candidate(t!(9m), 1000.0, 0.5, 0.8);
+        // Empty EV=0.0 < populated EV=1000.0
+        assert_eq!(empty.cmp(&pop, CandidateColumn::EV), Ordering::Less);
+        assert_eq!(pop.cmp(&empty, CandidateColumn::EV), Ordering::Greater);
+    }
+
+    #[test]
+    fn cmp_same_tile_returns_equal() {
+        let a = empty_candidate(t!(5m));
+        let b = populated_candidate(t!(5m), 999.0, 0.9, 0.9);
+        assert_eq!(a.cmp(&b, CandidateColumn::EV), Ordering::Equal);
     }
 }
