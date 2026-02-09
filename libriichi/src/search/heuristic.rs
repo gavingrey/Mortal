@@ -236,8 +236,9 @@ pub fn smart_reaction(seat: u8, state: &PlayerState, rng: &mut ChaCha12Rng) -> E
         };
     }
 
-    // Riichi players must tsumogiri
-    if state.self_riichi_accepted()
+    // Riichi players must tsumogiri (only when it's our turn to discard)
+    if cans.can_discard
+        && state.self_riichi_accepted()
         && let Some(tsumo) = state.last_self_tsumo()
     {
         return Event::Dahai {
@@ -1036,5 +1037,97 @@ mod test {
             }
             _ => panic!("expected Dahai for riichi player, got {ev:?}"),
         }
+    }
+
+    // Regression test: riichi'd player at ron decision must NOT generate Dahai
+    #[test]
+    fn test_riichi_player_at_ron_decision_passes() {
+        // Reproduces the bug: riichi'd player 1 drew N (tsumogiri'd it), then
+        // player 0 discards a tile that player 1 can ron. last_self_tsumo()
+        // is still Some(N) but can_discard=false, can_ron_agari=true.
+        // smart_reaction must return Event::None (pass) or Hora, NOT Dahai.
+        let mut state = PlayerState::new(1);
+        state.set_record_events(true);
+
+        let bakaze: Tile = "E".parse().unwrap();
+        let dora_marker: Tile = "9s".parse().unwrap();
+
+        // Player 1 has a tenpai hand waiting on 7m
+        let tehais = [
+            ["?"; 13].map(|s| s.parse::<Tile>().unwrap()),
+            [
+                "1m", "2m", "3m", "4p", "5p", "6p", "7s", "8s", "9s", "E", "E", "N", "N",
+            ]
+            .map(|s| s.parse::<Tile>().unwrap()),
+            ["?"; 13].map(|s| s.parse::<Tile>().unwrap()),
+            ["?"; 13].map(|s| s.parse::<Tile>().unwrap()),
+        ];
+
+        state
+            .update(&Event::StartKyoku {
+                bakaze,
+                dora_marker,
+                kyoku: 1,
+                honba: 0,
+                kyotaku: 0,
+                oya: 0,
+                scores: [25000; 4],
+                tehais,
+            })
+            .unwrap();
+
+        // Oya (player 0) draws and discards
+        state.update(&Event::Tsumo { actor: 0, pai: "C".parse().unwrap() }).unwrap();
+        state.update(&Event::Dahai { actor: 0, pai: "C".parse().unwrap(), tsumogiri: true }).unwrap();
+
+        // Player 1 draws N, declares riichi, discards N
+        state.update(&Event::Tsumo { actor: 1, pai: "N".parse().unwrap() }).unwrap();
+        state.update(&Event::Reach { actor: 1 }).unwrap();
+        state.update(&Event::Dahai { actor: 1, pai: "N".parse().unwrap(), tsumogiri: true }).unwrap();
+        state.update(&Event::ReachAccepted { actor: 1 }).unwrap();
+
+        // Player 2 draws and discards
+        state.update(&Event::Tsumo { actor: 2, pai: "?".parse().unwrap() }).unwrap();
+        state.update(&Event::Dahai { actor: 2, pai: "S".parse().unwrap(), tsumogiri: true }).unwrap();
+
+        // Player 3 draws and discards
+        state.update(&Event::Tsumo { actor: 3, pai: "?".parse().unwrap() }).unwrap();
+        state.update(&Event::Dahai { actor: 3, pai: "S".parse().unwrap(), tsumogiri: true }).unwrap();
+
+        // Player 1 draws N again (tsumogiri since in riichi, not a win)
+        state.update(&Event::Tsumo { actor: 1, pai: "N".parse().unwrap() }).unwrap();
+        // Player 1 must tsumogiri (riichi). Simulate the tsumogiri.
+        state.update(&Event::Dahai { actor: 1, pai: "N".parse().unwrap(), tsumogiri: true }).unwrap();
+
+        // Now player 2 discards 7m — player 1 can potentially ron
+        state.update(&Event::Tsumo { actor: 2, pai: "?".parse().unwrap() }).unwrap();
+        state.update(&Event::Dahai { actor: 2, pai: "7m".parse().unwrap(), tsumogiri: false }).unwrap();
+
+        let cans = state.last_cans();
+        // Player 1 should have ron option but NOT discard
+        // (Note: can_ron_agari depends on whether the hand is actually waiting on 7m
+        //  which it isn't with this hand. But the key invariant is: if can_discard=false,
+        //  we must NOT generate Dahai, regardless of riichi status.)
+        assert!(
+            !cans.can_discard,
+            "test setup: expected can_discard=false at a call decision point"
+        );
+        // last_self_tsumo should still be the previous draw
+        assert!(
+            state.last_self_tsumo().is_some(),
+            "test setup: last_self_tsumo should still be set from previous draw"
+        );
+        assert!(
+            state.self_riichi_accepted(),
+            "test setup: player 1 should be in riichi"
+        );
+
+        let mut rng = ChaCha12Rng::seed_from_u64(42);
+        let ev = smart_reaction(1, &state, &mut rng);
+        // Must NOT be a Dahai — should be None (pass) or Hora (if can_ron_agari)
+        assert!(
+            !matches!(ev, Event::Dahai { .. }),
+            "riichi player at ron decision must NOT generate Dahai, got {ev:?}"
+        );
     }
 }
