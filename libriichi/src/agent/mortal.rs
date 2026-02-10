@@ -17,8 +17,10 @@ use numpy::{PyArray1, PyArray2};
 use parking_lot::Mutex;
 use pyo3::intern;
 use pyo3::prelude::*;
+use rand::prelude::*;
 use rand::SeedableRng;
 use rand_chacha::ChaCha12Rng;
+use rayon::prelude::*;
 
 pub struct MortalBatchAgent {
     engine: PyObject,
@@ -197,33 +199,110 @@ impl SearchIntegration {
         // Derive event-dependent midgame context once (not per particle).
         let base = simulator::derive_midgame_context_base(state.event_history());
 
-        // Round-robin rollouts: particle-first, action-second
-        let mut action_sums: Vec<f64> = vec![0.0; actions.len()];
-        let mut action_counts: Vec<usize> = vec![0; actions.len()];
+        // Pre-generate per-particle RNG seeds for parallel execution.
+        let seeds: Vec<u64> = (0..particles.len())
+            .map(|_| self.rng.next_u64())
+            .collect();
 
-        for p in &particles {
-            for (ai, &action) in actions.iter().enumerate() {
-                let rollout = panic::catch_unwind(panic::AssertUnwindSafe(|| {
-                    simulator::simulate_action_rollout_with_base_smart(
-                        state, &replayed, p, action, &base, &mut self.rng,
-                    )
-                }));
-                match rollout {
-                    Ok(Ok(result)) => {
-                        action_sums[ai] += f64::from(result.deltas[actor as usize]);
-                        action_counts[ai] += 1;
-                    }
+        // Parallel rollouts: particle-first (par_iter), action-second (sequential).
+        // Build-once-clone-K: build BoardState once per particle, clone K times.
+        // Per-action RNG independence: each action gets its own seeded RNG.
+        enum RolloutOutcome {
+            Ok { action: usize, delta: i32 },
+            Error { msg: String },
+            Panic { msg: String },
+        }
+
+        let per_particle: Vec<Vec<RolloutOutcome>> = particles
+            .par_iter()
+            .enumerate()
+            .map(|(pi, p)| {
+                // Build BoardState once for this particle
+                let board_state = match panic::catch_unwind(panic::AssertUnwindSafe(|| {
+                    simulator::build_midgame_board_state_with_base(state, &replayed, p, &base)
+                })) {
+                    Ok(Ok(bs)) => bs,
                     Ok(Err(e)) => {
                         let msg = e.to_string();
-                        self.errors.record_error(&msg);
-                        log::debug!("search rollout error: {msg}");
+                        return actions
+                            .iter()
+                            .map(|_| RolloutOutcome::Error { msg: msg.clone() })
+                            .collect();
                     }
                     Err(panic_info) => {
                         let msg = panic_info
                             .downcast_ref::<String>()
                             .map(String::as_str)
                             .or_else(|| panic_info.downcast_ref::<&str>().copied())
-                            .unwrap_or("unknown panic");
+                            .unwrap_or("unknown panic")
+                            .to_owned();
+                        return actions
+                            .iter()
+                            .map(|_| RolloutOutcome::Panic { msg: msg.clone() })
+                            .collect();
+                    }
+                };
+                let initial_scores = board_state.board.scores;
+
+                // Per-action seeds derived from particle RNG
+                let mut particle_rng = ChaCha12Rng::seed_from_u64(seeds[pi]);
+
+                actions
+                    .iter()
+                    .map(|&action| {
+                        let action_seed = particle_rng.next_u64();
+                        let mut action_rng = ChaCha12Rng::seed_from_u64(action_seed);
+
+                        let rollout = panic::catch_unwind(panic::AssertUnwindSafe(|| {
+                            simulator::simulate_action_rollout_prebuilt(
+                                &board_state,
+                                initial_scores,
+                                actor,
+                                action,
+                                Some(&mut action_rng),
+                            )
+                        }));
+                        match rollout {
+                            std::result::Result::Ok(std::result::Result::Ok(result)) => {
+                                RolloutOutcome::Ok {
+                                    action,
+                                    delta: result.deltas[actor as usize],
+                                }
+                            }
+                            std::result::Result::Ok(Err(e)) => {
+                                RolloutOutcome::Error { msg: e.to_string() }
+                            }
+                            Err(panic_info) => RolloutOutcome::Panic {
+                                msg: panic_info
+                                    .downcast_ref::<String>()
+                                    .map(String::as_str)
+                                    .or_else(|| panic_info.downcast_ref::<&str>().copied())
+                                    .unwrap_or("unknown panic")
+                                    .to_owned(),
+                            },
+                        }
+                    })
+                    .collect()
+            })
+            .collect();
+
+        // Aggregate results and record errors
+        let mut action_sums: Vec<f64> = vec![0.0; actions.len()];
+        let mut action_counts: Vec<usize> = vec![0; actions.len()];
+
+        for particle_results in &per_particle {
+            for outcome in particle_results {
+                match outcome {
+                    RolloutOutcome::Ok { action, delta } => {
+                        let ai = actions.iter().position(|&a| a == *action).unwrap();
+                        action_sums[ai] += f64::from(*delta);
+                        action_counts[ai] += 1;
+                    }
+                    RolloutOutcome::Error { msg } => {
+                        self.errors.record_error(msg);
+                        log::debug!("search rollout error: {msg}");
+                    }
+                    RolloutOutcome::Panic { msg } => {
                         self.errors.record_panic(msg);
                         log::warn!("search rollout panic: {msg}");
                     }
