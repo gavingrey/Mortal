@@ -227,38 +227,45 @@ impl SearchModule {
         // Pre-generate per-particle RNG seeds
         let use_smart = self.use_smart_policy;
         let player_id = state.player_id();
-        let seeds: Vec<u64> = (0..particles.len())
+        let n_particles = particles.len();
+        let seeds: Vec<u64> = (0..n_particles)
             .map(|_| self.rng.next_u64())
             .collect();
 
         // Parallel iteration over particles, sequential over actions.
         // collect() preserves particle ordering for deterministic results.
+        // into_par_iter() avoids reference indirection since particles is owned.
         let per_particle: Result<Vec<Vec<(usize, RolloutResult)>>, anyhow::Error> = particles
-            .par_iter()
+            .into_par_iter()
             .enumerate()
             .map(|(i, particle)| {
                 // Build BoardState once per particle
                 let board_state = simulator::build_midgame_board_state_with_base(
-                    state, &replayed, particle, &base,
+                    state, &replayed, &particle, &base,
                 )?;
                 let initial_scores = board_state.board.scores;
 
-                // Create thread-local RNG if needed
-                let mut thread_rng = if use_smart {
-                    Some(ChaCha12Rng::seed_from_u64(seeds[i]))
-                } else {
-                    None
-                };
+                // Derive per-action seeds from the particle RNG so that each
+                // action's rollout is independent — evaluating {0,1} gives the
+                // same result for action 0 as evaluating {0,1,2}.
+                let mut particle_rng = ChaCha12Rng::seed_from_u64(seeds[i]);
 
                 // Sequential iteration over actions (K is small)
                 let mut action_results = Vec::with_capacity(actions.len());
                 for &action in &actions {
+                    let action_seed = particle_rng.next_u64();
+                    let mut action_rng = if use_smart {
+                        Some(ChaCha12Rng::seed_from_u64(action_seed))
+                    } else {
+                        None
+                    };
+
                     let rollout_result = simulator::simulate_action_rollout_prebuilt(
                         &board_state,
                         initial_scores,
                         player_id,
                         action,
-                        thread_rng.as_mut(),
+                        action_rng.as_mut(),
                     )?;
                     action_results.push((action, rollout_result));
                 }
@@ -275,7 +282,7 @@ impl SearchModule {
         // Merge per-particle results in deterministic order
         let mut results = std::collections::HashMap::new();
         for &action in &actions {
-            results.insert(action, Vec::with_capacity(particles.len()));
+            results.insert(action, Vec::with_capacity(n_particles));
         }
         for particle_results in per_particle {
             for (action, result) in particle_results {
@@ -591,6 +598,66 @@ mod test {
             !results.is_empty(),
             "generate_and_simulate should return results"
         );
+    }
+
+    #[test]
+    fn test_evaluate_actions_empty_actions() {
+        let state = setup_basic_game();
+        let mut sm = SearchModule::with_seed(5, 42);
+        let particles = sm.generate_particles(&state).unwrap();
+        let results = sm.evaluate_actions(&state, particles, vec![]).unwrap();
+        assert_eq!(results.len(), 0);
+    }
+
+    #[test]
+    fn test_evaluate_actions_empty_particles() {
+        let state = setup_basic_game();
+        let mut sm = SearchModule::with_seed(5, 42);
+        let results = sm.evaluate_actions(&state, vec![], vec![0, 8]).unwrap();
+        for (_, v) in &results {
+            assert!(v.is_empty());
+        }
+    }
+
+    #[test]
+    fn test_evaluate_actions_action_independence() {
+        // Verify that evaluating {0, 8} gives the same results for action 0
+        // as evaluating {0, 8, 13}. This confirms per-action RNG seeding
+        // makes actions independent of which other actions are evaluated.
+        let state = setup_basic_game();
+
+        let mut sm1 = SearchModule::with_seed(5, 42);
+        let particles1 = sm1.generate_particles(&state).unwrap();
+        let results_2 = sm1
+            .evaluate_actions(&state, particles1, vec![0, 8])
+            .unwrap();
+
+        let mut sm2 = SearchModule::with_seed(5, 42);
+        let particles2 = sm2.generate_particles(&state).unwrap();
+        let results_3 = sm2
+            .evaluate_actions(&state, particles2, vec![0, 8, 13])
+            .unwrap();
+
+        // Action 0 results should be identical regardless of action set size
+        let r0_2 = &results_2[&0];
+        let r0_3 = &results_3[&0];
+        assert_eq!(r0_2.len(), r0_3.len());
+        for (a, b) in r0_2.iter().zip(r0_3.iter()) {
+            assert_eq!(
+                a.deltas, b.deltas,
+                "action 0: deltas should match regardless of action set"
+            );
+        }
+
+        // Action 8 results should also be identical
+        let r8_2 = &results_2[&8];
+        let r8_3 = &results_3[&8];
+        for (a, b) in r8_2.iter().zip(r8_3.iter()) {
+            assert_eq!(
+                a.deltas, b.deltas,
+                "action 8: deltas should match regardless of action set"
+            );
+        }
     }
 }
 
