@@ -11,8 +11,11 @@ use particle::Particle;
 use simulator::RolloutResult;
 
 use pyo3::prelude::*;
+use rand::prelude::*;
 use rand::SeedableRng;
 use rand_chacha::ChaCha12Rng;
+use rayon::prelude::*;
+use std::time::Instant;
 
 /// PyO3-exposed search module entry point.
 #[pyclass]
@@ -22,6 +25,8 @@ pub struct SearchModule {
     use_smart_policy: bool,
     last_gen_attempts: usize,
     last_gen_accepted: usize,
+    last_simulate_time_ms: f64,
+    last_evaluate_time_ms: f64,
 }
 
 #[pymethods]
@@ -35,6 +40,8 @@ impl SearchModule {
             use_smart_policy: true,
             last_gen_attempts: 0,
             last_gen_accepted: 0,
+            last_simulate_time_ms: 0.0,
+            last_evaluate_time_ms: 0.0,
         }
     }
 
@@ -48,6 +55,8 @@ impl SearchModule {
             use_smart_policy: true,
             last_gen_attempts: 0,
             last_gen_accepted: 0,
+            last_simulate_time_ms: 0.0,
+            last_evaluate_time_ms: 0.0,
         }
     }
 
@@ -103,6 +112,20 @@ impl SearchModule {
         self.last_gen_accepted
     }
 
+    /// Wall-clock time (ms) of the last `generate_and_simulate` call.
+    #[getter]
+    #[must_use]
+    pub const fn last_simulate_time_ms(&self) -> f64 {
+        self.last_simulate_time_ms
+    }
+
+    /// Wall-clock time (ms) of the last `evaluate_actions` call.
+    #[getter]
+    #[must_use]
+    pub const fn last_evaluate_time_ms(&self) -> f64 {
+        self.last_evaluate_time_ms
+    }
+
     /// Simulate a single particle rollout using tsumogiri strategy.
     pub fn simulate_particle(
         &self,
@@ -113,14 +136,16 @@ impl SearchModule {
             .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))
     }
 
-    /// Generate particles and simulate all of them, returning results.
+    /// Generate particles and simulate all of them in parallel, returning results.
     ///
     /// Replays event history once and derives the midgame context once,
-    /// then runs one tsumogiri rollout per particle.
+    /// then runs rollouts in parallel across particles using rayon.
     pub fn generate_and_simulate(
         &mut self,
         state: &PlayerState,
     ) -> PyResult<Vec<RolloutResult>> {
+        let start = Instant::now();
+
         let (particles, attempts) =
             particle::generate_particles(state, &self.config, &mut self.rng)
                 .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))?;
@@ -133,21 +158,32 @@ impl SearchModule {
         // Derive event-dependent context once, reuse across all particles
         let base = simulator::derive_midgame_context_base(state.event_history());
 
-        let mut results = Vec::with_capacity(particles.len());
-        for p in &particles {
-            let board_state =
-                simulator::build_midgame_board_state_with_base(state, &replayed, p, &base)
-                    .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))?;
-            let initial_scores = board_state.board.scores;
-            let result = if self.use_smart_policy {
-                simulator::run_rollout_smart(board_state, initial_scores, &mut self.rng)
-            } else {
-                simulator::run_rollout_tsumogiri(board_state, initial_scores)
-            }
-            .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))?;
-            results.push(result);
-        }
-        Ok(results)
+        // Pre-generate per-particle RNG seeds
+        let use_smart = self.use_smart_policy;
+        let seeds: Vec<u64> = (0..particles.len())
+            .map(|_| self.rng.next_u64())
+            .collect();
+
+        // Parallel rollouts across particles
+        let results: Result<Vec<RolloutResult>, _> = particles
+            .par_iter()
+            .enumerate()
+            .map(|(i, p)| {
+                let board_state =
+                    simulator::build_midgame_board_state_with_base(state, &replayed, p, &base)?;
+                let initial_scores = board_state.board.scores;
+                if use_smart {
+                    let mut thread_rng = ChaCha12Rng::seed_from_u64(seeds[i]);
+                    simulator::run_rollout_smart(board_state, initial_scores, &mut thread_rng)
+                } else {
+                    simulator::run_rollout_tsumogiri(board_state, initial_scores)
+                }
+            })
+            .collect();
+
+        self.last_simulate_time_ms = start.elapsed().as_secs_f64() * 1000.0;
+
+        results.map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))
     }
 
     /// Simulate a single particle rollout with a specific action injected.
@@ -164,11 +200,14 @@ impl SearchModule {
             .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))
     }
 
-    /// Evaluate multiple actions across multiple particles.
+    /// Evaluate multiple actions across multiple particles in parallel.
     ///
-    /// Replays event history once and derives midgame context once, then
-    /// for each particle/action pair, clones the replayed states and runs
-    /// a rollout.
+    /// Replays event history once and derives midgame context once. For each
+    /// particle (in parallel), builds the BoardState once and clones it K
+    /// times for K actions (build-once-clone-K optimization).
+    ///
+    /// Uses rayon's `par_iter().map().collect()` which preserves ordering,
+    /// ensuring deterministic results for the same seed.
     /// Returns a dict mapping action index to list of RolloutResults.
     pub fn evaluate_actions(
         &mut self,
@@ -176,6 +215,8 @@ impl SearchModule {
         particles: Vec<Particle>,
         actions: Vec<usize>,
     ) -> PyResult<std::collections::HashMap<usize, Vec<RolloutResult>>> {
+        let start = Instant::now();
+
         // Replay once
         let replayed = simulator::replay_player_states(state)
             .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))?;
@@ -183,33 +224,62 @@ impl SearchModule {
         // Derive event-dependent context once
         let base = simulator::derive_midgame_context_base(state.event_history());
 
-        let mut results = std::collections::HashMap::new();
+        // Pre-generate per-particle RNG seeds
+        let use_smart = self.use_smart_policy;
+        let player_id = state.player_id();
+        let seeds: Vec<u64> = (0..particles.len())
+            .map(|_| self.rng.next_u64())
+            .collect();
 
-        // Round-robin: iterate particles first, then actions, to avoid
-        // sampling bias toward earlier candidates.
+        // Parallel iteration over particles, sequential over actions.
+        // collect() preserves particle ordering for deterministic results.
+        let per_particle: Result<Vec<Vec<(usize, RolloutResult)>>, anyhow::Error> = particles
+            .par_iter()
+            .enumerate()
+            .map(|(i, particle)| {
+                // Build BoardState once per particle
+                let board_state = simulator::build_midgame_board_state_with_base(
+                    state, &replayed, particle, &base,
+                )?;
+                let initial_scores = board_state.board.scores;
+
+                // Create thread-local RNG if needed
+                let mut thread_rng = if use_smart {
+                    Some(ChaCha12Rng::seed_from_u64(seeds[i]))
+                } else {
+                    None
+                };
+
+                // Sequential iteration over actions (K is small)
+                let mut action_results = Vec::with_capacity(actions.len());
+                for &action in &actions {
+                    let rollout_result = simulator::simulate_action_rollout_prebuilt(
+                        &board_state,
+                        initial_scores,
+                        player_id,
+                        action,
+                        thread_rng.as_mut(),
+                    )?;
+                    action_results.push((action, rollout_result));
+                }
+
+                Ok(action_results)
+            })
+            .collect();
+
+        self.last_evaluate_time_ms = start.elapsed().as_secs_f64() * 1000.0;
+
+        let per_particle = per_particle
+            .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))?;
+
+        // Merge per-particle results in deterministic order
+        let mut results = std::collections::HashMap::new();
         for &action in &actions {
             results.insert(action, Vec::with_capacity(particles.len()));
         }
-
-        for particle in &particles {
-            for &action in &actions {
-                let result = if self.use_smart_policy {
-                    simulator::simulate_action_rollout_with_base_smart(
-                        state, &replayed, particle, action, &base, &mut self.rng,
-                    )
-                } else {
-                    simulator::simulate_action_rollout_with_base(
-                        state, &replayed, particle, action, &base,
-                    )
-                };
-                match result {
-                    Ok(result) => results.get_mut(&action).unwrap().push(result),
-                    Err(e) => {
-                        return Err(pyo3::exceptions::PyRuntimeError::new_err(format!(
-                            "action {action}: {e}"
-                        )));
-                    }
-                }
+        for particle_results in per_particle {
+            for (action, result) in particle_results {
+                results.get_mut(&action).unwrap().push(result);
             }
         }
 
@@ -264,6 +334,263 @@ pub(crate) mod test_utils {
         state.update(&tsumo_event).unwrap();
 
         state
+    }
+}
+
+#[cfg(test)]
+mod test {
+    use super::*;
+    use crate::search::test_utils::setup_basic_game;
+
+    #[test]
+    fn test_boardstate_clone_independence() {
+        // Clone a BoardState, step the original forward, verify clone is unchanged.
+        use crate::arena::Board;
+        use crate::search::config::ParticleConfig;
+        use crate::search::particle::generate_particles;
+
+        let state = setup_basic_game();
+        let config = ParticleConfig::new(1);
+        let mut rng = ChaCha12Rng::seed_from_u64(42);
+
+        let (particles, _) = generate_particles(&state, &config, &mut rng).unwrap();
+        let bs = simulator::build_midgame_board_state(&state, &particles[0]).unwrap();
+
+        // Clone the BoardState
+        let clone = bs.clone();
+
+        // Verify fields match before mutation
+        assert_eq!(bs.board.scores, clone.board.scores);
+        assert_eq!(bs.board.kyoku, clone.board.kyoku);
+        assert_eq!(bs.tiles_left, clone.tiles_left);
+        assert_eq!(bs.board.yama.len(), clone.board.yama.len());
+
+        // Mutate the clone by stepping it forward
+        let mut mutated = clone;
+        let reactions: [crate::mjai::EventExt; 4] = Default::default();
+        // Step the mutated copy forward — it may change tiles_left, yama, etc.
+        drop(mutated.poll(reactions));
+
+        // Original should be untouched
+        assert_eq!(bs.board.scores, [25000; 4]);
+        assert_eq!(bs.board.kyoku, 0);
+    }
+
+    #[test]
+    fn test_simulate_action_rollout_prebuilt_correctness() {
+        // Verify prebuilt function produces same results as existing
+        // simulate_action_rollout_with_base_smart for the same inputs.
+        use crate::search::config::ParticleConfig;
+        use crate::search::particle::generate_particles;
+
+        let state = setup_basic_game();
+        let config = ParticleConfig::new(5);
+        let mut rng = ChaCha12Rng::seed_from_u64(42);
+
+        let (particles, _) = generate_particles(&state, &config, &mut rng).unwrap();
+        let replayed = simulator::replay_player_states(&state).unwrap();
+        let base = simulator::derive_midgame_context_base(state.event_history());
+
+        let action = 0_usize; // discard 1m
+        let player_id = state.player_id();
+
+        for particle in &particles {
+            // Method 1: existing approach (build + run_rollout internally)
+            let mut rng1 = ChaCha12Rng::seed_from_u64(999);
+            let result1 = simulator::simulate_action_rollout_with_base_smart(
+                &state, &replayed, particle, action, &base, &mut rng1,
+            )
+            .unwrap();
+
+            // Method 2: prebuilt approach (build once, clone K times)
+            let mut rng2 = ChaCha12Rng::seed_from_u64(999);
+            let board_state = simulator::build_midgame_board_state_with_base(
+                &state, &replayed, particle, &base,
+            )
+            .unwrap();
+            let initial_scores = board_state.board.scores;
+            let result2 = simulator::simulate_action_rollout_prebuilt(
+                &board_state,
+                initial_scores,
+                player_id,
+                action,
+                Some(&mut rng2),
+            )
+            .unwrap();
+
+            assert_eq!(
+                result1.deltas, result2.deltas,
+                "prebuilt should match existing approach"
+            );
+            assert_eq!(result1.scores, result2.scores);
+            assert_eq!(result1.has_hora, result2.has_hora);
+            assert_eq!(result1.steps, result2.steps);
+        }
+    }
+
+    #[test]
+    fn test_generate_and_simulate_determinism() {
+        // Same seed produces same results across multiple calls.
+        let state = setup_basic_game();
+
+        let mut sm1 = SearchModule::with_seed(10, 42);
+        let results1 = sm1.generate_and_simulate(&state).unwrap();
+
+        let mut sm2 = SearchModule::with_seed(10, 42);
+        let results2 = sm2.generate_and_simulate(&state).unwrap();
+
+        assert_eq!(results1.len(), results2.len());
+        for (r1, r2) in results1.iter().zip(results2.iter()) {
+            assert_eq!(r1.deltas, r2.deltas, "determinism: deltas should match");
+            assert_eq!(r1.scores, r2.scores, "determinism: scores should match");
+        }
+    }
+
+    #[test]
+    fn test_evaluate_actions_determinism() {
+        // Same seed produces same results across multiple calls.
+        let state = setup_basic_game();
+
+        let mut sm1 = SearchModule::with_seed(10, 42);
+        let particles1 = sm1.generate_particles(&state).unwrap();
+        let actions = vec![0_usize, 8, 13]; // discard 1m, 9m, 5p
+        let results1 = sm1.evaluate_actions(&state, particles1.clone(), actions.clone()).unwrap();
+
+        let mut sm2 = SearchModule::with_seed(10, 42);
+        let particles2 = sm2.generate_particles(&state).unwrap();
+        let results2 = sm2.evaluate_actions(&state, particles2, actions.clone()).unwrap();
+
+        for &action in &actions {
+            let r1 = &results1[&action];
+            let r2 = &results2[&action];
+            assert_eq!(r1.len(), r2.len(), "action {action}: result counts should match");
+            for (a, b) in r1.iter().zip(r2.iter()) {
+                assert_eq!(a.deltas, b.deltas, "action {action}: deltas should match");
+                assert_eq!(a.scores, b.scores, "action {action}: scores should match");
+            }
+        }
+    }
+
+    #[test]
+    fn test_evaluate_actions_correctness() {
+        // Results have expected structure: each action gets N results, scores are valid.
+        let state = setup_basic_game();
+        let mut sm = SearchModule::with_seed(10, 42);
+        let particles = sm.generate_particles(&state).unwrap();
+        let n = particles.len();
+        let actions = vec![0_usize, 8, 13];
+        let results = sm.evaluate_actions(&state, particles, actions.clone()).unwrap();
+
+        assert_eq!(results.len(), actions.len(), "should have one entry per action");
+        for &action in &actions {
+            let action_results = &results[&action];
+            assert_eq!(
+                action_results.len(),
+                n,
+                "action {action} should have {n} results"
+            );
+            for r in action_results {
+                // Deltas should sum to at most 1000 (riichi sticks)
+                let delta_sum: i32 = r.deltas.iter().sum();
+                assert!(
+                    delta_sum.abs() <= 1000,
+                    "action {action}: delta sum {delta_sum} too large"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn test_evaluate_actions_build_once_clone_k() {
+        // Verify that the build-once-clone-K pattern produces identical results
+        // to the old per-pair rebuild pattern.
+        //
+        // We compare prebuilt (clone-based) against explicit rebuild for each action.
+        use crate::search::config::ParticleConfig;
+        use crate::search::particle::generate_particles;
+
+        let state = setup_basic_game();
+        let config = ParticleConfig::new(5);
+        let mut rng = ChaCha12Rng::seed_from_u64(42);
+
+        let (particles, _) = generate_particles(&state, &config, &mut rng).unwrap();
+        let replayed = simulator::replay_player_states(&state).unwrap();
+        let base = simulator::derive_midgame_context_base(state.event_history());
+        let player_id = state.player_id();
+        let actions = [0_usize, 8, 13];
+
+        for particle in &particles {
+            // Build once
+            let board_state = simulator::build_midgame_board_state_with_base(
+                &state, &replayed, particle, &base,
+            )
+            .unwrap();
+            let initial_scores = board_state.board.scores;
+
+            for &action in &actions {
+                // Clone-K approach
+                let mut rng_clone = ChaCha12Rng::seed_from_u64(777);
+                let result_clone = simulator::simulate_action_rollout_prebuilt(
+                    &board_state,
+                    initial_scores,
+                    player_id,
+                    action,
+                    Some(&mut rng_clone),
+                )
+                .unwrap();
+
+                // Rebuild approach (existing)
+                let mut rng_rebuild = ChaCha12Rng::seed_from_u64(777);
+                let result_rebuild = simulator::simulate_action_rollout_with_base_smart(
+                    &state, &replayed, particle, action, &base, &mut rng_rebuild,
+                )
+                .unwrap();
+
+                assert_eq!(
+                    result_clone.deltas, result_rebuild.deltas,
+                    "clone-K vs rebuild: action {action} deltas should match"
+                );
+                assert_eq!(
+                    result_clone.scores, result_rebuild.scores,
+                    "clone-K vs rebuild: action {action} scores should match"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn test_timing_metrics_populated() {
+        // Verify that timing fields are set after generate_and_simulate / evaluate_actions.
+        let state = setup_basic_game();
+
+        let mut sm = SearchModule::with_seed(5, 42);
+        assert_eq!(sm.last_simulate_time_ms(), 0.0);
+        assert_eq!(sm.last_evaluate_time_ms(), 0.0);
+
+        drop(sm.generate_and_simulate(&state).unwrap());
+        assert!(
+            sm.last_simulate_time_ms() > 0.0,
+            "simulate time should be > 0 after call"
+        );
+
+        let particles = sm.generate_particles(&state).unwrap();
+        drop(sm.evaluate_actions(&state, particles, vec![0, 13]).unwrap());
+        assert!(
+            sm.last_evaluate_time_ms() > 0.0,
+            "evaluate time should be > 0 after call"
+        );
+    }
+
+    #[test]
+    fn test_generate_and_simulate_produces_results() {
+        // Basic smoke test: generate_and_simulate returns non-empty results.
+        let state = setup_basic_game();
+        let mut sm = SearchModule::with_seed(10, 42);
+        let results = sm.generate_and_simulate(&state).unwrap();
+        assert!(
+            !results.is_empty(),
+            "generate_and_simulate should return results"
+        );
     }
 }
 

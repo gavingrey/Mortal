@@ -1060,6 +1060,28 @@ pub fn simulate_action_rollout_with_base_smart(
     run_rollout(board_state, initial_scores, Some(player_id), Some(action), Some(rng))
 }
 
+/// Simulate an action rollout on a pre-built BoardState.
+///
+/// Clones the provided BoardState and runs the rollout with the specified
+/// action injected. Use this for build-once-clone-K patterns where the
+/// caller builds a BoardState once per particle and clones K times for
+/// K different actions.
+pub fn simulate_action_rollout_prebuilt(
+    board_state: &BoardState,
+    initial_scores: [i32; 4],
+    player_id: u8,
+    action: usize,
+    smart_rng: Option<&mut ChaCha12Rng>,
+) -> Result<RolloutResult> {
+    run_rollout(
+        board_state.clone(),
+        initial_scores,
+        Some(player_id),
+        Some(action),
+        smart_rng,
+    )
+}
+
 #[cfg(test)]
 mod test {
     use super::*;

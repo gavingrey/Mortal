@@ -47,7 +47,7 @@ pub struct Board {
     pub ura_indicators: Vec<Tile>,
 }
 
-#[derive(Derivative)]
+#[derive(Clone, Derivative)]
 #[derivative(Default)]
 pub struct BoardState {
     pub(crate) board: Board,
