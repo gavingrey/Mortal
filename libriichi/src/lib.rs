@@ -141,6 +141,14 @@ fn libriichi(py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
     algo::shanten::ensure_init();
     algo::agari::ensure_init();
 
+    // Configure rayon global thread pool with explicit stack size.
+    // Default 8MB stacks can overflow during complex rollout simulations.
+    // This must run before any rayon parallel operation.
+    rayon::ThreadPoolBuilder::new()
+        .stack_size(64 * 1024 * 1024) // 64 MB per thread
+        .build_global()
+        .ok(); // Ignore if already initialized
+
     let name = m.name()?;
     let name = name.extract()?;
     if cfg!(debug_assertions) {
