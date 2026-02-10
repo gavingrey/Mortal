@@ -140,6 +140,11 @@ impl SearchModule {
     ///
     /// Replays event history once and derives the midgame context once,
     /// then runs rollouts in parallel across particles using rayon.
+    ///
+    /// Note: does not release the Python GIL via `py.allow_threads()` because
+    /// test code calls this from pure Rust without a Python context. The parallel
+    /// section takes ~4ms (vs seconds for arena functions that use allow_threads),
+    /// so GIL contention is negligible. Revisit if Python multithreading is added.
     pub fn generate_and_simulate(
         &mut self,
         state: &PlayerState,

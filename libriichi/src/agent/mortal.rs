@@ -96,7 +96,7 @@ impl ErrorMetrics {
         }
     }
 
-    fn total(&self) -> u32 {
+    const fn total(&self) -> u32 {
         self.panics + self.rollout_errors
     }
 }
