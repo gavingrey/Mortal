@@ -2,6 +2,7 @@ use super::{BatchAgent, InvisibleState};
 use crate::consts::ACTION_SPACE;
 use crate::mjai::{Event, EventExt, Metadata};
 use crate::search::config::ParticleConfig;
+use crate::search::grp::{self, GrpEntry, GrpEvaluator};
 use crate::search::{particle, simulator};
 use crate::state::PlayerState;
 use crate::{must_tile, tu8};
@@ -108,6 +109,10 @@ struct SearchIntegration {
     config: ParticleConfig,
     max_candidates: usize,
     search_weight: f32,
+
+    // GRP value truncation (optional — when None, uses terminal rollouts)
+    grp: Option<GrpEvaluator>,
+    grp_max_steps: u32,
 
     // Core counts
     search_count: u32,
@@ -441,6 +446,370 @@ impl SearchIntegration {
         // Threshold: 0.25 means at least one significant factor must be present
         score >= 0.25
     }
+
+    /// Build GRP history from the player's event history.
+    ///
+    /// Extracts all StartKyoku events to build the sequence of kyoku
+    /// boundary entries. Excludes the current kyoku (the one we're
+    /// currently playing in) since that will be evaluated separately.
+    fn build_grp_history(events: &[Event]) -> Vec<GrpEntry> {
+        let mut history = Vec::new();
+        let mut kyoku_count = 0_usize;
+        for event in events {
+            if let Event::StartKyoku {
+                bakaze,
+                kyoku,
+                honba,
+                kyotaku,
+                scores,
+                ..
+            } = event
+            {
+                kyoku_count += 1;
+                // bakaze is a Tile: E=27, S=28, W=29, N=30
+                let grand_kyoku = (bakaze.as_u8() - tu8!(E)) * 4 + (kyoku - 1);
+                let entry = grp::make_grp_entry(
+                    grand_kyoku,
+                    *honba,
+                    *kyotaku,
+                    scores,
+                );
+                history.push(entry);
+            }
+        }
+        // Remove the last entry (current kyoku) — it's evaluated as the baseline
+        if kyoku_count > 1 {
+            history.pop();
+        } else {
+            // Only one kyoku seen (the current one) — no history
+            history.clear();
+        }
+        history
+    }
+
+    /// GRP-based search override: truncated rollouts + value network evaluation.
+    ///
+    /// Returns `Some(action)` if search found a better action, `None` to keep DQN choice.
+    fn maybe_override_grp(
+        &mut self,
+        state: &PlayerState,
+        q_values: &[f32; ACTION_SPACE],
+        masks: &[bool; ACTION_SPACE],
+        actor: u8,
+    ) -> Option<usize> {
+        let grp = self.grp.as_ref()?;
+        let start = Instant::now();
+
+        if !Self::is_critical(state) {
+            self.skips.low_criticality += 1;
+            return None;
+        }
+
+        // Get top-k candidate actions by q-value (excluding riichi=37)
+        let mut candidates: Vec<(usize, f32)> = q_values
+            .iter()
+            .enumerate()
+            .filter(|&(i, _)| masks[i] && i != 37)
+            .map(|(i, &q)| (i, q))
+            .collect();
+        candidates.sort_by(|a, b| b.1.total_cmp(&a.1));
+        candidates.truncate(self.max_candidates);
+
+        if candidates.len() < 2 {
+            self.skips.insufficient_candidates += 1;
+            return None;
+        }
+
+        let actions: Vec<usize> = candidates.iter().map(|&(a, _)| a).collect();
+        let n_target = self.config.n_particles;
+
+        // Generate particles
+        let gen_result = particle::generate_particles(state, &self.config, &mut self.rng);
+        let (particles, attempts) = match gen_result {
+            Ok(pair) => pair,
+            Err(e) => {
+                self.skips.particle_gen_error += 1;
+                log::debug!("particle gen error: {e}");
+                return None;
+            }
+        };
+        self.particle_gen_attempts += attempts as u32;
+        if particles.is_empty() {
+            self.skips.no_particles += 1;
+            return None;
+        }
+        self.particles_requested += n_target as u32;
+        self.particles_generated += particles.len() as u32;
+
+        self.search_count += 1;
+
+        // Replay event history once
+        let replayed = match simulator::replay_player_states(state) {
+            Ok(r) => r,
+            Err(e) => {
+                self.skips.replay_error += 1;
+                log::debug!("replay error: {e}");
+                self.record_elapsed(start);
+                return None;
+            }
+        };
+
+        let base = simulator::derive_midgame_context_base(state.event_history());
+        let seeds: Vec<u64> = (0..particles.len())
+            .map(|_| self.rng.next_u64())
+            .collect();
+
+        let max_steps = self.grp_max_steps;
+
+        // Build GRP history from event log (previous kyoku boundaries)
+        let grp_history = Self::build_grp_history(state.event_history());
+
+        // Compute current expected value (baseline for relative improvement)
+        let current_scores = state.scores();
+        let player_id = state.player_id();
+
+        // Build the current state GRP entry
+        // PlayerState.bakaze().as_u8() gives wind tile (27=E, 28=S, etc.)
+        // grand_kyoku = (bakaze - E) * 4 + kyoku_within_wind
+        let bakaze_u8 = state.bakaze().as_u8();
+        let grand_kyoku = (bakaze_u8 - tu8!(E)) * 4 + state.kyoku();
+        let current_honba = state.honba();
+        let current_kyotaku = state.kyotaku();
+
+        // Un-rotate scores: PlayerState uses relative (0=self), GRP needs absolute
+        let mut abs_scores = [0_i32; 4];
+        for i in 0..4 {
+            abs_scores[(player_id as usize + i) % 4] = current_scores[i];
+        }
+
+        let current_entry = grp::make_grp_entry(
+            grand_kyoku,
+            current_honba,
+            current_kyotaku,
+            &abs_scores,
+        );
+
+        let current_ev = match grp.evaluate_leaf_rust(
+            &grp_history,
+            &current_entry,
+            player_id,
+        ) {
+            Ok(ev) => ev,
+            Err(e) => {
+                log::debug!("GRP baseline eval error: {e}");
+                self.record_elapsed(start);
+                return None;
+            }
+        };
+
+        // Parallel truncated rollouts: particle-first, action-second
+        enum GrpOutcome {
+            Ok { action: usize, value: f64 },
+            Error { msg: String },
+            Panic { msg: String },
+        }
+
+        let history = &grp_history;
+
+        let per_particle: Vec<Vec<GrpOutcome>> = particles
+            .par_iter()
+            .enumerate()
+            .map(|(pi, p)| {
+                let board_state = match panic::catch_unwind(panic::AssertUnwindSafe(|| {
+                    simulator::build_midgame_board_state_with_base(state, &replayed, p, &base)
+                })) {
+                    Ok(Ok(bs)) => bs,
+                    Ok(Err(e)) => {
+                        let msg = e.to_string();
+                        return actions
+                            .iter()
+                            .map(|_| GrpOutcome::Error { msg: msg.clone() })
+                            .collect();
+                    }
+                    Err(panic_info) => {
+                        let msg = panic_info
+                            .downcast_ref::<String>()
+                            .map(String::as_str)
+                            .or_else(|| panic_info.downcast_ref::<&str>().copied())
+                            .unwrap_or("unknown panic")
+                            .to_owned();
+                        return actions
+                            .iter()
+                            .map(|_| GrpOutcome::Panic { msg: msg.clone() })
+                            .collect();
+                    }
+                };
+                let initial_scores = board_state.board.scores;
+
+                let mut particle_rng = ChaCha12Rng::seed_from_u64(seeds[pi]);
+
+                actions
+                    .iter()
+                    .map(|&action| {
+                        let action_seed = particle_rng.next_u64();
+                        let mut action_rng = ChaCha12Rng::seed_from_u64(action_seed);
+
+                        let rollout = panic::catch_unwind(panic::AssertUnwindSafe(|| {
+                            simulator::simulate_action_rollout_prebuilt_truncated(
+                                &board_state,
+                                initial_scores,
+                                actor,
+                                action,
+                                Some(&mut action_rng),
+                                max_steps,
+                            )
+                        }));
+                        match rollout {
+                            std::result::Result::Ok(std::result::Result::Ok(result)) => {
+                                if result.terminated {
+                                    // Game ended naturally: use raw delta as value
+                                    let delta = f64::from(result.deltas[actor as usize]);
+                                    // Normalize delta to same scale as GRP expected pts:
+                                    // delta is in raw points (e.g. +8000), convert to
+                                    // placement-point scale by dividing by 10000
+                                    let value = delta / 10000.0;
+                                    GrpOutcome::Ok { action, value }
+                                } else {
+                                    // Truncated: evaluate leaf with GRP
+                                    let leaf_entry = grp::make_grp_entry(
+                                        result.kyoku,
+                                        result.honba,
+                                        result.kyotaku,
+                                        &result.scores,
+                                    );
+                                    // GRP evaluation cannot use self.grp (borrow conflict
+                                    // inside par_iter), so we do inline evaluation
+                                    match grp.evaluate_leaf_rust(
+                                        history,
+                                        &leaf_entry,
+                                        actor,
+                                    ) {
+                                        Ok(leaf_ev) => {
+                                            let value = leaf_ev - current_ev;
+                                            GrpOutcome::Ok { action, value }
+                                        }
+                                        Err(e) => {
+                                            GrpOutcome::Error { msg: e.to_string() }
+                                        }
+                                    }
+                                }
+                            }
+                            std::result::Result::Ok(Err(e)) => {
+                                GrpOutcome::Error { msg: e.to_string() }
+                            }
+                            Err(panic_info) => GrpOutcome::Panic {
+                                msg: panic_info
+                                    .downcast_ref::<String>()
+                                    .map(String::as_str)
+                                    .or_else(|| panic_info.downcast_ref::<&str>().copied())
+                                    .unwrap_or("unknown panic")
+                                    .to_owned(),
+                            },
+                        }
+                    })
+                    .collect()
+            })
+            .collect();
+
+        // Aggregate results
+        let mut action_sums: Vec<f64> = vec![0.0; actions.len()];
+        let mut action_counts: Vec<usize> = vec![0; actions.len()];
+
+        for particle_results in &per_particle {
+            for outcome in particle_results {
+                match outcome {
+                    GrpOutcome::Ok { action, value } => {
+                        let ai = actions.iter().position(|&a| a == *action).unwrap();
+                        action_sums[ai] += value;
+                        action_counts[ai] += 1;
+                    }
+                    GrpOutcome::Error { msg } => {
+                        self.errors.record_error(msg);
+                        log::debug!("search GRP rollout error: {msg}");
+                    }
+                    GrpOutcome::Panic { msg } => {
+                        self.errors.record_panic(msg);
+                        log::warn!("search GRP rollout panic: {msg}");
+                    }
+                }
+            }
+        }
+
+        // Compute mean search values
+        let search_values: Vec<f64> = action_sums
+            .iter()
+            .zip(action_counts.iter())
+            .map(|(&sum, &count)| if count > 0 { sum / count as f64 } else { f64::NEG_INFINITY })
+            .collect();
+
+        // Normalize search values to [0, 1] range
+        let search_min = search_values
+            .iter()
+            .copied()
+            .filter(|v| v.is_finite())
+            .fold(f64::INFINITY, f64::min);
+        let search_max = search_values
+            .iter()
+            .copied()
+            .filter(|v| v.is_finite())
+            .fold(f64::NEG_INFINITY, f64::max);
+        let search_range = search_max - search_min;
+
+        let normalized_search: Vec<f64> = if search_range > 1e-10 {
+            search_values
+                .iter()
+                .map(|&v| {
+                    if v.is_finite() {
+                        (v - search_min) / search_range
+                    } else {
+                        0.0
+                    }
+                })
+                .collect()
+        } else {
+            self.skips.inconclusive += 1;
+            self.record_elapsed(start);
+            return None;
+        };
+
+        // Blend with policy
+        let candidate_q: Vec<f32> = candidates.iter().map(|&(_, q)| q).collect();
+        let q_max = candidate_q
+            .iter()
+            .copied()
+            .fold(f32::NEG_INFINITY, f32::max);
+        let exp_q: Vec<f64> = candidate_q
+            .iter()
+            .map(|&q| f64::from(q - q_max).exp())
+            .collect();
+        let exp_sum: f64 = exp_q.iter().sum();
+        let policy: Vec<f64> = exp_q.iter().map(|&e| e / exp_sum).collect();
+
+        let w = f64::from(self.search_weight);
+        let blended: Vec<f64> = normalized_search
+            .iter()
+            .zip(policy.iter())
+            .map(|(&s, &p)| w.mul_add(s, (1.0 - w) * p))
+            .collect();
+
+        let best_idx = blended
+            .iter()
+            .enumerate()
+            .max_by(|(_, a), (_, b)| a.total_cmp(b))?
+            .0;
+
+        let best_action = actions[best_idx];
+        let dqn_action = candidates[0].0;
+
+        self.record_elapsed(start);
+
+        if best_action != dqn_action {
+            self.override_count += 1;
+            Some(best_action)
+        } else {
+            None
+        }
+    }
 }
 
 impl SearchIntegration {
@@ -593,7 +962,22 @@ impl MortalBatchAgent {
                     .getattr("search_weight")
                     .and_then(|v| v.extract())
                     .unwrap_or(0.5);
-                Some((n_particles, seed, weight))
+
+                // GRP model path (optional)
+                let grp_model_path: Option<String> = obj
+                    .getattr("search_grp_model")
+                    .and_then(|v| v.extract())
+                    .ok();
+                let grp_max_steps: u32 = obj
+                    .getattr("search_max_steps")
+                    .and_then(|v| v.extract())
+                    .unwrap_or(20);
+                let grp_placement_pts: Option<[f64; 4]> = obj
+                    .getattr("search_placement_pts")
+                    .and_then(|v| v.extract())
+                    .ok();
+
+                Some((n_particles, seed, weight, grp_model_path, grp_max_steps, grp_placement_pts))
             } else {
                 None
             };
@@ -608,26 +992,38 @@ impl MortalBatchAgent {
             ))
         })?;
 
-        let search = search_cfg.map(|(n_particles, seed, weight)| {
-            let rng = match seed {
-                Some(s) => ChaCha12Rng::seed_from_u64(s),
-                None => ChaCha12Rng::from_os_rng(),
-            };
-            SearchIntegration {
-                rng,
-                config: ParticleConfig::new(n_particles),
-                max_candidates: 5,
-                search_weight: weight,
-                search_count: 0_u32,
-                override_count: 0_u32,
-                skips: SkipMetrics::default(),
-                errors: ErrorMetrics::default(),
-                search_times_us: Vec::new(),
-                particles_requested: 0_u32,
-                particles_generated: 0_u32,
-                particle_gen_attempts: 0_u32,
-            }
-        });
+        let search = search_cfg
+            .map(|(n_particles, seed, weight, grp_model_path, grp_max_steps, grp_placement_pts)| {
+                let rng = match seed {
+                    Some(s) => ChaCha12Rng::seed_from_u64(s),
+                    None => ChaCha12Rng::from_os_rng(),
+                };
+
+                let placement_pts = grp_placement_pts.unwrap_or([6.0, 4.0, 2.0, 0.0]);
+
+                let grp = grp_model_path.map(|path| {
+                    log::info!("Loading GRP model from {path}");
+                    GrpEvaluator::load(&path, placement_pts)
+                        .expect("failed to load GRP ONNX model")
+                });
+
+                SearchIntegration {
+                    rng,
+                    config: ParticleConfig::new(n_particles),
+                    max_candidates: 5,
+                    search_weight: weight,
+                    grp,
+                    grp_max_steps,
+                    search_count: 0_u32,
+                    override_count: 0_u32,
+                    skips: SkipMetrics::default(),
+                    errors: ErrorMetrics::default(),
+                    search_times_us: Vec::new(),
+                    particles_requested: 0_u32,
+                    particles_generated: 0_u32,
+                    particle_gen_attempts: 0_u32,
+                }
+            });
 
         let size = player_ids.len();
         let quick_eval_reactions = if enable_quick_eval {
@@ -901,14 +1297,24 @@ impl BatchAgent for MortalBatchAgent {
         // riichi (two-step action), so don't risk suppressing it.
         let action = if action != 37 {
             if let Some(ref mut search) = self.search {
-                search
-                    .maybe_override(
+                // Use GRP-based search when a GRP model is loaded,
+                // otherwise fall back to terminal rollout search.
+                let override_action = if search.grp.is_some() {
+                    search.maybe_override_grp(
                         state,
                         &self.q_values[action_idx],
                         &self.masks_recv[action_idx],
                         actor,
                     )
-                    .unwrap_or(action)
+                } else {
+                    search.maybe_override(
+                        state,
+                        &self.q_values[action_idx],
+                        &self.masks_recv[action_idx],
+                        actor,
+                    )
+                };
+                override_action.unwrap_or(action)
             } else {
                 action
             }
@@ -1260,6 +1666,8 @@ mod tests {
             config: ParticleConfig::new(10),
             max_candidates: 5,
             search_weight: 0.5,
+            grp: None,
+            grp_max_steps: 20,
             search_count: 0,
             override_count: 0,
             skips: SkipMetrics::default(),
@@ -1279,6 +1687,8 @@ mod tests {
             config: ParticleConfig::new(50),
             max_candidates: 5,
             search_weight: 0.5,
+            grp: None,
+            grp_max_steps: 20,
             search_count: 10,
             override_count: 3,
             skips: SkipMetrics {

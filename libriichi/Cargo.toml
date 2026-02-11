@@ -31,6 +31,7 @@ crossbeam = "0.8"
 pyo3 = { version = "0.25", features = ["auto-initialize", "multiple-pymethods", "anyhow"] }
 indicatif = { version = "0.17", features = ["rayon"] }
 tinyvec = { version = "1", features = ["alloc", "serde", "rustc_1_57"] }
+tract-onnx = "0.21"
 serde = { version = "1", features = ["derive"] }
 derive_more = { version = "2", features = ["add", "add_assign", "sum"] }
 mimalloc = { version = "0.1", default-features = false, optional = true }

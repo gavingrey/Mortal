@@ -1,4 +1,5 @@
 pub mod config;
+pub mod grp;
 pub mod heuristic;
 pub mod particle;
 pub mod simulator;
@@ -7,8 +8,9 @@ use crate::py_helper::add_submodule;
 use crate::state::PlayerState;
 
 use config::ParticleConfig;
+use grp::GrpEvaluator;
 use particle::Particle;
-use simulator::RolloutResult;
+use simulator::{RolloutResult, TruncatedResult};
 
 use pyo3::prelude::*;
 use rand::prelude::*;
@@ -203,6 +205,85 @@ impl SearchModule {
     ) -> PyResult<RolloutResult> {
         simulator::simulate_action_rollout(state, particle, action)
             .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))
+    }
+
+    /// Evaluate multiple actions with truncated rollouts in parallel.
+    ///
+    /// Same as `evaluate_actions` but uses truncated rollouts that stop after
+    /// `max_steps` heuristic steps. Returns `TruncatedResult` with leaf state
+    /// information needed for GRP evaluation.
+    pub fn evaluate_actions_truncated(
+        &mut self,
+        state: &PlayerState,
+        particles: Vec<Particle>,
+        actions: Vec<usize>,
+        max_steps: u32,
+    ) -> PyResult<std::collections::HashMap<usize, Vec<TruncatedResult>>> {
+        let start = Instant::now();
+
+        let replayed = simulator::replay_player_states(state)
+            .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))?;
+
+        let base = simulator::derive_midgame_context_base(state.event_history());
+
+        let use_smart = self.use_smart_policy;
+        let player_id = state.player_id();
+        let n_particles = particles.len();
+        let seeds: Vec<u64> = (0..n_particles)
+            .map(|_| self.rng.next_u64())
+            .collect();
+
+        let per_particle: Result<Vec<Vec<(usize, TruncatedResult)>>, anyhow::Error> = particles
+            .into_par_iter()
+            .enumerate()
+            .map(|(i, particle)| {
+                let board_state = simulator::build_midgame_board_state_with_base(
+                    state, &replayed, &particle, &base,
+                )?;
+                let initial_scores = board_state.board.scores;
+
+                let mut particle_rng = ChaCha12Rng::seed_from_u64(seeds[i]);
+
+                let mut action_results = Vec::with_capacity(actions.len());
+                for &action in &actions {
+                    let action_seed = particle_rng.next_u64();
+                    let mut action_rng = if use_smart {
+                        Some(ChaCha12Rng::seed_from_u64(action_seed))
+                    } else {
+                        None
+                    };
+
+                    let result = simulator::simulate_action_rollout_prebuilt_truncated(
+                        &board_state,
+                        initial_scores,
+                        player_id,
+                        action,
+                        action_rng.as_mut(),
+                        max_steps,
+                    )?;
+                    action_results.push((action, result));
+                }
+
+                Ok(action_results)
+            })
+            .collect();
+
+        self.last_evaluate_time_ms = start.elapsed().as_secs_f64() * 1000.0;
+
+        let per_particle = per_particle
+            .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))?;
+
+        let mut results = std::collections::HashMap::new();
+        for &action in &actions {
+            results.insert(action, Vec::with_capacity(n_particles));
+        }
+        for particle_results in per_particle {
+            for (action, result) in particle_results {
+                results.get_mut(&action).unwrap().push(result);
+            }
+        }
+
+        Ok(results)
     }
 
     /// Evaluate multiple actions across multiple particles in parallel.
@@ -664,6 +745,59 @@ mod test {
             );
         }
     }
+
+    #[test]
+    fn test_evaluate_actions_truncated_basic() {
+        // Truncated evaluation should return TruncatedResults with correct structure.
+        let state = setup_basic_game();
+        let mut sm = SearchModule::with_seed(5, 42);
+        let particles = sm.generate_particles(&state).unwrap();
+        let n = particles.len();
+        let actions = vec![0_usize, 8, 13];
+        let results = sm
+            .evaluate_actions_truncated(&state, particles, actions.clone(), 10)
+            .unwrap();
+
+        assert_eq!(results.len(), actions.len());
+        for &action in &actions {
+            let action_results = &results[&action];
+            assert_eq!(action_results.len(), n);
+            for r in action_results {
+                assert!(r.steps <= 10, "truncated should stop at max_steps");
+                // kyoku should be reasonable
+                assert!(r.kyoku <= 15, "kyoku={} too large", r.kyoku);
+            }
+        }
+    }
+
+    #[test]
+    fn test_evaluate_actions_truncated_determinism() {
+        let state = setup_basic_game();
+
+        let mut sm1 = SearchModule::with_seed(5, 42);
+        let particles1 = sm1.generate_particles(&state).unwrap();
+        let results1 = sm1
+            .evaluate_actions_truncated(&state, particles1, vec![0, 8], 10)
+            .unwrap();
+
+        let mut sm2 = SearchModule::with_seed(5, 42);
+        let particles2 = sm2.generate_particles(&state).unwrap();
+        let results2 = sm2
+            .evaluate_actions_truncated(&state, particles2, vec![0, 8], 10)
+            .unwrap();
+
+        for &action in &[0, 8] {
+            let r1 = &results1[&action];
+            let r2 = &results2[&action];
+            assert_eq!(r1.len(), r2.len());
+            for (a, b) in r1.iter().zip(r2.iter()) {
+                assert_eq!(a.deltas, b.deltas, "truncated determinism: deltas");
+                assert_eq!(a.scores, b.scores, "truncated determinism: scores");
+                assert_eq!(a.terminated, b.terminated, "truncated determinism: terminated");
+                assert_eq!(a.steps, b.steps, "truncated determinism: steps");
+            }
+        }
+    }
 }
 
 pub(crate) fn register_module(
@@ -676,5 +810,7 @@ pub(crate) fn register_module(
     m.add_class::<ParticleConfig>()?;
     m.add_class::<Particle>()?;
     m.add_class::<RolloutResult>()?;
+    m.add_class::<TruncatedResult>()?;
+    m.add_class::<GrpEvaluator>()?;
     add_submodule(py, prefix, super_mod, &m)
 }

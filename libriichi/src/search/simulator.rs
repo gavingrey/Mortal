@@ -59,6 +59,79 @@ impl RolloutResult {
     }
 }
 
+/// Result of a truncated rollout simulation.
+///
+/// Similar to `RolloutResult` but includes additional state information
+/// needed for GRP evaluation when the game didn't terminate naturally.
+#[pyclass]
+#[derive(Clone, Debug)]
+pub struct TruncatedResult {
+    /// Final scores (absolute seats, 0-3) at the leaf state.
+    #[pyo3(get)]
+    pub scores: [i32; 4],
+
+    /// Score deltas from start of kyoku (absolute seats, 0-3).
+    #[pyo3(get)]
+    pub deltas: [i32; 4],
+
+    /// Number of poll iterations (game steps) in the rollout.
+    #[pyo3(get)]
+    pub steps: u32,
+
+    /// True if the game ended naturally before max_steps.
+    #[pyo3(get)]
+    pub terminated: bool,
+
+    /// True if ended with a win (only meaningful when terminated=true).
+    #[pyo3(get)]
+    pub has_hora: bool,
+
+    /// True if ended with an abortive draw (only meaningful when terminated=true).
+    #[pyo3(get)]
+    pub has_abortive_ryukyoku: bool,
+
+    /// Current kyoku at leaf (absolute, 0-indexed).
+    #[pyo3(get)]
+    pub kyoku: u8,
+
+    /// Current honba at leaf.
+    #[pyo3(get)]
+    pub honba: u8,
+
+    /// Current kyotaku at leaf.
+    #[pyo3(get)]
+    pub kyotaku: u8,
+}
+
+#[pymethods]
+impl TruncatedResult {
+    /// Get the score delta for a specific player (absolute seat 0-3).
+    pub fn player_delta(&self, player_id: u8) -> PyResult<i32> {
+        if player_id >= 4 {
+            return Err(pyo3::exceptions::PyValueError::new_err(format!(
+                "player_id must be 0-3, got {player_id}"
+            )));
+        }
+        Ok(self.deltas[player_id as usize])
+    }
+
+    fn __repr__(&self) -> String {
+        format!(
+            "TruncatedResult(scores={:?}, deltas={:?}, steps={}, terminated={}, \
+             hora={}, abort={}, kyoku={}, honba={}, kyotaku={})",
+            self.scores,
+            self.deltas,
+            self.steps,
+            self.terminated,
+            self.has_hora,
+            self.has_abortive_ryukyoku,
+            self.kyoku,
+            self.honba,
+            self.kyotaku,
+        )
+    }
+}
+
 /// Derive all BoardState internal fields from the event history.
 ///
 /// This accurately reconstructs every field that BoardState tracks during
@@ -1079,6 +1152,143 @@ pub fn simulate_action_rollout_prebuilt(
         Some(player_id),
         Some(action),
         smart_rng,
+    )
+}
+
+/// Run a truncated rollout: same as `run_rollout` but stops after `max_steps`.
+///
+/// When the game ends naturally before `max_steps`, returns `terminated=true`
+/// with the final scores. When truncated, returns `terminated=false` with
+/// the current board state scores at the truncation point.
+fn run_rollout_truncated(
+    mut board_state: BoardState,
+    initial_scores: [i32; 4],
+    inject_player: Option<u8>,
+    inject_action: Option<usize>,
+    mut smart_rng: Option<&mut ChaCha12Rng>,
+    max_steps: u32,
+) -> Result<TruncatedResult> {
+    let mut reactions: [EventExt; 4] = Default::default();
+    let mut action_injected = inject_action.is_none();
+    let mut steps = 0_u32;
+
+    loop {
+        // Check truncation before polling
+        if steps >= max_steps {
+            let scores = board_state.board.scores;
+            let deltas = [
+                scores[0] - initial_scores[0],
+                scores[1] - initial_scores[1],
+                scores[2] - initial_scores[2],
+                scores[3] - initial_scores[3],
+            ];
+            return Ok(TruncatedResult {
+                scores,
+                deltas,
+                steps,
+                terminated: false,
+                has_hora: false,
+                has_abortive_ryukyoku: false,
+                kyoku: board_state.board.kyoku,
+                honba: board_state.board.honba,
+                kyotaku: board_state.board.kyotaku,
+            });
+        }
+
+        match board_state.poll(reactions)? {
+            Poll::InGame => {
+                steps += 1;
+                reactions = Default::default();
+                let ctx = board_state.agent_context();
+
+                for (seat, ps) in ctx.player_states.iter().enumerate() {
+                    let cans = ps.last_cans();
+                    if !cans.can_act() {
+                        continue;
+                    }
+
+                    let ev = if !action_injected
+                        && inject_player.is_some_and(|pid| seat as u8 == pid)
+                    {
+                        let action = inject_action.unwrap();
+                        let player_id = inject_player.unwrap();
+
+                        let matches = match action {
+                            0..=36 => cans.can_discard,
+                            37 => cans.can_riichi,
+                            38 => cans.can_chi_low,
+                            39 => cans.can_chi_mid,
+                            40 => cans.can_chi_high,
+                            41 => cans.can_pon,
+                            42 => cans.can_daiminkan || cans.can_ankan || cans.can_kakan,
+                            43 => cans.can_agari(),
+                            44 => cans.can_ryukyoku,
+                            45 => cans.can_pass() && !cans.can_discard,
+                            _ => false,
+                        };
+
+                        if matches {
+                            action_injected = true;
+                            action_to_event(action, player_id, ps)?
+                        } else {
+                            if let Some(ref mut rng) = smart_rng {
+                                super::heuristic::smart_reaction(seat as u8, ps, rng)
+                            } else {
+                                default_reaction(seat as u8, ps)
+                            }
+                        }
+                    } else if let Some(ref mut rng) = smart_rng {
+                        super::heuristic::smart_reaction(seat as u8, ps, rng)
+                    } else {
+                        default_reaction(seat as u8, ps)
+                    };
+                    reactions[seat] = EventExt::no_meta(ev);
+                }
+            }
+            Poll::End => {
+                let result = board_state.end();
+                let deltas = [
+                    result.scores[0] - initial_scores[0],
+                    result.scores[1] - initial_scores[1],
+                    result.scores[2] - initial_scores[2],
+                    result.scores[3] - initial_scores[3],
+                ];
+                return Ok(TruncatedResult {
+                    scores: result.scores,
+                    deltas,
+                    steps,
+                    terminated: true,
+                    has_hora: result.has_hora,
+                    has_abortive_ryukyoku: result.has_abortive_ryukyoku,
+                    kyoku: result.kyoku,
+                    honba: board_state.board.honba,
+                    kyotaku: result.kyotaku_left,
+                });
+            }
+        }
+    }
+}
+
+/// Simulate a truncated action rollout on a pre-built BoardState.
+///
+/// Clones the provided BoardState and runs a truncated rollout with the
+/// specified action injected. Returns a `TruncatedResult` with state info
+/// needed for GRP evaluation.
+pub fn simulate_action_rollout_prebuilt_truncated(
+    board_state: &BoardState,
+    initial_scores: [i32; 4],
+    player_id: u8,
+    action: usize,
+    smart_rng: Option<&mut ChaCha12Rng>,
+    max_steps: u32,
+) -> Result<TruncatedResult> {
+    run_rollout_truncated(
+        board_state.clone(),
+        initial_scores,
+        Some(player_id),
+        Some(action),
+        smart_rng,
+        max_steps,
     )
 }
 
@@ -5687,6 +5897,158 @@ mod test {
                 "pending riichi rollout particle {i} failed: {:?}",
                 rollout.err()
             );
+        }
+    }
+
+    #[test]
+    fn truncated_rollout_terminates_early() {
+        // A truncated rollout with max_steps=5 should stop early
+        let state = setup_basic_game();
+        let config = ParticleConfig::new(5);
+        let mut rng = ChaCha12Rng::seed_from_u64(42);
+
+        let (particles, _) = generate_particles(&state, &config, &mut rng).unwrap();
+        let replayed = replay_player_states(&state).unwrap();
+        let base = derive_midgame_context_base(state.event_history());
+
+        for (i, particle) in particles.iter().enumerate() {
+            let board_state =
+                build_midgame_board_state_with_base(&state, &replayed, particle, &base).unwrap();
+            let initial_scores = board_state.board.scores;
+
+            let mut thread_rng = ChaCha12Rng::seed_from_u64(100 + i as u64);
+            let result = run_rollout_truncated(
+                board_state,
+                initial_scores,
+                None,
+                None,
+                Some(&mut thread_rng),
+                5,
+            )
+            .unwrap();
+
+            // With max_steps=5, most rollouts should truncate (not enough steps
+            // for the game to end). steps should be <= 5.
+            assert!(
+                result.steps <= 5,
+                "truncated rollout should stop at max_steps, got {} steps",
+                result.steps
+            );
+            if !result.terminated {
+                assert_eq!(result.steps, 5, "non-terminated should stop exactly at max_steps");
+            }
+        }
+    }
+
+    #[test]
+    fn truncated_rollout_with_high_max_steps_matches_terminal() {
+        // With a very high max_steps, the truncated rollout should produce
+        // the same result as a terminal rollout (terminated=true).
+        let state = setup_basic_game();
+        let config = ParticleConfig::new(3);
+        let mut rng = ChaCha12Rng::seed_from_u64(42);
+
+        let (particles, _) = generate_particles(&state, &config, &mut rng).unwrap();
+        let replayed = replay_player_states(&state).unwrap();
+        let base = derive_midgame_context_base(state.event_history());
+
+        for (i, particle) in particles.iter().enumerate() {
+            let board_state =
+                build_midgame_board_state_with_base(&state, &replayed, particle, &base).unwrap();
+            let initial_scores = board_state.board.scores;
+
+            // Terminal rollout
+            let mut rng1 = ChaCha12Rng::seed_from_u64(200 + i as u64);
+            let terminal = run_rollout_smart(board_state.clone(), initial_scores, &mut rng1).unwrap();
+
+            // Truncated rollout with very high max_steps
+            let mut rng2 = ChaCha12Rng::seed_from_u64(200 + i as u64);
+            let truncated = run_rollout_truncated(
+                board_state,
+                initial_scores,
+                None,
+                None,
+                Some(&mut rng2),
+                10000,
+            )
+            .unwrap();
+
+            assert!(truncated.terminated, "high max_steps should terminate naturally");
+            assert_eq!(truncated.scores, terminal.scores, "scores should match terminal");
+            assert_eq!(truncated.deltas, terminal.deltas, "deltas should match terminal");
+            assert_eq!(truncated.steps, terminal.steps, "steps should match terminal");
+        }
+    }
+
+    #[test]
+    fn truncated_action_rollout_prebuilt_works() {
+        // Test the prebuilt truncated action rollout
+        let state = setup_basic_game();
+        let config = ParticleConfig::new(3);
+        let mut rng = ChaCha12Rng::seed_from_u64(42);
+
+        let (particles, _) = generate_particles(&state, &config, &mut rng).unwrap();
+        let replayed = replay_player_states(&state).unwrap();
+        let base = derive_midgame_context_base(state.event_history());
+        let player_id = state.player_id();
+
+        for particle in &particles {
+            let board_state =
+                build_midgame_board_state_with_base(&state, &replayed, particle, &base).unwrap();
+            let initial_scores = board_state.board.scores;
+
+            let mut action_rng = ChaCha12Rng::seed_from_u64(999);
+            let result = simulate_action_rollout_prebuilt_truncated(
+                &board_state,
+                initial_scores,
+                player_id,
+                0, // discard 1m
+                Some(&mut action_rng),
+                10,
+            )
+            .unwrap();
+
+            assert!(result.steps <= 10);
+            // Scores should be reasonable
+            for &s in &result.scores {
+                assert!(s >= -100000 && s <= 200000, "score {s} out of range");
+            }
+        }
+    }
+
+    #[test]
+    fn truncated_result_has_valid_kyoku_info() {
+        // Verify that truncated results carry correct kyoku/honba/kyotaku
+        let state = setup_basic_game();
+        let config = ParticleConfig::new(3);
+        let mut rng = ChaCha12Rng::seed_from_u64(42);
+
+        let (particles, _) = generate_particles(&state, &config, &mut rng).unwrap();
+        let replayed = replay_player_states(&state).unwrap();
+        let base = derive_midgame_context_base(state.event_history());
+
+        for particle in &particles {
+            let board_state =
+                build_midgame_board_state_with_base(&state, &replayed, particle, &base).unwrap();
+            let initial_scores = board_state.board.scores;
+
+            let mut thread_rng = ChaCha12Rng::seed_from_u64(42);
+            let result = run_rollout_truncated(
+                board_state,
+                initial_scores,
+                None,
+                None,
+                Some(&mut thread_rng),
+                5,
+            )
+            .unwrap();
+
+            // The basic game starts at kyoku=0, honba=0
+            // After truncation, kyoku should still be 0 (too few steps to end the round)
+            if !result.terminated {
+                assert_eq!(result.kyoku, 0, "kyoku should be 0 in early truncation");
+                assert_eq!(result.honba, 0, "honba should be 0 in early truncation");
+            }
         }
     }
 }
