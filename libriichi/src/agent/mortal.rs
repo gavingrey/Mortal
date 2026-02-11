@@ -330,6 +330,16 @@ impl SearchIntegration {
         let threshold = 3.0 * (1.0 - f64::from(self.search_weight));
 
         if t_stat > threshold {
+            log::info!(
+                "GRP override: action {} → {} | current_ev={:.3} | means=[{}] | counts=[{}] | t={:.2} > {:.2}",
+                dqn_action,
+                search_best_action,
+                0.0, // current_ev not available here; logged at call site
+                search_means.iter().enumerate().map(|(i, m)| format!("a{}={:.3}", actions[i], m)).collect::<Vec<_>>().join(", "),
+                action_counts.iter().enumerate().map(|(i, c)| format!("a{}={}", actions[i], c)).collect::<Vec<_>>().join(", "),
+                t_stat,
+                threshold,
+            );
             Some(search_best_action)
         } else {
             self.skips.insufficient_data += 1;
@@ -673,10 +683,11 @@ impl SearchIntegration {
                     RolloutOutcome::Ok {
                         action, leaf_entry, terminated,
                     } => {
-                        leaves.push(*leaf_entry);
-                        leaf_meta.push((*action, *terminated));
                         if *terminated {
                             n_terminated += 1;
+                            // Only terminated leaves carry meaningful GRP signal
+                            leaves.push(*leaf_entry);
+                            leaf_meta.push((*action, true));
                         } else {
                             n_truncated += 1;
                         }
@@ -693,7 +704,24 @@ impl SearchIntegration {
             }
         }
 
-        // Single batched GRP evaluation
+        // Update GRP metrics (before early-exit check so counts are always accurate)
+        self.grp_truncated_count += n_truncated;
+        self.grp_terminated_count += n_terminated;
+
+        // Bail out if no terminated rollouts — truncated leaves carry no signal
+        if leaves.is_empty() {
+            log::debug!(
+                "GRP search: all {} rollouts truncated, no terminated leaves — skipping override",
+                n_truncated,
+            );
+            self.skips.insufficient_data += 1;
+            self.grp_eval_count += 1; // baseline eval still counted
+            self.grp_eval_time_us += baseline_eval_us;
+            self.record_elapsed(start);
+            return None;
+        }
+
+        // Single batched GRP evaluation (terminated leaves only)
         let batch_eval_start = Instant::now();
         let grp = self.grp.as_ref().unwrap();
         let gs = self.grp_game_states.entry(game_index).or_default();
@@ -710,7 +738,7 @@ impl SearchIntegration {
             .unwrap_or(Duration::ZERO)
             .as_micros() as u64;
 
-        // Accumulate action statistics from batch results
+        // Accumulate action statistics from terminated leaves only
         let mut action_sums: Vec<f64> = vec![0.0; actions.len()];
         let mut action_sum_sq: Vec<f64> = vec![0.0; actions.len()];
         let mut action_counts: Vec<usize> = vec![0; actions.len()];
@@ -723,11 +751,28 @@ impl SearchIntegration {
             action_counts[ai] += 1;
         }
 
-        // Update GRP metrics
-        self.grp_eval_count += 1 + n_truncated + n_terminated;
+        // Guard: need at least 2 actions with ≥2 terminated samples for meaningful t-test
+        let actions_with_enough = action_counts.iter().filter(|&&c| c >= 2).count();
+        if actions_with_enough < 2 {
+            log::debug!(
+                "GRP search: only {} actions have ≥2 terminated samples (need 2) — skipping override",
+                actions_with_enough,
+            );
+            self.skips.insufficient_data += 1;
+            self.grp_eval_count += 1 + n_terminated;
+            self.grp_eval_time_us += baseline_eval_us + batch_eval_us;
+            self.record_elapsed(start);
+            return None;
+        }
+
+        // Update GRP metrics (truncated/terminated counts already updated above)
+        self.grp_eval_count += 1 + n_terminated;
         self.grp_eval_time_us += baseline_eval_us + batch_eval_us;
-        self.grp_truncated_count += n_truncated;
-        self.grp_terminated_count += n_terminated;
+
+        log::debug!(
+            "GRP search: terminated={}, truncated={}, leaves_evaluated={}, current_ev={:.3}",
+            n_terminated, n_truncated, leaves.len(), current_ev,
+        );
 
         let result = self.decide_override(
             &actions, &candidates, &action_sums, &action_sum_sq, &action_counts,
@@ -976,7 +1021,7 @@ impl MortalBatchAgent {
                 let grp_max_steps: u32 = obj
                     .getattr("search_max_steps")
                     .and_then(|v| v.extract())
-                    .unwrap_or(20);
+                    .unwrap_or(100);
                 let grp_placement_pts: Option<[f64; 4]> = obj
                     .getattr("search_placement_pts")
                     .and_then(|v| v.extract())
@@ -1687,7 +1732,7 @@ mod tests {
             max_candidates: 5,
             search_weight: 0.3,
             grp: None,
-            grp_max_steps: 20,
+            grp_max_steps: 100,
             grp_game_states: HashMap::new(),
             search_count,
             override_count,
@@ -1909,5 +1954,91 @@ mod tests {
         // Metrics should NOT be cleared (they accumulate across games)
         assert_eq!(si.search_count, 5);
         assert_eq!(si.override_count, 2);
+    }
+
+    // --- Truncated rollout filtering tests ---
+
+    #[test]
+    fn decide_override_zero_counts_returns_none() {
+        // Simulates the scenario where all rollouts were truncated and filtered:
+        // action_counts are all zero → decide_override returns None.
+        let mut si = make_test_si(0, 0);
+        let actions = vec![0, 1, 2];
+        let candidates = vec![(0, 1.0), (1, 0.8), (2, 0.5)];
+        let sums = vec![0.0, 0.0, 0.0];
+        let sum_sq = vec![0.0, 0.0, 0.0];
+        let counts = vec![0, 0, 0];
+
+        let result = si.decide_override(&actions, &candidates, &sums, &sum_sq, &counts);
+        assert!(result.is_none(), "should not override with zero counts");
+    }
+
+    #[test]
+    fn decide_override_mixed_counts_some_zero() {
+        // One action has enough samples, others have zero (from truncation filtering).
+        // Since DQN action (0) has n=0, t-test can't run → returns None.
+        let mut si = make_test_si(0, 0);
+        si.search_weight = 1.0; // threshold = 0, always override if possible
+        let actions = vec![0, 1];
+        let candidates = vec![(0, 1.0), (1, 0.5)];
+        // Action 0: no terminated samples; Action 1: 5 samples
+        let sums = vec![0.0, 100.0];
+        let sum_sq = vec![0.0, 2200.0];
+        let counts = vec![0, 5];
+
+        let result = si.decide_override(&actions, &candidates, &sums, &sum_sq, &counts);
+        // Search best = action 1 (mean 20 vs -inf for action 0).
+        // DQN action = 0 (first candidate). DQN idx = 0, n_dqn = 0 → returns None
+        assert!(
+            result.is_none(),
+            "should not override when DQN action has zero samples"
+        );
+    }
+
+    #[test]
+    fn decide_override_only_terminated_works_normally() {
+        // When all rollouts terminate (none truncated), the standard t-test logic applies.
+        let mut si = make_test_si(0, 0);
+        si.search_weight = 0.5; // threshold = 1.5
+        let actions = vec![0, 1];
+        let candidates = vec![(0, 1.0), (1, 0.5)];
+        // Action 0: mean=10, action 1: mean=50 — clear difference
+        let sums = vec![100.0, 500.0];
+        let sum_sq = vec![1200.0, 26000.0]; // var ~ 20, 200
+        let counts = vec![10, 10];
+
+        let result = si.decide_override(&actions, &candidates, &sums, &sum_sq, &counts);
+        // t-stat for (50-10) / sqrt(200/10 + 20/10) = 40/sqrt(22) ≈ 8.5 >> 1.5
+        assert_eq!(
+            result,
+            Some(1),
+            "should override when search clearly favors different action"
+        );
+    }
+
+    #[test]
+    fn decide_override_insufficient_samples_one_action() {
+        // One action has enough samples, the other has only 1 → can't compute variance
+        let mut si = make_test_si(0, 0);
+        si.search_weight = 1.0;
+        let actions = vec![0, 1];
+        let candidates = vec![(0, 1.0), (1, 0.5)];
+        let sums = vec![10.0, 500.0];
+        let sum_sq = vec![100.0, 50000.0];
+        let counts = vec![1, 10]; // action 0 has only 1 sample
+
+        let result = si.decide_override(&actions, &candidates, &sums, &sum_sq, &counts);
+        // Search best = action 1 (mean 50 >> mean 10). DQN action = 0 with n=1 → returns None
+        assert!(
+            result.is_none(),
+            "should not override when DQN action has only 1 sample"
+        );
+        assert_eq!(si.skips.insufficient_data, 1);
+    }
+
+    #[test]
+    fn grp_default_max_steps_is_100() {
+        let si = make_test_si(0, 0);
+        assert_eq!(si.grp_max_steps, 100);
     }
 }

@@ -26,7 +26,7 @@ class MortalEngine:
         search_particles = 50,
         search_weight = 0.5,
         search_grp_model = None,
-        search_max_steps = 20,
+        search_max_steps = 100,
         search_placement_pts = None,
     ):
         self.engine_type = 'mortal'
