@@ -550,6 +550,7 @@ impl SearchIntegration {
         self.particles_generated += particles.len() as u32;
 
         self.search_count += 1;
+        self.grp_search_count += 1;
 
         // Replay event history once
         let replayed = match simulator::replay_player_states(state) {
@@ -680,17 +681,37 @@ impl SearchIntegration {
                         match rollout {
                             std::result::Result::Ok(std::result::Result::Ok(result)) => {
                                 if result.terminated {
-                                    // Game ended naturally: use raw delta as value
-                                    let delta = f64::from(result.deltas[actor as usize]);
-                                    // Normalize delta to same scale as GRP expected pts:
-                                    // delta is in raw points (e.g. +8000), convert to
-                                    // placement-point scale by dividing by 10000
-                                    let value = delta / 10000.0;
-                                    GrpOutcome::Ok {
-                                        action,
-                                        value,
-                                        terminated: true,
-                                        grp_eval_us: 0,
+                                    // Game ended naturally: evaluate terminal state
+                                    // through GRP to keep values on the same scale as
+                                    // truncated rollouts (expected placement pts).
+                                    let terminal_entry = grp::make_grp_entry(
+                                        result.kyoku,
+                                        result.honba,
+                                        result.kyotaku,
+                                        &result.scores,
+                                    );
+                                    let eval_start = Instant::now();
+                                    match grp.evaluate_leaf_rust(
+                                        history,
+                                        &terminal_entry,
+                                        actor,
+                                    ) {
+                                        Ok(terminal_ev) => {
+                                            let eval_us = Instant::now()
+                                                .checked_duration_since(eval_start)
+                                                .unwrap_or(Duration::ZERO)
+                                                .as_micros() as u64;
+                                            let value = terminal_ev - current_ev;
+                                            GrpOutcome::Ok {
+                                                action,
+                                                value,
+                                                terminated: true,
+                                                grp_eval_us: eval_us,
+                                            }
+                                        }
+                                        Err(e) => {
+                                            GrpOutcome::Error { msg: e.to_string() }
+                                        }
                                     }
                                 } else {
                                     // Truncated: evaluate leaf with GRP
@@ -783,11 +804,11 @@ impl SearchIntegration {
         }
 
         // Update GRP metrics
-        self.grp_eval_count += 1 + n_truncated; // 1 baseline + 1 per truncated rollout
+        // 1 baseline + 1 per truncated + 1 per terminated (all evaluated via GRP now)
+        self.grp_eval_count += 1 + n_truncated + n_terminated;
         self.grp_eval_time_us += baseline_eval_us + leaf_eval_us_total;
         self.grp_truncated_count += n_truncated;
         self.grp_terminated_count += n_terminated;
-        self.grp_search_count += 1;
 
         // Compute mean search values
         let search_values: Vec<f64> = action_sums

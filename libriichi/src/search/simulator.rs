@@ -1157,6 +1157,12 @@ pub fn simulate_action_rollout_prebuilt(
 
 /// Run a truncated rollout: same as `run_rollout` but stops after `max_steps`.
 ///
+/// `max_steps` counts the number of reaction sets consumed by `poll()`. The
+/// first `poll()` call processes empty/default reactions (game initialization),
+/// so `max_steps=1` means the injected action is consumed by the second poll
+/// and then we truncate. With `max_steps=0`, truncation happens immediately
+/// after the first poll (no player actions are processed).
+///
 /// When the game ends naturally before `max_steps`, returns `terminated=true`
 /// with the final scores. When truncated, returns `terminated=false` with
 /// the current board state scores at the truncation point.
@@ -1173,31 +1179,38 @@ fn run_rollout_truncated(
     let mut steps = 0_u32;
 
     loop {
-        // Check truncation before polling
-        if steps >= max_steps {
-            let scores = board_state.board.scores;
-            let deltas = [
-                scores[0] - initial_scores[0],
-                scores[1] - initial_scores[1],
-                scores[2] - initial_scores[2],
-                scores[3] - initial_scores[3],
-            ];
-            return Ok(TruncatedResult {
-                scores,
-                deltas,
-                steps,
-                terminated: false,
-                has_hora: false,
-                has_abortive_ryukyoku: false,
-                kyoku: board_state.board.kyoku,
-                honba: board_state.board.honba,
-                kyotaku: board_state.board.kyotaku,
-            });
-        }
-
         match board_state.poll(reactions)? {
             Poll::InGame => {
                 steps += 1;
+
+                // Check truncation AFTER poll has consumed the previous
+                // iteration's reactions. This ensures that the injected action
+                // (placed into reactions on the first InGame) is consumed by
+                // the next poll before we can truncate.
+                if steps > max_steps {
+                    let scores = board_state.board.scores;
+                    let deltas = [
+                        scores[0] - initial_scores[0],
+                        scores[1] - initial_scores[1],
+                        scores[2] - initial_scores[2],
+                        scores[3] - initial_scores[3],
+                    ];
+                    // Return max_steps as step count (not the internal counter
+                    // which includes the init poll). This keeps the external
+                    // semantics: steps = "number of reaction sets consumed".
+                    return Ok(TruncatedResult {
+                        scores,
+                        deltas,
+                        steps: max_steps,
+                        terminated: false,
+                        has_hora: false,
+                        has_abortive_ryukyoku: false,
+                        kyoku: board_state.board.kyoku,
+                        honba: board_state.board.honba,
+                        kyotaku: board_state.board.kyotaku,
+                    });
+                }
+
                 reactions = Default::default();
                 let ctx = board_state.agent_context();
 
