@@ -26,6 +26,7 @@ pub type GrpEntry = [f64; 7];
 #[pyclass]
 pub struct GrpEvaluator {
     model: Arc<TypedRunnableModel<TypedFact>>,
+    seq_sym: Symbol,
     placement_pts: [f64; 4],
 }
 
@@ -81,6 +82,7 @@ impl GrpEvaluator {
 
         Ok(Self {
             model: Arc::new(model),
+            seq_sym,
             placement_pts,
         })
     }
@@ -109,8 +111,12 @@ impl GrpEvaluator {
         )
         .context("failed to create input tensor")?;
 
-        // Run inference
-        let result = self.model.run(tvec![input_tensor.into_tvalue()])
+        // Run inference with resolved symbolic dimension
+        let mut state = SimpleState::new(Arc::clone(&self.model))
+            .context("failed to create inference state")?;
+        state.session_state.resolved_symbols
+            .set(&self.seq_sym, seq_len as i64);
+        let result = state.run(tvec![input_tensor.into_tvalue()])
             .context("GRP inference failed")?;
 
         // Extract logits: shape (1, 24), cast f32 -> f64
