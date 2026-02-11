@@ -183,12 +183,13 @@ impl GrpEvaluator {
         let batch_size = leaves.len();
         let seq_len = history.len() + 1;
 
+        // Pre-convert shared history prefix to f32 once (avoids redundant conversion per leaf)
+        let history_f32: Vec<f32> = history.iter().flat_map(|e| e.iter().map(|&v| v as f32)).collect();
+
         // Build flat (batch_size, seq_len, 7) tensor data
         let mut input_data: Vec<f32> = Vec::with_capacity(batch_size * seq_len * 7);
         for leaf in leaves {
-            for entry in history {
-                input_data.extend(entry.iter().map(|&v| v as f32));
-            }
+            input_data.extend_from_slice(&history_f32);
             input_data.extend(leaf.iter().map(|&v| v as f32));
         }
 
@@ -219,12 +220,13 @@ impl GrpEvaluator {
             logits_tensor.len()
         );
 
-        // Compute expected points for each leaf
-        let logits_flat: Vec<f64> = logits_tensor.iter().map(|&v| f64::from(v)).collect();
+        // Compute expected points for each leaf (convert f32->f64 per-sample on the stack)
+        let logits_flat = logits_tensor.as_slice().context("logits tensor not contiguous")?;
         let mut results = Vec::with_capacity(batch_size);
         for i in 0..batch_size {
-            let sample_logits = &logits_flat[i * 24..(i + 1) * 24];
-            let probs = calc_player_probs(sample_logits, player_id);
+            let sample_f32 = &logits_flat[i * 24..(i + 1) * 24];
+            let sample_logits: [f64; 24] = std::array::from_fn(|j| f64::from(sample_f32[j]));
+            let probs = calc_player_probs(&sample_logits, player_id);
             let expected_pts: f64 = probs
                 .iter()
                 .zip(self.placement_pts.iter())

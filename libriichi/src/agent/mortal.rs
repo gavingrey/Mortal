@@ -661,8 +661,9 @@ impl SearchIntegration {
         // ============================================================
 
         // Flatten Ok outcomes into leaves + metadata, track errors
-        let mut leaves: Vec<GrpEntry> = Vec::new();
-        let mut leaf_meta: Vec<(usize, bool)> = Vec::new(); // (action, terminated)
+        let expected = particles.len() * actions.len();
+        let mut leaves: Vec<GrpEntry> = Vec::with_capacity(expected);
+        let mut leaf_meta: Vec<(usize, bool)> = Vec::with_capacity(expected); // (action, terminated)
         let mut n_truncated = 0_u64;
         let mut n_terminated = 0_u64;
 
