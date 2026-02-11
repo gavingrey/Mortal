@@ -5,7 +5,7 @@ Usage:
     python scripts/export_grp_onnx.py <model.pth> <output.onnx>
 
 The wrapper avoids PackedSequence by using raw GRU + fc directly,
-accepting a simple (1, seq_len, 7) tensor as input.
+accepting a simple (batch, seq_len, 7) tensor as input.
 Exports as float32 for broad ONNX runtime compatibility (tract, onnxruntime).
 """
 
@@ -29,10 +29,10 @@ class GRPExportWrapper(nn.Module):
         self.fc = grp.fc
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        # x: (1, seq_len, 7)
-        _, state = self.rnn(x)  # state: (num_layers, 1, hidden)
-        state = state.transpose(0, 1).flatten(1)  # (1, num_layers*hidden)
-        return self.fc(state)  # (1, 24)
+        # x: (batch, seq_len, 7)
+        _, state = self.rnn(x)  # state: (num_layers, batch, hidden)
+        state = state.transpose(0, 1).flatten(1)  # (batch, num_layers*hidden)
+        return self.fc(state)  # (batch, 24)
 
 
 def main():
@@ -111,7 +111,7 @@ def main():
 
     # Export to ONNX as float32
     print(f"\nExporting to {output_path} (float32)")
-    dummy_input = torch.randn(1, 3, 7, dtype=torch.float32)
+    dummy_input = torch.randn(2, 3, 7, dtype=torch.float32)
     torch.onnx.export(
         wrapper,
         dummy_input,
@@ -119,8 +119,8 @@ def main():
         input_names=['input'],
         output_names=['logits'],
         dynamic_axes={
-            'input': {1: 'seq_len'},
-            'logits': {},
+            'input': {0: 'batch_size', 1: 'seq_len'},
+            'logits': {0: 'batch_size'},
         },
         opset_version=17,
     )
@@ -144,7 +144,22 @@ def main():
             ref_out = wrapper(x).numpy()
         onnx_out = session.run(None, {'input': x.numpy()})[0]
         diff = np.abs(ref_out - onnx_out).max()
-        print(f"  seq_len={seq_len}: PyTorch vs ONNX max_diff={diff:.2e}", end="")
+        print(f"  batch=1, seq_len={seq_len}: PyTorch vs ONNX max_diff={diff:.2e}", end="")
+        if diff < 1e-5:
+            print(" OK")
+        else:
+            print(f" WARNING: large difference!")
+
+    # Verify batched inference
+    print("Verifying batched inference with onnxruntime...")
+    for batch_size in [2, 4, 8]:
+        seq_len = 5
+        x = torch.randn(batch_size, seq_len, 7, dtype=torch.float32)
+        with torch.no_grad():
+            ref_out = wrapper(x).numpy()
+        onnx_out = session.run(None, {'input': x.numpy()})[0]
+        diff = np.abs(ref_out - onnx_out).max()
+        print(f"  batch={batch_size}, seq_len={seq_len}: PyTorch vs ONNX max_diff={diff:.2e}", end="")
         if diff < 1e-5:
             print(" OK")
         else:

@@ -26,6 +26,7 @@ pub type GrpEntry = [f64; 7];
 #[pyclass]
 pub struct GrpEvaluator {
     model: Arc<TypedRunnableModel<TypedFact>>,
+    batch_sym: Symbol,
     seq_sym: Symbol,
     placement_pts: [f64; 4],
 }
@@ -60,12 +61,30 @@ impl GrpEvaluator {
         self.evaluate_leaf_impl(&history, &leaf, player_id)
             .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))
     }
+
+    /// Evaluate multiple leaf states in a single batched ONNX call.
+    ///
+    /// `history`: shared prefix of GRP entries from previous kyoku boundaries
+    /// `leaves`: leaf state entries to evaluate (one per batch element)
+    /// `player_id`: absolute seat (0-3) to evaluate for
+    ///
+    /// Returns a Vec of expected points, one per leaf.
+    pub fn evaluate_batch(
+        &self,
+        history: Vec<[f64; 7]>,
+        leaves: Vec<[f64; 7]>,
+        player_id: u8,
+    ) -> PyResult<Vec<f64>> {
+        self.evaluate_batch_impl(&history, &leaves, player_id)
+            .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))
+    }
 }
 
 impl GrpEvaluator {
     pub(crate) fn load_impl(onnx_path: &str, placement_pts: [f64; 4]) -> Result<Self> {
-        // Create a symbolic dimension for the sequence length
+        // Create symbolic dimensions for batch size and sequence length
         let sym_scope = tract_onnx::prelude::SymbolScope::default();
+        let batch_sym = sym_scope.sym("batch");
         let seq_sym = sym_scope.sym("seq");
 
         let model = tract_onnx::onnx()
@@ -73,7 +92,10 @@ impl GrpEvaluator {
             .with_context(|| format!("failed to load ONNX model from {onnx_path}"))?
             .with_input_fact(
                 0,
-                InferenceFact::dt_shape(f32::datum_type(), tvec![1.into(), TDim::from(&seq_sym), 7.into()]),
+                InferenceFact::dt_shape(
+                    f32::datum_type(),
+                    tvec![TDim::from(&batch_sym), TDim::from(&seq_sym), 7.into()],
+                ),
             )?
             .into_optimized()
             .context("failed to optimize ONNX model")?
@@ -82,6 +104,7 @@ impl GrpEvaluator {
 
         Ok(Self {
             model: Arc::new(model),
+            batch_sym,
             seq_sym,
             placement_pts,
         })
@@ -111,9 +134,11 @@ impl GrpEvaluator {
         )
         .context("failed to create input tensor")?;
 
-        // Run inference with resolved symbolic dimension
+        // Run inference with resolved symbolic dimensions
         let mut state = SimpleState::new(Arc::clone(&self.model))
             .context("failed to create inference state")?;
+        state.session_state.resolved_symbols
+            .set(&self.batch_sym, 1);
         state.session_state.resolved_symbols
             .set(&self.seq_sym, seq_len as i64);
         let result = state.run(tvec![input_tensor.into_tvalue()])
@@ -137,6 +162,78 @@ impl GrpEvaluator {
             .sum();
 
         Ok(expected_pts)
+    }
+
+    /// Batched evaluation: run GRP inference for multiple leaves in one ONNX call.
+    ///
+    /// All leaves share the same `history` prefix. Each sample in the batch is
+    /// `history ++ [leaf_i]`. Returns expected points per leaf.
+    pub(crate) fn evaluate_batch_impl(
+        &self,
+        history: &[GrpEntry],
+        leaves: &[GrpEntry],
+        player_id: u8,
+    ) -> Result<Vec<f64>> {
+        ensure!(player_id < 4, "player_id must be 0-3, got {player_id}");
+
+        if leaves.is_empty() {
+            return Ok(vec![]);
+        }
+
+        let batch_size = leaves.len();
+        let seq_len = history.len() + 1;
+
+        // Build flat (batch_size, seq_len, 7) tensor data
+        let mut input_data: Vec<f32> = Vec::with_capacity(batch_size * seq_len * 7);
+        for leaf in leaves {
+            for entry in history {
+                input_data.extend(entry.iter().map(|&v| v as f32));
+            }
+            input_data.extend(leaf.iter().map(|&v| v as f32));
+        }
+
+        let input_tensor = tract_ndarray::Array3::from_shape_vec(
+            (batch_size, seq_len, 7),
+            input_data,
+        )
+        .context("failed to create batched input tensor")?;
+
+        // Run inference with resolved symbolic dimensions
+        let mut state = SimpleState::new(Arc::clone(&self.model))
+            .context("failed to create inference state")?;
+        state.session_state.resolved_symbols
+            .set(&self.batch_sym, batch_size as i64);
+        state.session_state.resolved_symbols
+            .set(&self.seq_sym, seq_len as i64);
+        let result = state.run(tvec![input_tensor.into_tvalue()])
+            .context("batched GRP inference failed")?;
+
+        // Extract logits: shape (batch_size, 24), cast f32 -> f64
+        let logits_tensor = result[0]
+            .to_array_view::<f32>()
+            .context("failed to extract batched logits")?;
+        ensure!(
+            logits_tensor.len() == batch_size * 24,
+            "expected {} logits, got {}",
+            batch_size * 24,
+            logits_tensor.len()
+        );
+
+        // Compute expected points for each leaf
+        let logits_flat: Vec<f64> = logits_tensor.iter().map(|&v| f64::from(v)).collect();
+        let mut results = Vec::with_capacity(batch_size);
+        for i in 0..batch_size {
+            let sample_logits = &logits_flat[i * 24..(i + 1) * 24];
+            let probs = calc_player_probs(sample_logits, player_id);
+            let expected_pts: f64 = probs
+                .iter()
+                .zip(self.placement_pts.iter())
+                .map(|(p, pts)| p * pts)
+                .sum();
+            results.push(expected_pts);
+        }
+
+        Ok(results)
     }
 
     /// Get a reference to the placement points.

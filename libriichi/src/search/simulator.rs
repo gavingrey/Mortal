@@ -1249,12 +1249,10 @@ fn run_rollout_truncated(
                         if matches {
                             action_injected = true;
                             action_to_event(action, player_id, ps)?
+                        } else if let Some(ref mut rng) = smart_rng {
+                            super::heuristic::smart_reaction(seat as u8, ps, rng)
                         } else {
-                            if let Some(ref mut rng) = smart_rng {
-                                super::heuristic::smart_reaction(seat as u8, ps, rng)
-                            } else {
-                                default_reaction(seat as u8, ps)
-                            }
+                            default_reaction(seat as u8, ps)
                         }
                     } else if let Some(ref mut rng) = smart_rng {
                         super::heuristic::smart_reaction(seat as u8, ps, rng)

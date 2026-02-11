@@ -308,10 +308,10 @@ impl SearchIntegration {
 
         // Bessel-corrected sample variance: (sum_sq - n * mean²) / (n - 1)
         let var_best =
-            (action_sum_sq[search_best_idx] - n_best as f64 * mean_best * mean_best)
+            (n_best as f64 * mean_best).mul_add(-mean_best, action_sum_sq[search_best_idx])
                 / (n_best - 1) as f64;
         let var_dqn =
-            (action_sum_sq[dqn_idx] - n_dqn as f64 * mean_dqn * mean_dqn)
+            (n_dqn as f64 * mean_dqn).mul_add(-mean_dqn, action_sum_sq[dqn_idx])
                 / (n_dqn - 1) as f64;
 
         // Welch's t-test: SE² = var_a/n_a + var_b/n_b
@@ -489,7 +489,11 @@ impl SearchIntegration {
         result
     }
 
-    /// GRP-based search override: truncated rollouts + value network evaluation.
+    /// GRP-based search override: truncated rollouts + batched value network evaluation.
+    ///
+    /// Two-phase approach:
+    /// - Phase A: Parallel truncated rollouts (rayon) collect leaf entries
+    /// - Phase B: Single batched GRP ONNX call evaluates all leaves at once
     ///
     /// Returns `Some(action)` if search found a statistically significantly
     /// better action, `None` to keep DQN choice.
@@ -501,9 +505,7 @@ impl SearchIntegration {
         masks: &[bool; ACTION_SPACE],
         actor: u8,
     ) -> Option<usize> {
-        if self.grp.is_none() {
-            return None;
-        }
+        self.grp.as_ref()?;
 
         let ctx = self.prepare_search(state, q_values, masks)?;
         let SearchContext {
@@ -532,7 +534,7 @@ impl SearchIntegration {
             &abs_scores,
         );
 
-        // Baseline GRP evaluation (scoped to avoid borrow conflict)
+        // Baseline GRP evaluation (single call, trivial cost)
         let baseline_eval_start = Instant::now();
         let current_ev = {
             let grp = self.grp.as_ref().unwrap();
@@ -552,23 +554,20 @@ impl SearchIntegration {
             .unwrap_or(Duration::ZERO)
             .as_micros() as u64;
 
-        // Parallel truncated rollouts: particle-first, action-second
-        enum GrpOutcome {
+        // ============================================================
+        // Phase A: Parallel truncated rollouts (NO GRP calls)
+        // ============================================================
+        enum RolloutOutcome {
             Ok {
                 action: usize,
-                value: f64,
+                leaf_entry: GrpEntry,
                 terminated: bool,
-                grp_eval_us: u64,
             },
             Error { msg: String },
             Panic { msg: String },
         }
 
-        let grp = self.grp.as_ref().unwrap();
-        let gs = self.grp_game_states.entry(game_index).or_default();
-        let history = &gs.history;
-
-        let per_particle: Vec<Vec<GrpOutcome>> = particles
+        let per_particle: Vec<Vec<RolloutOutcome>> = particles
             .par_iter()
             .enumerate()
             .map(|(pi, p)| {
@@ -582,14 +581,14 @@ impl SearchIntegration {
                         let msg = e.to_string();
                         return actions
                             .iter()
-                            .map(|_| GrpOutcome::Error { msg: msg.clone() })
+                            .map(|_| RolloutOutcome::Error { msg: msg.clone() })
                             .collect();
                     }
                     Err(panic_info) => {
                         let msg = extract_panic_msg(&panic_info);
                         return actions
                             .iter()
-                            .map(|_| GrpOutcome::Panic { msg: msg.clone() })
+                            .map(|_| RolloutOutcome::Panic { msg: msg.clone() })
                             .collect();
                     }
                 };
@@ -639,29 +638,16 @@ impl SearchIntegration {
                                     )
                                 };
 
-                                let eval_start = Instant::now();
-                                match grp.evaluate_leaf_impl(
-                                    history, &leaf_entry, actor,
-                                ) {
-                                    Ok(leaf_ev) => {
-                                        let eval_us = Instant::now()
-                                            .checked_duration_since(eval_start)
-                                            .unwrap_or(Duration::ZERO)
-                                            .as_micros() as u64;
-                                        GrpOutcome::Ok {
-                                            action,
-                                            value: leaf_ev - current_ev,
-                                            terminated: result.terminated,
-                                            grp_eval_us: eval_us,
-                                        }
-                                    }
-                                    Err(e) => GrpOutcome::Error { msg: e.to_string() },
+                                RolloutOutcome::Ok {
+                                    action,
+                                    leaf_entry,
+                                    terminated: result.terminated,
                                 }
                             }
                             Ok(Err(e)) => {
-                                GrpOutcome::Error { msg: e.to_string() }
+                                RolloutOutcome::Error { msg: e.to_string() }
                             }
-                            Err(panic_info) => GrpOutcome::Panic {
+                            Err(panic_info) => RolloutOutcome::Panic {
                                 msg: extract_panic_msg(&panic_info),
                             },
                         }
@@ -670,36 +656,35 @@ impl SearchIntegration {
             })
             .collect();
 
-        // Aggregate results and GRP metrics
-        let mut action_sums: Vec<f64> = vec![0.0; actions.len()];
-        let mut action_sum_sq: Vec<f64> = vec![0.0; actions.len()];
-        let mut action_counts: Vec<usize> = vec![0; actions.len()];
+        // ============================================================
+        // Phase B: Batched GRP evaluation (single ONNX call)
+        // ============================================================
+
+        // Flatten Ok outcomes into leaves + metadata, track errors
+        let mut leaves: Vec<GrpEntry> = Vec::new();
+        let mut leaf_meta: Vec<(usize, bool)> = Vec::new(); // (action, terminated)
         let mut n_truncated = 0_u64;
         let mut n_terminated = 0_u64;
-        let mut leaf_eval_us_total = 0_u64;
 
         for particle_results in &per_particle {
             for outcome in particle_results {
                 match outcome {
-                    GrpOutcome::Ok {
-                        action, value, terminated, grp_eval_us,
+                    RolloutOutcome::Ok {
+                        action, leaf_entry, terminated,
                     } => {
-                        let ai = actions.iter().position(|&a| a == *action).unwrap();
-                        action_sums[ai] += value;
-                        action_sum_sq[ai] += value * value;
-                        action_counts[ai] += 1;
-                        leaf_eval_us_total += grp_eval_us;
+                        leaves.push(*leaf_entry);
+                        leaf_meta.push((*action, *terminated));
                         if *terminated {
                             n_terminated += 1;
                         } else {
                             n_truncated += 1;
                         }
                     }
-                    GrpOutcome::Error { msg } => {
+                    RolloutOutcome::Error { msg } => {
                         self.errors.record_error(msg);
                         log::debug!("search GRP rollout error: {msg}");
                     }
-                    GrpOutcome::Panic { msg } => {
+                    RolloutOutcome::Panic { msg } => {
                         self.errors.record_panic(msg);
                         log::warn!("search GRP rollout panic: {msg}");
                     }
@@ -707,9 +692,39 @@ impl SearchIntegration {
             }
         }
 
+        // Single batched GRP evaluation
+        let batch_eval_start = Instant::now();
+        let grp = self.grp.as_ref().unwrap();
+        let gs = self.grp_game_states.entry(game_index).or_default();
+        let leaf_evs = match grp.evaluate_batch_impl(&gs.history, &leaves, actor) {
+            Ok(evs) => evs,
+            Err(e) => {
+                log::debug!("GRP batch eval error: {e}");
+                self.record_elapsed(start);
+                return None;
+            }
+        };
+        let batch_eval_us = Instant::now()
+            .checked_duration_since(batch_eval_start)
+            .unwrap_or(Duration::ZERO)
+            .as_micros() as u64;
+
+        // Accumulate action statistics from batch results
+        let mut action_sums: Vec<f64> = vec![0.0; actions.len()];
+        let mut action_sum_sq: Vec<f64> = vec![0.0; actions.len()];
+        let mut action_counts: Vec<usize> = vec![0; actions.len()];
+
+        for (leaf_ev, &(action, _terminated)) in leaf_evs.iter().zip(leaf_meta.iter()) {
+            let value = leaf_ev - current_ev;
+            let ai = actions.iter().position(|&a| a == action).unwrap();
+            action_sums[ai] += value;
+            action_sum_sq[ai] += value * value;
+            action_counts[ai] += 1;
+        }
+
         // Update GRP metrics
         self.grp_eval_count += 1 + n_truncated + n_terminated;
-        self.grp_eval_time_us += baseline_eval_us + leaf_eval_us_total;
+        self.grp_eval_time_us += baseline_eval_us + batch_eval_us;
         self.grp_truncated_count += n_truncated;
         self.grp_terminated_count += n_terminated;
 
