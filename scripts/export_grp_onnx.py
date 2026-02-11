@@ -8,14 +8,15 @@ The wrapper avoids PackedSequence by using raw GRU + fc directly,
 accepting a simple (1, seq_len, 7) tensor as input.
 """
 
+import os
 import sys
 import torch
 import torch.nn as nn
 import numpy as np
 
-# Add mortal to path
-sys.path.insert(0, '.')
-from mortal.model import GRP
+# Add mortal/ to path so we can import model.py directly
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', 'mortal'))
+from model import GRP
 
 
 class GRPExportWrapper(nn.Module):
