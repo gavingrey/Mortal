@@ -710,12 +710,11 @@ impl SearchIntegration {
                     } => {
                         if *terminated {
                             n_terminated += 1;
-                            // Only terminated leaves carry meaningful GRP signal
-                            leaves.push(*leaf_entry);
-                            leaf_meta.push((*action, true));
                         } else {
                             n_truncated += 1;
                         }
+                        leaves.push(*leaf_entry);
+                        leaf_meta.push((*action, *terminated));
                     }
                     RolloutOutcome::Error { msg } => {
                         self.errors.record_error(msg);
@@ -733,11 +732,11 @@ impl SearchIntegration {
         self.grp_truncated_count += n_truncated;
         self.grp_terminated_count += n_terminated;
 
-        // Bail out if no terminated rollouts — truncated leaves carry no signal
+        // Bail out if no valid leaves at all (all errors/panics)
         if leaves.is_empty() {
             log::debug!(
-                "GRP search: all {} rollouts truncated, no terminated leaves — skipping override",
-                n_truncated,
+                "GRP search: no valid rollout leaves (errors={}) — skipping override",
+                expected - leaves.len(),
             );
             self.skips.insufficient_data += 1;
             self.grp_eval_count += 1; // baseline eval still counted
@@ -746,7 +745,7 @@ impl SearchIntegration {
             return None;
         }
 
-        // Single batched GRP evaluation (terminated leaves only)
+        // Single batched GRP evaluation (terminated + truncated leaves)
         let batch_eval_start = Instant::now();
         let grp = self.grp.as_ref().unwrap();
         let gs = self.grp_game_states.entry(game_index).or_default();
@@ -763,7 +762,7 @@ impl SearchIntegration {
             .unwrap_or(Duration::ZERO)
             .as_micros() as u64;
 
-        // Accumulate action statistics from terminated leaves only
+        // Accumulate action statistics from all leaves
         let mut action_sums: Vec<f64> = vec![0.0; actions.len()];
         let mut action_sum_sq: Vec<f64> = vec![0.0; actions.len()];
         let mut action_counts: Vec<usize> = vec![0; actions.len()];
@@ -786,22 +785,22 @@ impl SearchIntegration {
         let actions_with_enough = action_counts.iter().filter(|&&c| c >= 2).count();
         if actions_with_enough < 2 {
             log::debug!(
-                "GRP search: only {} actions have ≥2 terminated samples (need 2) — skipping override",
+                "GRP search: only {} actions have ≥2 samples (need 2) — skipping override",
                 actions_with_enough,
             );
             self.skips.insufficient_data += 1;
-            self.grp_eval_count += 1 + n_terminated;
+            self.grp_eval_count += 1 + leaves.len() as u64;
             self.grp_eval_time_us += baseline_eval_us + batch_eval_us;
             self.record_elapsed(start);
             return None;
         }
 
         // Update GRP metrics (truncated/terminated counts already updated above)
-        self.grp_eval_count += 1 + n_terminated;
+        self.grp_eval_count += 1 + leaves.len() as u64;
         self.grp_eval_time_us += baseline_eval_us + batch_eval_us;
 
         log::debug!(
-            "GRP search: terminated={}, truncated={}, leaves_evaluated={}, current_ev={:.3}",
+            "GRP search: terminated={}, truncated={}, total_leaves={}, current_ev={:.3}",
             n_terminated, n_truncated, leaves.len(), current_ev,
         );
 
