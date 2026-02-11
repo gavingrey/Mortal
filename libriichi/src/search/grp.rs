@@ -144,7 +144,7 @@ impl GrpEvaluator {
     }
 
     /// Get a reference to the placement points.
-    pub fn placement_pts(&self) -> &[f64; 4] {
+    pub const fn placement_pts(&self) -> &[f64; 4] {
         &self.placement_pts
     }
 }
@@ -278,5 +278,123 @@ mod test {
         assert_eq!(entry[4], 3.0);  // 30000/10000
         assert_eq!(entry[5], 2.0);  // 20000/10000
         assert_eq!(entry[6], 2.5);  // 25000/10000
+    }
+
+    #[test]
+    fn test_permutation_table_lexicographic_order() {
+        // PERMS should be in lexicographic order
+        for i in 1..PERMS.len() {
+            assert!(
+                PERMS[i - 1] < PERMS[i],
+                "PERMS[{}]={:?} should be < PERMS[{}]={:?}",
+                i - 1,
+                PERMS[i - 1],
+                i,
+                PERMS[i]
+            );
+        }
+    }
+
+    #[test]
+    fn test_calc_player_probs_known_values() {
+        // Hand-computed test case:
+        // Set logits so only permutations 0 and 6 have significant weight.
+        // perm[0] = [0,1,2,3]: p0→rank0, p1→rank1, p2→rank2, p3→rank3
+        // perm[6] = [1,0,2,3]: p0→rank1, p1→rank0, p2→rank2, p3→rank3
+        //
+        // With logits[0]=1.0, logits[6]=1.0, rest=-1000.0:
+        // softmax ≈ 0.5 each for perms 0 and 6.
+        //
+        // Player 0: rank0 from perm[0] + rank1 from perm[6] → [0.5, 0.5, 0, 0]
+        // Player 1: rank1 from perm[0] + rank0 from perm[6] → [0.5, 0.5, 0, 0]
+        // Player 2: rank2 from both → [0, 0, 1.0, 0]
+        // Player 3: rank3 from both → [0, 0, 0, 1.0]
+        let mut logits = [-1000.0_f64; 24];
+        logits[0] = 1.0;
+        logits[6] = 1.0;
+
+        let p0 = calc_player_probs(&logits, 0);
+        assert!((p0[0] - 0.5).abs() < 1e-6, "p0 rank0: {}", p0[0]);
+        assert!((p0[1] - 0.5).abs() < 1e-6, "p0 rank1: {}", p0[1]);
+        assert!(p0[2] < 1e-6, "p0 rank2 should be ~0");
+        assert!(p0[3] < 1e-6, "p0 rank3 should be ~0");
+
+        let p1 = calc_player_probs(&logits, 1);
+        assert!((p1[0] - 0.5).abs() < 1e-6, "p1 rank0: {}", p1[0]);
+        assert!((p1[1] - 0.5).abs() < 1e-6, "p1 rank1: {}", p1[1]);
+
+        let p2 = calc_player_probs(&logits, 2);
+        assert!((p2[2] - 1.0).abs() < 1e-6, "p2 rank2: {}", p2[2]);
+
+        let p3 = calc_player_probs(&logits, 3);
+        assert!((p3[3] - 1.0).abs() < 1e-6, "p3 rank3: {}", p3[3]);
+    }
+
+    #[test]
+    fn test_grp_expected_points_bounds() {
+        // With placement_pts = [6, 4, 2, 0], expected points for any
+        // probability distribution should be in [0.0, 6.0].
+        let placement_pts = [6.0_f64, 4.0, 2.0, 0.0];
+        let test_cases: Vec<Vec<f64>> = vec![
+            vec![0.0; 24],
+            (0..24).map(|i| i as f64).collect(),
+            (0..24).map(|i| -(i as f64)).collect(),
+        ];
+
+        for logits in &test_cases {
+            for player_id in 0..4_u8 {
+                let probs = calc_player_probs(logits, player_id);
+                let expected_pts: f64 = probs
+                    .iter()
+                    .zip(placement_pts.iter())
+                    .map(|(p, pts)| p * pts)
+                    .sum();
+                assert!(
+                    expected_pts >= -1e-10 && expected_pts <= 6.0 + 1e-10,
+                    "player {player_id}: expected_pts={expected_pts} out of [0, 6] bounds"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn test_make_grp_entry_negative_scores() {
+        let entry = make_grp_entry(7, 3, 0, &[-5000, 35000, 40000, 30000]);
+        assert_eq!(entry[0], 7.0);
+        assert_eq!(entry[1], 3.0);
+        assert_eq!(entry[2], 0.0);
+        assert!((entry[3] - (-0.5)).abs() < 1e-10);
+        assert!((entry[4] - 3.5).abs() < 1e-10);
+        assert!((entry[5] - 4.0).abs() < 1e-10);
+        assert!((entry[6] - 3.0).abs() < 1e-10);
+    }
+
+    #[test]
+    fn test_calc_player_probs_all_players_sum() {
+        // For any logits, each player's rank probabilities should sum to 1,
+        // and across all players, each rank should also sum to 1.
+        let logits: Vec<f64> = (0..24).map(|i| (i as f64) * 0.3 - 2.0).collect();
+
+        let all_probs: Vec<[f64; 4]> = (0..4_u8)
+            .map(|pid| calc_player_probs(&logits, pid))
+            .collect();
+
+        // Each player's probs sum to 1
+        for (pid, probs) in all_probs.iter().enumerate() {
+            let sum: f64 = probs.iter().sum();
+            assert!(
+                (sum - 1.0).abs() < 1e-10,
+                "player {pid}: probs sum to {sum}"
+            );
+        }
+
+        // Each rank's probs across players sum to 1
+        for rank in 0..4_usize {
+            let sum: f64 = all_probs.iter().map(|p| p[rank]).sum();
+            assert!(
+                (sum - 1.0).abs() < 1e-10,
+                "rank {rank}: probs across players sum to {sum}"
+            );
+        }
     }
 }

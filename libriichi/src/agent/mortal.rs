@@ -118,6 +118,14 @@ struct SearchIntegration {
     search_count: u32,
     override_count: u32,
 
+    // GRP-specific metrics
+    grp_eval_count: u64,
+    grp_eval_time_us: u64,
+    grp_truncated_count: u64,
+    grp_terminated_count: u64,
+    grp_search_count: u32,
+    grp_override_count: u32,
+
     // Detailed breakdowns
     skips: SkipMetrics,
     errors: ErrorMetrics,
@@ -589,6 +597,7 @@ impl SearchIntegration {
             &abs_scores,
         );
 
+        let baseline_eval_start = Instant::now();
         let current_ev = match grp.evaluate_leaf_rust(
             &grp_history,
             &current_entry,
@@ -601,10 +610,19 @@ impl SearchIntegration {
                 return None;
             }
         };
+        let baseline_eval_us = Instant::now()
+            .checked_duration_since(baseline_eval_start)
+            .unwrap_or(Duration::ZERO)
+            .as_micros() as u64;
 
         // Parallel truncated rollouts: particle-first, action-second
         enum GrpOutcome {
-            Ok { action: usize, value: f64 },
+            Ok {
+                action: usize,
+                value: f64,
+                terminated: bool,
+                grp_eval_us: u64,
+            },
             Error { msg: String },
             Panic { msg: String },
         }
@@ -668,7 +686,12 @@ impl SearchIntegration {
                                     // delta is in raw points (e.g. +8000), convert to
                                     // placement-point scale by dividing by 10000
                                     let value = delta / 10000.0;
-                                    GrpOutcome::Ok { action, value }
+                                    GrpOutcome::Ok {
+                                        action,
+                                        value,
+                                        terminated: true,
+                                        grp_eval_us: 0,
+                                    }
                                 } else {
                                     // Truncated: evaluate leaf with GRP
                                     let leaf_entry = grp::make_grp_entry(
@@ -679,14 +702,24 @@ impl SearchIntegration {
                                     );
                                     // GRP evaluation cannot use self.grp (borrow conflict
                                     // inside par_iter), so we do inline evaluation
+                                    let eval_start = Instant::now();
                                     match grp.evaluate_leaf_rust(
                                         history,
                                         &leaf_entry,
                                         actor,
                                     ) {
                                         Ok(leaf_ev) => {
+                                            let eval_us = Instant::now()
+                                                .checked_duration_since(eval_start)
+                                                .unwrap_or(Duration::ZERO)
+                                                .as_micros() as u64;
                                             let value = leaf_ev - current_ev;
-                                            GrpOutcome::Ok { action, value }
+                                            GrpOutcome::Ok {
+                                                action,
+                                                value,
+                                                terminated: false,
+                                                grp_eval_us: eval_us,
+                                            }
                                         }
                                         Err(e) => {
                                             GrpOutcome::Error { msg: e.to_string() }
@@ -711,17 +744,31 @@ impl SearchIntegration {
             })
             .collect();
 
-        // Aggregate results
+        // Aggregate results and GRP metrics
         let mut action_sums: Vec<f64> = vec![0.0; actions.len()];
         let mut action_counts: Vec<usize> = vec![0; actions.len()];
+        let mut n_truncated = 0_u64;
+        let mut n_terminated = 0_u64;
+        let mut leaf_eval_us_total = 0_u64;
 
         for particle_results in &per_particle {
             for outcome in particle_results {
                 match outcome {
-                    GrpOutcome::Ok { action, value } => {
+                    GrpOutcome::Ok {
+                        action,
+                        value,
+                        terminated,
+                        grp_eval_us,
+                    } => {
                         let ai = actions.iter().position(|&a| a == *action).unwrap();
                         action_sums[ai] += value;
                         action_counts[ai] += 1;
+                        if *terminated {
+                            n_terminated += 1;
+                        } else {
+                            n_truncated += 1;
+                            leaf_eval_us_total += grp_eval_us;
+                        }
                     }
                     GrpOutcome::Error { msg } => {
                         self.errors.record_error(msg);
@@ -734,6 +781,13 @@ impl SearchIntegration {
                 }
             }
         }
+
+        // Update GRP metrics
+        self.grp_eval_count += 1 + n_truncated; // 1 baseline + 1 per truncated rollout
+        self.grp_eval_time_us += baseline_eval_us + leaf_eval_us_total;
+        self.grp_truncated_count += n_truncated;
+        self.grp_terminated_count += n_terminated;
+        self.grp_search_count += 1;
 
         // Compute mean search values
         let search_values: Vec<f64> = action_sums
@@ -805,10 +859,38 @@ impl SearchIntegration {
 
         if best_action != dqn_action {
             self.override_count += 1;
+            self.grp_override_count += 1;
             Some(best_action)
         } else {
             None
         }
+    }
+
+    /// Return a summary of GRP-specific metrics.
+    fn grp_metrics_summary(&self) -> String {
+        let total_rollouts = self.grp_truncated_count + self.grp_terminated_count;
+        let truncation_rate = if total_rollouts > 0 {
+            self.grp_truncated_count as f64 / total_rollouts as f64 * 100.0
+        } else {
+            0.0
+        };
+        let grp_override_pct = if self.grp_search_count > 0 {
+            f64::from(self.grp_override_count) / f64::from(self.grp_search_count) * 100.0
+        } else {
+            0.0
+        };
+        format!(
+            "GRP: searches={}, overrides={} ({:.1}%), evals={}, eval_time={:.1}ms, \
+             truncated={}, terminated={}, truncation_rate={:.1}%",
+            self.grp_search_count,
+            self.grp_override_count,
+            grp_override_pct,
+            self.grp_eval_count,
+            self.grp_eval_time_us as f64 / 1000.0,
+            self.grp_truncated_count,
+            self.grp_terminated_count,
+            truncation_rate,
+        )
     }
 }
 
@@ -897,6 +979,13 @@ impl Drop for SearchIntegration {
             particle_fill_pct,
             self.particle_gen_attempts,
         );
+
+        // Append GRP metrics if any GRP searches were performed
+        let msg = if self.grp_search_count > 0 {
+            format!("{msg}\n             {}", self.grp_metrics_summary())
+        } else {
+            msg
+        };
 
         if error_total > 0 {
             log::warn!("{msg}");
@@ -1016,6 +1105,12 @@ impl MortalBatchAgent {
                     grp_max_steps,
                     search_count: 0_u32,
                     override_count: 0_u32,
+                    grp_eval_count: 0_u64,
+                    grp_eval_time_us: 0_u64,
+                    grp_truncated_count: 0_u64,
+                    grp_terminated_count: 0_u64,
+                    grp_search_count: 0_u32,
+                    grp_override_count: 0_u32,
                     skips: SkipMetrics::default(),
                     errors: ErrorMetrics::default(),
                     search_times_us: Vec::new(),
@@ -1658,55 +1753,247 @@ mod tests {
         let _ = SearchIntegration::is_critical(&state);
     }
 
-    #[test]
-    fn search_integration_drop_does_not_panic() {
-        // Verify that dropping with zero counts doesn't panic
-        let si = SearchIntegration {
+    /// Helper to create a SearchIntegration with default fields for testing.
+    fn make_test_si(search_count: u32, override_count: u32) -> SearchIntegration {
+        SearchIntegration {
             rng: ChaCha12Rng::seed_from_u64(0),
             config: ParticleConfig::new(10),
             max_candidates: 5,
             search_weight: 0.5,
             grp: None,
             grp_max_steps: 20,
-            search_count: 0,
-            override_count: 0,
+            search_count,
+            override_count,
+            grp_eval_count: 0,
+            grp_eval_time_us: 0,
+            grp_truncated_count: 0,
+            grp_terminated_count: 0,
+            grp_search_count: 0,
+            grp_override_count: 0,
             skips: SkipMetrics::default(),
             errors: ErrorMetrics::default(),
             search_times_us: Vec::new(),
             particles_requested: 0,
             particles_generated: 0,
             particle_gen_attempts: 0,
-        };
+        }
+    }
+
+    #[test]
+    fn search_integration_drop_does_not_panic() {
+        // Verify that dropping with zero counts doesn't panic
+        let si = make_test_si(0, 0);
         drop(si); // should not panic
     }
 
     #[test]
     fn search_integration_drop_with_data_does_not_panic() {
-        let mut si = SearchIntegration {
-            rng: ChaCha12Rng::seed_from_u64(0),
-            config: ParticleConfig::new(50),
-            max_candidates: 5,
-            search_weight: 0.5,
-            grp: None,
-            grp_max_steps: 20,
-            search_count: 10,
-            override_count: 3,
-            skips: SkipMetrics {
-                low_criticality: 20,
-                insufficient_candidates: 5,
-                no_particles: 2,
-                particle_gen_error: 1,
-                replay_error: 0,
-                inconclusive: 1,
-            },
-            errors: ErrorMetrics::default(),
-            search_times_us: vec![1000, 2000, 3000, 5000, 10000],
-            particles_requested: 500,
-            particles_generated: 450,
-            particle_gen_attempts: 600,
+        let mut si = make_test_si(10, 3);
+        si.config = ParticleConfig::new(50);
+        si.skips = SkipMetrics {
+            low_criticality: 20,
+            insufficient_candidates: 5,
+            no_particles: 2,
+            particle_gen_error: 1,
+            replay_error: 0,
+            inconclusive: 1,
         };
+        si.search_times_us = vec![1000, 2000, 3000, 5000, 10000];
+        si.particles_requested = 500;
+        si.particles_generated = 450;
+        si.particle_gen_attempts = 600;
         si.errors.record_panic("test panic");
         si.errors.record_error("test error");
         drop(si); // should not panic
+    }
+
+    #[test]
+    fn search_integration_drop_with_grp_data() {
+        let mut si = make_test_si(5, 2);
+        si.grp_search_count = 5;
+        si.grp_override_count = 2;
+        si.grp_eval_count = 150;
+        si.grp_eval_time_us = 50_000;
+        si.grp_truncated_count = 100;
+        si.grp_terminated_count = 50;
+        si.search_times_us = vec![2000, 4000, 6000, 8000, 10000];
+        drop(si); // should not panic and should log GRP metrics
+    }
+
+    #[test]
+    fn grp_metrics_default_zero() {
+        let si = make_test_si(0, 0);
+        assert_eq!(si.grp_eval_count, 0);
+        assert_eq!(si.grp_eval_time_us, 0);
+        assert_eq!(si.grp_truncated_count, 0);
+        assert_eq!(si.grp_terminated_count, 0);
+        assert_eq!(si.grp_search_count, 0);
+        assert_eq!(si.grp_override_count, 0);
+    }
+
+    #[test]
+    fn grp_metrics_summary_format() {
+        let mut si = make_test_si(10, 3);
+        si.grp_search_count = 10;
+        si.grp_override_count = 3;
+        si.grp_eval_count = 250;
+        si.grp_eval_time_us = 100_000;
+        si.grp_truncated_count = 200;
+        si.grp_terminated_count = 50;
+
+        let summary = si.grp_metrics_summary();
+        assert!(summary.contains("searches=10"), "summary: {summary}");
+        assert!(summary.contains("overrides=3"), "summary: {summary}");
+        assert!(summary.contains("evals=250"), "summary: {summary}");
+        assert!(summary.contains("truncated=200"), "summary: {summary}");
+        assert!(summary.contains("terminated=50"), "summary: {summary}");
+        // Truncation rate: 200/(200+50) = 80%
+        assert!(summary.contains("80.0%"), "summary: {summary}");
+    }
+
+    #[test]
+    fn grp_metrics_summary_zero_searches() {
+        let si = make_test_si(0, 0);
+        let summary = si.grp_metrics_summary();
+        assert!(summary.contains("searches=0"), "summary: {summary}");
+        assert!(summary.contains("truncation_rate=0.0%"), "summary: {summary}");
+    }
+
+    #[test]
+    fn build_grp_history_empty_events() {
+        let history = SearchIntegration::build_grp_history(&[]);
+        assert!(history.is_empty());
+    }
+
+    #[test]
+    fn build_grp_history_single_kyoku() {
+        use crate::tile::Tile;
+        let unknown: Tile = "?".parse().unwrap();
+        let events = vec![Event::StartKyoku {
+            bakaze: "E".parse().unwrap(),
+            dora_marker: "1m".parse().unwrap(),
+            kyoku: 1,
+            honba: 0,
+            kyotaku: 0,
+            oya: 0,
+            scores: [25000; 4],
+            tehais: [[unknown; 13]; 4],
+        }];
+        let history = SearchIntegration::build_grp_history(&events);
+        assert!(history.is_empty(), "single kyoku should give empty history");
+    }
+
+    #[test]
+    fn build_grp_history_two_kyoku() {
+        use crate::tile::Tile;
+        let unknown: Tile = "?".parse().unwrap();
+        let events = vec![
+            Event::StartKyoku {
+                bakaze: "E".parse().unwrap(),
+                dora_marker: "1m".parse().unwrap(),
+                kyoku: 1,
+                honba: 0,
+                kyotaku: 0,
+                oya: 0,
+                scores: [25000; 4],
+                tehais: [[unknown; 13]; 4],
+            },
+            Event::StartKyoku {
+                bakaze: "E".parse().unwrap(),
+                dora_marker: "3p".parse().unwrap(),
+                kyoku: 2,
+                honba: 0,
+                kyotaku: 0,
+                oya: 1,
+                scores: [30000, 20000, 25000, 25000],
+                tehais: [[unknown; 13]; 4],
+            },
+        ];
+        let history = SearchIntegration::build_grp_history(&events);
+        assert_eq!(history.len(), 1, "two kyoku → one history entry");
+        // First entry: E1 → grand_kyoku = (27-27)*4 + (1-1) = 0
+        assert_eq!(history[0][0], 0.0, "grand_kyoku for E1");
+        assert_eq!(history[0][1], 0.0, "honba");
+        assert_eq!(history[0][2], 0.0, "kyotaku");
+        assert_eq!(history[0][3], 2.5, "score 25000/10000");
+    }
+
+    #[test]
+    fn build_grp_history_three_kyoku() {
+        use crate::tile::Tile;
+        let unknown: Tile = "?".parse().unwrap();
+        let events = vec![
+            Event::StartKyoku {
+                bakaze: "E".parse().unwrap(),
+                dora_marker: "1m".parse().unwrap(),
+                kyoku: 1,
+                honba: 0,
+                kyotaku: 0,
+                oya: 0,
+                scores: [25000; 4],
+                tehais: [[unknown; 13]; 4],
+            },
+            Event::StartKyoku {
+                bakaze: "E".parse().unwrap(),
+                dora_marker: "3p".parse().unwrap(),
+                kyoku: 2,
+                honba: 1,
+                kyotaku: 0,
+                oya: 1,
+                scores: [30000, 20000, 25000, 25000],
+                tehais: [[unknown; 13]; 4],
+            },
+            Event::StartKyoku {
+                bakaze: "S".parse().unwrap(),
+                dora_marker: "5s".parse().unwrap(),
+                kyoku: 1,
+                honba: 0,
+                kyotaku: 2,
+                oya: 0,
+                scores: [35000, 15000, 25000, 25000],
+                tehais: [[unknown; 13]; 4],
+            },
+        ];
+        let history = SearchIntegration::build_grp_history(&events);
+        assert_eq!(history.len(), 2, "three kyoku → two history entries");
+        // First entry: E1 → grand_kyoku=0
+        assert_eq!(history[0][0], 0.0);
+        // Second entry: E2 → grand_kyoku = (27-27)*4 + (2-1) = 1
+        assert_eq!(history[1][0], 1.0);
+        assert_eq!(history[1][1], 1.0, "honba=1");
+    }
+
+    #[test]
+    fn build_grp_history_south_wind() {
+        use crate::tile::Tile;
+        let unknown: Tile = "?".parse().unwrap();
+        let events = vec![
+            Event::StartKyoku {
+                bakaze: "S".parse().unwrap(),
+                dora_marker: "1m".parse().unwrap(),
+                kyoku: 3,
+                honba: 2,
+                kyotaku: 1,
+                oya: 2,
+                scores: [20000, 30000, 25000, 25000],
+                tehais: [[unknown; 13]; 4],
+            },
+            Event::StartKyoku {
+                bakaze: "S".parse().unwrap(),
+                dora_marker: "9s".parse().unwrap(),
+                kyoku: 4,
+                honba: 0,
+                kyotaku: 0,
+                oya: 3,
+                scores: [15000, 35000, 25000, 25000],
+                tehais: [[unknown; 13]; 4],
+            },
+        ];
+        let history = SearchIntegration::build_grp_history(&events);
+        assert_eq!(history.len(), 1);
+        // S3 → grand_kyoku = (28-27)*4 + (3-1) = 6
+        assert_eq!(history[0][0], 6.0, "S3 grand_kyoku should be 6");
+        assert_eq!(history[0][1], 2.0, "honba=2");
+        assert_eq!(history[0][2], 1.0, "kyotaku=1");
     }
 }

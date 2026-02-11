@@ -798,6 +798,97 @@ mod test {
             }
         }
     }
+
+    #[test]
+    fn test_evaluate_actions_truncated_particle_count() {
+        // Each action should have exactly N results (one per particle)
+        let state = setup_basic_game();
+        let mut sm = SearchModule::with_seed(5, 42);
+        let particles = sm.generate_particles(&state).unwrap();
+        let n = particles.len();
+        let actions = vec![0_usize, 8];
+        let results = sm
+            .evaluate_actions_truncated(&state, particles, actions.clone(), 10)
+            .unwrap();
+
+        assert_eq!(results.len(), actions.len());
+        for &action in &actions {
+            let action_results = &results[&action];
+            assert_eq!(
+                action_results.len(),
+                n,
+                "action {action} should have exactly {n} results (one per particle)"
+            );
+        }
+    }
+
+    #[test]
+    fn test_evaluate_actions_truncated_action_independence() {
+        // Evaluating {0, 8} should give same action-0 results as {0, 8, 13}
+        let state = setup_basic_game();
+
+        let mut sm1 = SearchModule::with_seed(5, 42);
+        let particles1 = sm1.generate_particles(&state).unwrap();
+        let results_2 = sm1
+            .evaluate_actions_truncated(&state, particles1, vec![0, 8], 10)
+            .unwrap();
+
+        let mut sm2 = SearchModule::with_seed(5, 42);
+        let particles2 = sm2.generate_particles(&state).unwrap();
+        let results_3 = sm2
+            .evaluate_actions_truncated(&state, particles2, vec![0, 8, 13], 10)
+            .unwrap();
+
+        // Action 0 results should be identical
+        let r0_2 = &results_2[&0];
+        let r0_3 = &results_3[&0];
+        assert_eq!(r0_2.len(), r0_3.len());
+        for (a, b) in r0_2.iter().zip(r0_3.iter()) {
+            assert_eq!(a.deltas, b.deltas, "action 0 deltas should match");
+            assert_eq!(a.scores, b.scores, "action 0 scores should match");
+            assert_eq!(a.steps, b.steps, "action 0 steps should match");
+            assert_eq!(a.terminated, b.terminated, "action 0 terminated should match");
+        }
+
+        // Action 8 results should also be identical
+        let r8_2 = &results_2[&8];
+        let r8_3 = &results_3[&8];
+        for (a, b) in r8_2.iter().zip(r8_3.iter()) {
+            assert_eq!(a.deltas, b.deltas, "action 8 deltas should match");
+            assert_eq!(a.scores, b.scores, "action 8 scores should match");
+        }
+    }
+
+    #[test]
+    fn test_evaluate_actions_truncated_empty_particles() {
+        let state = setup_basic_game();
+        let mut sm = SearchModule::with_seed(5, 42);
+        let results = sm
+            .evaluate_actions_truncated(&state, vec![], vec![0, 8], 10)
+            .unwrap();
+        for (_, v) in &results {
+            assert!(v.is_empty());
+        }
+    }
+
+    #[test]
+    fn test_evaluate_actions_truncated_max_steps_zero() {
+        // max_steps=0: pure value truncation, no game steps taken
+        let state = setup_basic_game();
+        let mut sm = SearchModule::with_seed(5, 42);
+        let particles = sm.generate_particles(&state).unwrap();
+        let results = sm
+            .evaluate_actions_truncated(&state, particles, vec![0, 8], 0)
+            .unwrap();
+
+        for &action in &[0_usize, 8] {
+            for r in &results[&action] {
+                assert_eq!(r.steps, 0, "max_steps=0 should have 0 steps");
+                assert!(!r.terminated, "max_steps=0 should not be terminated");
+                assert_eq!(r.deltas, [0, 0, 0, 0], "max_steps=0 should have zero deltas");
+            }
+        }
+    }
 }
 
 pub(crate) fn register_module(

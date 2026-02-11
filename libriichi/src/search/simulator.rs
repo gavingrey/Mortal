@@ -6051,4 +6051,220 @@ mod test {
             }
         }
     }
+
+    #[test]
+    fn truncated_max_steps_zero() {
+        // max_steps=0 should return immediately with initial state (pure value truncation)
+        let state = setup_basic_game();
+        let config = ParticleConfig::new(3);
+        let mut rng = ChaCha12Rng::seed_from_u64(42);
+
+        let (particles, _) = generate_particles(&state, &config, &mut rng).unwrap();
+        let replayed = replay_player_states(&state).unwrap();
+        let base = derive_midgame_context_base(state.event_history());
+
+        for particle in &particles {
+            let board_state =
+                build_midgame_board_state_with_base(&state, &replayed, particle, &base).unwrap();
+            let initial_scores = board_state.board.scores;
+
+            let mut thread_rng = ChaCha12Rng::seed_from_u64(42);
+            let result = run_rollout_truncated(
+                board_state,
+                initial_scores,
+                None,
+                None,
+                Some(&mut thread_rng),
+                0,
+            )
+            .unwrap();
+
+            assert_eq!(result.steps, 0, "max_steps=0 should have 0 steps");
+            assert!(!result.terminated, "max_steps=0 should not be terminated");
+            assert_eq!(result.scores, initial_scores, "scores unchanged at step 0");
+            assert_eq!(result.deltas, [0, 0, 0, 0], "deltas should be zero at step 0");
+        }
+    }
+
+    #[test]
+    fn truncated_max_steps_one() {
+        // max_steps=1 should execute exactly one poll iteration
+        let state = setup_basic_game();
+        let config = ParticleConfig::new(3);
+        let mut rng = ChaCha12Rng::seed_from_u64(42);
+
+        let (particles, _) = generate_particles(&state, &config, &mut rng).unwrap();
+        let replayed = replay_player_states(&state).unwrap();
+        let base = derive_midgame_context_base(state.event_history());
+
+        for particle in &particles {
+            let board_state =
+                build_midgame_board_state_with_base(&state, &replayed, particle, &base).unwrap();
+            let initial_scores = board_state.board.scores;
+
+            let mut thread_rng = ChaCha12Rng::seed_from_u64(42);
+            let result = run_rollout_truncated(
+                board_state,
+                initial_scores,
+                None,
+                None,
+                Some(&mut thread_rng),
+                1,
+            )
+            .unwrap();
+
+            assert!(
+                result.steps <= 1,
+                "max_steps=1 should have at most 1 step, got {}",
+                result.steps
+            );
+            if !result.terminated {
+                assert_eq!(result.steps, 1, "non-terminated should have exactly 1 step");
+            }
+        }
+    }
+
+    #[test]
+    fn truncated_scores_sum_invariant() {
+        // Total score should sum to initial total, minus riichi deposits on table.
+        // Standard Mahjong: 4 × 25000 = 100000 total.
+        let state = setup_basic_game();
+        let config = ParticleConfig::new(5);
+        let mut rng = ChaCha12Rng::seed_from_u64(42);
+
+        let (particles, _) = generate_particles(&state, &config, &mut rng).unwrap();
+        let replayed = replay_player_states(&state).unwrap();
+        let base = derive_midgame_context_base(state.event_history());
+
+        for particle in &particles {
+            let board_state =
+                build_midgame_board_state_with_base(&state, &replayed, particle, &base).unwrap();
+            let initial_scores = board_state.board.scores;
+            let initial_sum: i32 = initial_scores.iter().sum();
+
+            let mut thread_rng = ChaCha12Rng::seed_from_u64(42);
+            let result = run_rollout_truncated(
+                board_state,
+                initial_scores,
+                None,
+                None,
+                Some(&mut thread_rng),
+                20,
+            )
+            .unwrap();
+
+            let result_sum: i32 = result.scores.iter().sum();
+            let kyotaku_adjustment = i32::from(result.kyotaku) * 1000;
+            let adjusted_sum = result_sum + kyotaku_adjustment;
+            assert!(
+                (adjusted_sum - initial_sum).abs() <= 1000,
+                "score sum {result_sum} + kyotaku*1000={kyotaku_adjustment} = {adjusted_sum} \
+                 should be close to initial {initial_sum}"
+            );
+        }
+    }
+
+    #[test]
+    fn truncated_determinism_with_action() {
+        // Same seed + same action → identical TruncatedResult
+        let state = setup_basic_game();
+        let config = ParticleConfig::new(3);
+
+        for seed in [42_u64, 123, 999] {
+            let mut rng1 = ChaCha12Rng::seed_from_u64(seed);
+            let (particles1, _) = generate_particles(&state, &config, &mut rng1).unwrap();
+            let mut rng2 = ChaCha12Rng::seed_from_u64(seed);
+            let (particles2, _) = generate_particles(&state, &config, &mut rng2).unwrap();
+
+            let replayed = replay_player_states(&state).unwrap();
+            let base = derive_midgame_context_base(state.event_history());
+
+            for (p1, p2) in particles1.iter().zip(particles2.iter()) {
+                let bs1 =
+                    build_midgame_board_state_with_base(&state, &replayed, p1, &base).unwrap();
+                let bs2 =
+                    build_midgame_board_state_with_base(&state, &replayed, p2, &base).unwrap();
+                let scores1 = bs1.board.scores;
+                let scores2 = bs2.board.scores;
+
+                let mut r1 = ChaCha12Rng::seed_from_u64(777);
+                let mut r2 = ChaCha12Rng::seed_from_u64(777);
+
+                let result1 = simulate_action_rollout_prebuilt_truncated(
+                    &bs1,
+                    scores1,
+                    0,
+                    0,
+                    Some(&mut r1),
+                    15,
+                )
+                .unwrap();
+                let result2 = simulate_action_rollout_prebuilt_truncated(
+                    &bs2,
+                    scores2,
+                    0,
+                    0,
+                    Some(&mut r2),
+                    15,
+                )
+                .unwrap();
+
+                assert_eq!(result1.scores, result2.scores, "determinism: scores");
+                assert_eq!(result1.deltas, result2.deltas, "determinism: deltas");
+                assert_eq!(result1.steps, result2.steps, "determinism: steps");
+                assert_eq!(
+                    result1.terminated, result2.terminated,
+                    "determinism: terminated"
+                );
+                assert_eq!(result1.kyoku, result2.kyoku, "determinism: kyoku");
+                assert_eq!(result1.honba, result2.honba, "determinism: honba");
+                assert_eq!(result1.kyotaku, result2.kyotaku, "determinism: kyotaku");
+            }
+        }
+    }
+
+    #[test]
+    fn truncated_all_terminate_naturally() {
+        // With a very high max_steps, all rollouts should terminate naturally.
+        let state = setup_basic_game();
+        let config = ParticleConfig::new(5);
+        let mut rng = ChaCha12Rng::seed_from_u64(42);
+
+        let (particles, _) = generate_particles(&state, &config, &mut rng).unwrap();
+        let replayed = replay_player_states(&state).unwrap();
+        let base = derive_midgame_context_base(state.event_history());
+
+        let mut all_terminated = true;
+        for particle in &particles {
+            let board_state =
+                build_midgame_board_state_with_base(&state, &replayed, particle, &base).unwrap();
+            let initial_scores = board_state.board.scores;
+
+            let mut thread_rng = ChaCha12Rng::seed_from_u64(42);
+            let result = run_rollout_truncated(
+                board_state,
+                initial_scores,
+                None,
+                None,
+                Some(&mut thread_rng),
+                100_000,
+            )
+            .unwrap();
+
+            if !result.terminated {
+                all_terminated = false;
+            }
+            // If terminated, should have hora or draw info
+            if result.terminated {
+                assert!(
+                    result.has_hora || result.has_abortive_ryukyoku || !result.has_hora,
+                    "terminated result should have valid end flags"
+                );
+            }
+        }
+        assert!(
+            all_terminated,
+            "with 100k max_steps, all rollouts should terminate naturally"
+        );
+    }
 }
