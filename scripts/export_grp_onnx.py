@@ -44,7 +44,7 @@ def main():
     output_path = sys.argv[2]
 
     print(f"Loading GRP model from {model_path}")
-    checkpoint = torch.load(model_path, map_location='cpu', weights_only=False)
+    checkpoint = torch.load(model_path, map_location='cpu', weights_only=True)
 
     # Handle full checkpoint (with 'model', 'optimizer', etc.) or bare state dict
     if 'model' in checkpoint and isinstance(checkpoint['model'], dict):

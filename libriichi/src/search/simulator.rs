@@ -6277,8 +6277,8 @@ mod test {
             // If terminated, should have hora or draw info
             if result.terminated {
                 assert!(
-                    result.has_hora || result.has_abortive_ryukyoku || !result.has_hora,
-                    "terminated result should have valid end flags"
+                    result.steps > 0,
+                    "terminated result should have taken some steps"
                 );
             }
         }

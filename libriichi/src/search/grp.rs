@@ -63,7 +63,7 @@ impl GrpEvaluator {
 }
 
 impl GrpEvaluator {
-    fn load_impl(onnx_path: &str, placement_pts: [f64; 4]) -> Result<Self> {
+    pub(crate) fn load_impl(onnx_path: &str, placement_pts: [f64; 4]) -> Result<Self> {
         // Create a symbolic dimension for the sequence length
         let sym_scope = tract_onnx::prelude::SymbolScope::default();
         let seq_sym = sym_scope.sym("seq");
@@ -88,7 +88,7 @@ impl GrpEvaluator {
     }
 
     /// Core evaluation: run GRP inference and compute expected points.
-    pub fn evaluate_leaf_impl(
+    pub(crate) fn evaluate_leaf_impl(
         &self,
         history: &[GrpEntry],
         leaf: &GrpEntry,
@@ -139,16 +139,6 @@ impl GrpEvaluator {
         Ok(expected_pts)
     }
 
-    /// Evaluate a leaf state without the PyO3 boundary (for Rust-internal use).
-    pub fn evaluate_leaf_rust(
-        &self,
-        history: &[GrpEntry],
-        leaf: &GrpEntry,
-        player_id: u8,
-    ) -> Result<f64> {
-        self.evaluate_leaf_impl(history, leaf, player_id)
-    }
-
     /// Get a reference to the placement points.
     pub const fn placement_pts(&self) -> &[f64; 4] {
         &self.placement_pts
@@ -164,21 +154,25 @@ impl GrpEvaluator {
 ///
 /// Returns `[prob_rank0, prob_rank1, prob_rank2, prob_rank3]` where rank 0 = 1st place.
 pub fn calc_player_probs(logits: &[f64], player_id: u8) -> [f64; 4] {
-    debug_assert!(logits.len() == 24);
-    debug_assert!(player_id < 4);
+    assert!(logits.len() == 24, "expected 24 logits, got {}", logits.len());
+    assert!(player_id < 4, "player_id must be 0-3, got {player_id}");
 
-    // Softmax
+    // Softmax (stack-allocated)
     let max_logit = logits.iter().copied().fold(f64::NEG_INFINITY, f64::max);
-    let exp: Vec<f64> = logits.iter().map(|&l| (l - max_logit).exp()).collect();
-    let sum: f64 = exp.iter().sum();
-    let probs: Vec<f64> = exp.iter().map(|&e| e / sum).collect();
+    let mut exp = [0.0_f64; 24];
+    let mut sum = 0.0_f64;
+    for (i, &l) in logits.iter().enumerate() {
+        exp[i] = (l - max_logit).exp();
+        sum += exp[i];
+    }
+    let inv_sum = 1.0 / sum;
 
     // Sum probabilities by rank for the given player
     let pid = player_id as usize;
     let mut rank_probs = [0.0_f64; 4];
     for (i, &perm) in PERMS.iter().enumerate() {
         let rank = perm[pid] as usize;
-        rank_probs[rank] += probs[i];
+        rank_probs[rank] += exp[i] * inv_sum;
     }
 
     rank_probs

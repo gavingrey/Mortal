@@ -298,11 +298,13 @@ impl SearchIntegration {
         let mean_best = search_means[search_best_idx];
         let mean_dqn = search_means[dqn_idx];
 
-        // Sample variance: E[X²] - E[X]²
+        // Bessel-corrected sample variance: (sum_sq - n * mean²) / (n - 1)
         let var_best =
-            mean_best.mul_add(-mean_best, action_sum_sq[search_best_idx] / n_best as f64);
+            (action_sum_sq[search_best_idx] - n_best as f64 * mean_best * mean_best)
+                / (n_best - 1) as f64;
         let var_dqn =
-            mean_dqn.mul_add(-mean_dqn, action_sum_sq[dqn_idx] / n_dqn as f64);
+            (action_sum_sq[dqn_idx] - n_dqn as f64 * mean_dqn * mean_dqn)
+                / (n_dqn - 1) as f64;
 
         // Welch's t-test: SE² = var_a/n_a + var_b/n_b
         let se_sq = var_best / n_best as f64 + var_dqn / n_dqn as f64;
@@ -423,13 +425,13 @@ impl SearchIntegration {
                             )
                         }));
                         match rollout {
-                            std::result::Result::Ok(std::result::Result::Ok(result)) => {
+                            Ok(Ok(result)) => {
                                 RolloutOutcome::Ok {
                                     action,
                                     value: f64::from(result.deltas[actor as usize]),
                                 }
                             }
-                            std::result::Result::Ok(Err(e)) => {
+                            Ok(Err(e)) => {
                                 RolloutOutcome::Error { msg: e.to_string() }
                             }
                             Err(panic_info) => RolloutOutcome::Panic {
@@ -524,7 +526,7 @@ impl SearchIntegration {
         let baseline_eval_start = Instant::now();
         let current_ev = {
             let grp = self.grp.as_ref().unwrap();
-            grp.evaluate_leaf_rust(&self.grp_history, &current_entry, player_id)
+            grp.evaluate_leaf_impl(&self.grp_history, &current_entry, player_id)
         };
         let current_ev = match current_ev {
             Ok(ev) => ev,
@@ -599,16 +601,16 @@ impl SearchIntegration {
                             )
                         }));
                         match rollout {
-                            std::result::Result::Ok(std::result::Result::Ok(result)) => {
+                            Ok(Ok(result)) => {
                                 // Build GRP entry: for terminated rollouts, compute
                                 // next-kyoku metadata; for truncated, use leaf state.
                                 let leaf_entry = if result.terminated {
                                     let (next_kyoku, next_honba) = if result.can_renchan {
-                                        (result.kyoku, result.honba + 1)
+                                        (result.kyoku, result.honba.saturating_add(1))
                                     } else if result.has_hora {
-                                        (result.kyoku + 1, 0)
+                                        (result.kyoku.saturating_add(1), 0)
                                     } else {
-                                        (result.kyoku + 1, result.honba + 1)
+                                        (result.kyoku.saturating_add(1), result.honba.saturating_add(1))
                                     };
                                     grp::make_grp_entry(
                                         next_kyoku,
@@ -626,7 +628,7 @@ impl SearchIntegration {
                                 };
 
                                 let eval_start = Instant::now();
-                                match grp.evaluate_leaf_rust(
+                                match grp.evaluate_leaf_impl(
                                     history, &leaf_entry, actor,
                                 ) {
                                     Ok(leaf_ev) => {
@@ -644,7 +646,7 @@ impl SearchIntegration {
                                     Err(e) => GrpOutcome::Error { msg: e.to_string() },
                                 }
                             }
-                            std::result::Result::Ok(Err(e)) => {
+                            Ok(Err(e)) => {
                                 GrpOutcome::Error { msg: e.to_string() }
                             }
                             Err(panic_info) => GrpOutcome::Panic {
@@ -968,7 +970,7 @@ impl MortalBatchAgent {
         })?;
 
         let search = search_cfg
-            .map(|(n_particles, seed, weight, grp_model_path, grp_max_steps, grp_placement_pts)| {
+            .map(|(n_particles, seed, weight, grp_model_path, grp_max_steps, grp_placement_pts)| -> anyhow::Result<SearchIntegration> {
                 let rng = match seed {
                     Some(s) => ChaCha12Rng::seed_from_u64(s),
                     None => ChaCha12Rng::from_os_rng(),
@@ -978,11 +980,11 @@ impl MortalBatchAgent {
 
                 let grp = grp_model_path.map(|path| {
                     log::info!("Loading GRP model from {path}");
-                    GrpEvaluator::load(&path, placement_pts)
-                        .expect("failed to load GRP ONNX model")
-                });
+                    GrpEvaluator::load_impl(&path, placement_pts)
+                }).transpose()
+                .context("failed to load GRP ONNX model")?;
 
-                SearchIntegration {
+                Ok(SearchIntegration {
                     rng,
                     config: ParticleConfig::new(n_particles),
                     max_candidates: 5,
@@ -1005,8 +1007,8 @@ impl MortalBatchAgent {
                     particles_requested: 0_u32,
                     particles_generated: 0_u32,
                     particle_gen_attempts: 0_u32,
-                }
-            });
+                })
+            }).transpose()?;
 
         let size = player_ids.len();
         let quick_eval_reactions = if enable_quick_eval {
@@ -1132,6 +1134,15 @@ impl BatchAgent for MortalBatchAgent {
     #[inline]
     fn oracle_obs_version(&self) -> Option<u32> {
         self.is_oracle.then_some(self.version)
+    }
+
+    fn start_game(&mut self, _index: usize) -> Result<()> {
+        // Clear GRP history so it doesn't leak across games (hanchan).
+        if let Some(si) = &mut self.search {
+            si.grp_history.clear();
+            si.current_kyoku_grp = None;
+        }
+        Ok(())
     }
 
     fn set_scene(
@@ -1845,5 +1856,22 @@ mod tests {
         let si = make_test_si(0, 0);
         assert!(si.grp_history.is_empty());
         assert!(si.current_kyoku_grp.is_none());
+    }
+
+    #[test]
+    fn reset_grp_history_clears_game_state() {
+        let mut si = make_test_si(5, 2);
+        si.grp_history = vec![[1.0, 0.0, 0.0, 2.5, 2.5, 2.5, 2.5]];
+        si.current_kyoku_grp = Some((4, [4.0, 1.0, 0.0, 2.5, 2.5, 2.5, 2.5]));
+
+        // Simulate what start_game does
+        si.grp_history.clear();
+        si.current_kyoku_grp = None;
+
+        assert!(si.grp_history.is_empty(), "grp_history should be cleared");
+        assert!(si.current_kyoku_grp.is_none(), "current_kyoku_grp should be cleared");
+        // Metrics should NOT be cleared (they accumulate across games)
+        assert_eq!(si.search_count, 5);
+        assert_eq!(si.override_count, 2);
     }
 }
