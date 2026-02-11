@@ -23,10 +23,14 @@ pub type GrpEntry = [f64; 7];
 ///
 /// Loads a GRP ONNX model and evaluates leaf states to produce expected
 /// points based on placement probabilities.
+///
+/// The model is loaded with concrete `batch=1` and symbolic `seq_len`.
+/// Tract's GRU scan creates inner plans that don't inherit resolved symbols,
+/// so symbolic batch dimensions cause panics. Batching is implemented by
+/// looping over `evaluate_leaf_impl` instead.
 #[pyclass]
 pub struct GrpEvaluator {
     model: Arc<TypedRunnableModel<TypedFact>>,
-    batch_sym: Symbol,
     seq_sym: Symbol,
     placement_pts: [f64; 4],
 }
@@ -62,7 +66,7 @@ impl GrpEvaluator {
             .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))
     }
 
-    /// Evaluate multiple leaf states in a single batched ONNX call.
+    /// Evaluate multiple leaf states (loops over evaluate_leaf internally).
     ///
     /// `history`: shared prefix of GRP entries from previous kyoku boundaries
     /// `leaves`: leaf state entries to evaluate (one per batch element)
@@ -82,9 +86,11 @@ impl GrpEvaluator {
 
 impl GrpEvaluator {
     pub(crate) fn load_impl(onnx_path: &str, placement_pts: [f64; 4]) -> Result<Self> {
-        // Create symbolic dimensions for batch size and sequence length
+        // Use concrete batch=1 and symbolic seq_len.
+        // Tract's GRU scan creates inner SimpleStates that don't inherit
+        // resolved symbols from the outer state, so symbolic batch dims
+        // cause panics. Batching is handled by looping over evaluate_leaf_impl.
         let sym_scope = tract_onnx::prelude::SymbolScope::default();
-        let batch_sym = sym_scope.sym("batch");
         let seq_sym = sym_scope.sym("seq");
 
         let model = tract_onnx::onnx()
@@ -94,7 +100,7 @@ impl GrpEvaluator {
                 0,
                 InferenceFact::dt_shape(
                     f32::datum_type(),
-                    tvec![TDim::from(&batch_sym), TDim::from(&seq_sym), 7.into()],
+                    tvec![1.into(), TDim::from(&seq_sym), 7.into()],
                 ),
             )?
             .into_optimized()
@@ -104,7 +110,6 @@ impl GrpEvaluator {
 
         Ok(Self {
             model: Arc::new(model),
-            batch_sym,
             seq_sym,
             placement_pts,
         })
@@ -134,11 +139,9 @@ impl GrpEvaluator {
         )
         .context("failed to create input tensor")?;
 
-        // Run inference with resolved symbolic dimensions
+        // Run inference with resolved symbolic seq_len (batch is concrete 1)
         let mut state = SimpleState::new(Arc::clone(&self.model))
             .context("failed to create inference state")?;
-        state.session_state.resolved_symbols
-            .set(&self.batch_sym, 1);
         state.session_state.resolved_symbols
             .set(&self.seq_sym, seq_len as i64);
         let result = state.run(tvec![input_tensor.into_tvalue()])
@@ -164,78 +167,23 @@ impl GrpEvaluator {
         Ok(expected_pts)
     }
 
-    /// Batched evaluation: run GRP inference for multiple leaves in one ONNX call.
+    /// Batched evaluation: evaluate multiple leaves by looping over `evaluate_leaf_impl`.
     ///
-    /// All leaves share the same `history` prefix. Each sample in the batch is
-    /// `history ++ [leaf_i]`. Returns expected points per leaf.
+    /// All leaves share the same `history` prefix. Returns expected points per leaf.
+    ///
+    /// Note: implemented as a loop rather than a true ONNX batch call because
+    /// tract's GRU scan creates inner SimpleStates that don't inherit resolved
+    /// symbolic dimensions, causing panics with symbolic batch dims.
     pub(crate) fn evaluate_batch_impl(
         &self,
         history: &[GrpEntry],
         leaves: &[GrpEntry],
         player_id: u8,
     ) -> Result<Vec<f64>> {
-        ensure!(player_id < 4, "player_id must be 0-3, got {player_id}");
-
-        if leaves.is_empty() {
-            return Ok(vec![]);
-        }
-
-        let batch_size = leaves.len();
-        let seq_len = history.len() + 1;
-
-        // Pre-convert shared history prefix to f32 once (avoids redundant conversion per leaf)
-        let history_f32: Vec<f32> = history.iter().flat_map(|e| e.iter().map(|&v| v as f32)).collect();
-
-        // Build flat (batch_size, seq_len, 7) tensor data
-        let mut input_data: Vec<f32> = Vec::with_capacity(batch_size * seq_len * 7);
-        for leaf in leaves {
-            input_data.extend_from_slice(&history_f32);
-            input_data.extend(leaf.iter().map(|&v| v as f32));
-        }
-
-        let input_tensor = tract_ndarray::Array3::from_shape_vec(
-            (batch_size, seq_len, 7),
-            input_data,
-        )
-        .context("failed to create batched input tensor")?;
-
-        // Run inference with resolved symbolic dimensions
-        let mut state = SimpleState::new(Arc::clone(&self.model))
-            .context("failed to create inference state")?;
-        state.session_state.resolved_symbols
-            .set(&self.batch_sym, batch_size as i64);
-        state.session_state.resolved_symbols
-            .set(&self.seq_sym, seq_len as i64);
-        let result = state.run(tvec![input_tensor.into_tvalue()])
-            .context("batched GRP inference failed")?;
-
-        // Extract logits: shape (batch_size, 24), cast f32 -> f64
-        let logits_tensor = result[0]
-            .to_array_view::<f32>()
-            .context("failed to extract batched logits")?;
-        ensure!(
-            logits_tensor.len() == batch_size * 24,
-            "expected {} logits, got {}",
-            batch_size * 24,
-            logits_tensor.len()
-        );
-
-        // Compute expected points for each leaf (convert f32->f64 per-sample on the stack)
-        let logits_flat = logits_tensor.as_slice().context("logits tensor not contiguous")?;
-        let mut results = Vec::with_capacity(batch_size);
-        for i in 0..batch_size {
-            let sample_f32 = &logits_flat[i * 24..(i + 1) * 24];
-            let sample_logits: [f64; 24] = std::array::from_fn(|j| f64::from(sample_f32[j]));
-            let probs = calc_player_probs(&sample_logits, player_id);
-            let expected_pts: f64 = probs
-                .iter()
-                .zip(self.placement_pts.iter())
-                .map(|(p, pts)| p * pts)
-                .sum();
-            results.push(expected_pts);
-        }
-
-        Ok(results)
+        leaves
+            .iter()
+            .map(|leaf| self.evaluate_leaf_impl(history, leaf, player_id))
+            .collect()
     }
 
     /// Get a reference to the placement points.
