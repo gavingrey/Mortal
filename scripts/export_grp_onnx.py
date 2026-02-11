@@ -86,18 +86,22 @@ def main():
         else:
             print(f" WARNING: large difference!")
 
+    # Save f64 reference outputs before converting to f32
+    print("\nComputing f64 reference outputs for precision comparison...")
+    ref_inputs = [torch.randn(1, seq_len, 7, dtype=torch.float64) for seq_len in [1, 3, 5, 8]]
+    with torch.no_grad():
+        ref_outputs = [wrapper(x) for x in ref_inputs]
+
     # Convert to float32 for ONNX export (tract and onnxruntime support f32 GRU)
-    print("\nConverting model to float32 for export...")
-    wrapper_f32 = wrapper.float()
+    print("Converting model to float32 for export...")
+    wrapper.float()  # in-place conversion
 
     # Validate f32 vs f64 precision loss is acceptable
     print("Validating f32 precision loss...")
-    for seq_len in [1, 3, 5, 8]:
-        x64 = torch.randn(1, seq_len, 7, dtype=torch.float64)
+    for x64, out64, seq_len in zip(ref_inputs, ref_outputs, [1, 3, 5, 8]):
         x32 = x64.float()
         with torch.no_grad():
-            out64 = wrapper(x64)
-            out32 = wrapper_f32(x32)
+            out32 = wrapper(x32)
         diff = (out64.float() - out32).abs().max().item()
         print(f"  seq_len={seq_len}: f64 vs f32 max_diff={diff:.2e}", end="")
         if diff < 1e-3:
@@ -109,7 +113,7 @@ def main():
     print(f"\nExporting to {output_path} (float32)")
     dummy_input = torch.randn(1, 3, 7, dtype=torch.float32)
     torch.onnx.export(
-        wrapper_f32,
+        wrapper,
         dummy_input,
         output_path,
         input_names=['input'],
@@ -137,7 +141,7 @@ def main():
     for seq_len in [1, 3, 5, 8]:
         x = torch.randn(1, seq_len, 7, dtype=torch.float32)
         with torch.no_grad():
-            ref_out = wrapper_f32(x).numpy()
+            ref_out = wrapper(x).numpy()
         onnx_out = session.run(None, {'input': x.numpy()})[0]
         diff = np.abs(ref_out - onnx_out).max()
         print(f"  seq_len={seq_len}: PyTorch vs ONNX max_diff={diff:.2e}", end="")
