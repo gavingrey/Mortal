@@ -90,6 +90,10 @@ pub struct TruncatedResult {
     #[pyo3(get)]
     pub has_abortive_ryukyoku: bool,
 
+    /// Whether the dealer can renchan (only meaningful when terminated=true).
+    #[pyo3(get)]
+    pub can_renchan: bool,
+
     /// Current kyoku at leaf (absolute, 0-indexed).
     #[pyo3(get)]
     pub kyoku: u8,
@@ -118,13 +122,14 @@ impl TruncatedResult {
     fn __repr__(&self) -> String {
         format!(
             "TruncatedResult(scores={:?}, deltas={:?}, steps={}, terminated={}, \
-             hora={}, abort={}, kyoku={}, honba={}, kyotaku={})",
+             hora={}, abort={}, renchan={}, kyoku={}, honba={}, kyotaku={})",
             self.scores,
             self.deltas,
             self.steps,
             self.terminated,
             self.has_hora,
             self.has_abortive_ryukyoku,
+            self.can_renchan,
             self.kyoku,
             self.honba,
             self.kyotaku,
@@ -1205,6 +1210,7 @@ fn run_rollout_truncated(
                         terminated: false,
                         has_hora: false,
                         has_abortive_ryukyoku: false,
+                        can_renchan: false,
                         kyoku: board_state.board.kyoku,
                         honba: board_state.board.honba,
                         kyotaku: board_state.board.kyotaku,
@@ -1273,6 +1279,7 @@ fn run_rollout_truncated(
                     terminated: true,
                     has_hora: result.has_hora,
                     has_abortive_ryukyoku: result.has_abortive_ryukyoku,
+                    can_renchan: result.can_renchan,
                     kyoku: result.kyoku,
                     honba: board_state.board.honba,
                     kyotaku: result.kyotaku_left,
