@@ -3,7 +3,9 @@ use crate::arena::MidgameContextBase;
 use crate::consts::ACTION_SPACE;
 use crate::mjai::{Event, EventExt, Metadata};
 use crate::search::config::ParticleConfig;
+use crate::consts::obs_shape;
 use crate::search::grp::{self, GrpEntry, GrpEvaluator};
+use crate::search::mortal_value::{self, MortalValueEvaluator};
 use crate::search::{particle, simulator};
 use crate::state::PlayerState;
 use crate::{must_tile, tu8};
@@ -126,6 +128,17 @@ struct SearchIntegration {
     // GRP value truncation (optional — when None, uses terminal rollouts)
     grp: Option<GrpEvaluator>,
     grp_max_steps: u32,
+
+    // Mortal value head evaluation (alternative to GRP)
+    mortal_value: Option<MortalValueEvaluator>,
+    value_obs_version: u32,
+    value_placement_pts: [f64; 4],
+    value_search_count: u32,
+    value_override_count: u32,
+    value_eval_count: u64,
+    value_eval_time_us: u64,
+    value_truncated_count: u64,
+    value_terminated_count: u64,
 
     // Per-game GRP history (keyed by game index within the batch).
     // Each game accumulates its own kyoku boundary entries independently.
@@ -644,6 +657,8 @@ impl SearchIntegration {
                                 action,
                                 Some(&mut action_rng),
                                 max_steps,
+                                false,
+                                4,
                             )
                         }));
                         match rollout {
@@ -816,6 +831,255 @@ impl SearchIntegration {
         result
     }
 
+    /// Value-head-based search override: truncated rollouts + Mortal value head evaluation.
+    ///
+    /// Two-phase approach:
+    /// - Phase A: Parallel truncated rollouts (rayon) with obs capture for truncated leaves
+    /// - Phase B: Score-based placement EV for terminated leaves, value head for truncated
+    ///
+    /// Returns `Some(action)` if search found a statistically significantly
+    /// better action, `None` to keep DQN choice.
+    fn maybe_override_value(
+        &mut self,
+        _game_index: usize,
+        state: &PlayerState,
+        q_values: &[f32; ACTION_SPACE],
+        masks: &[bool; ACTION_SPACE],
+        actor: u8,
+    ) -> Option<usize> {
+        self.mortal_value.as_ref()?;
+
+        let ctx = self.prepare_search(state, q_values, masks)?;
+        let SearchContext {
+            actions, candidates, particles, replayed, base, seeds, start,
+        } = ctx;
+
+        self.value_search_count += 1;
+        let max_steps = self.grp_max_steps;
+        let obs_version = self.value_obs_version;
+        let placement_pts = self.value_placement_pts;
+
+        // Baseline: placement EV from current scores
+        let player_id = state.player_id();
+        let current_scores = state.scores();
+        let mut abs_scores = [0_i32; 4];
+        for i in 0..4 {
+            abs_scores[(player_id as usize + i) % 4] = current_scores[i];
+        }
+        let current_ev = mortal_value::scores_to_placement_ev(&abs_scores, actor, &placement_pts);
+
+        // ============================================================
+        // Phase A: Parallel truncated rollouts with obs capture
+        // ============================================================
+        enum RolloutOutcome {
+            Ok {
+                action: usize,
+                leaf_obs: Option<Array2<f32>>,
+                terminated: bool,
+                scores: [i32; 4],
+            },
+            Error { msg: String },
+            Panic { msg: String },
+        }
+
+        let per_particle: Vec<Vec<RolloutOutcome>> = particles
+            .par_iter()
+            .enumerate()
+            .map(|(pi, p)| {
+                let board_state = match panic::catch_unwind(panic::AssertUnwindSafe(|| {
+                    simulator::build_midgame_board_state_with_base(
+                        state, &replayed, p, &base,
+                    )
+                })) {
+                    Ok(Ok(bs)) => bs,
+                    Ok(Err(e)) => {
+                        let msg = e.to_string();
+                        return actions
+                            .iter()
+                            .map(|_| RolloutOutcome::Error { msg: msg.clone() })
+                            .collect();
+                    }
+                    Err(panic_info) => {
+                        let msg = extract_panic_msg(&panic_info);
+                        return actions
+                            .iter()
+                            .map(|_| RolloutOutcome::Panic { msg: msg.clone() })
+                            .collect();
+                    }
+                };
+                let initial_scores = board_state.board.scores;
+                let mut particle_rng = ChaCha12Rng::seed_from_u64(seeds[pi]);
+
+                actions
+                    .iter()
+                    .map(|&action| {
+                        let action_seed = particle_rng.next_u64();
+                        let mut action_rng = ChaCha12Rng::seed_from_u64(action_seed);
+
+                        let rollout = panic::catch_unwind(panic::AssertUnwindSafe(|| {
+                            simulator::simulate_action_rollout_prebuilt_truncated(
+                                &board_state,
+                                initial_scores,
+                                actor,
+                                action,
+                                Some(&mut action_rng),
+                                max_steps,
+                                true,
+                                obs_version,
+                            )
+                        }));
+                        match rollout {
+                            Ok(Ok(result)) => RolloutOutcome::Ok {
+                                action,
+                                leaf_obs: result.leaf_obs,
+                                terminated: result.terminated,
+                                scores: result.scores,
+                            },
+                            Ok(Err(e)) => {
+                                RolloutOutcome::Error { msg: e.to_string() }
+                            }
+                            Err(panic_info) => RolloutOutcome::Panic {
+                                msg: extract_panic_msg(&panic_info),
+                            },
+                        }
+                    })
+                    .collect()
+            })
+            .collect();
+
+        // ============================================================
+        // Phase B: Evaluate leaves
+        // ============================================================
+
+        // Separate terminated and truncated outcomes
+        struct LeafData {
+            action: usize,
+            ev: f64,
+        }
+
+        let mut leaf_results: Vec<LeafData> = Vec::new();
+        let mut truncated_obs: Vec<(usize, Array2<f32>)> = Vec::new(); // (action, obs)
+        let mut n_truncated = 0_u64;
+        let mut n_terminated = 0_u64;
+
+        for particle_results in &per_particle {
+            for outcome in particle_results {
+                match outcome {
+                    RolloutOutcome::Ok {
+                        action, leaf_obs, terminated, scores,
+                    } => {
+                        if *terminated {
+                            // Score-based placement EV (ground truth)
+                            let ev = mortal_value::scores_to_placement_ev(
+                                scores, actor, &placement_pts,
+                            );
+                            leaf_results.push(LeafData { action: *action, ev });
+                            n_terminated += 1;
+                        } else if let Some(obs) = leaf_obs {
+                            truncated_obs.push((*action, obs.clone()));
+                            n_truncated += 1;
+                        }
+                    }
+                    RolloutOutcome::Error { msg } => {
+                        self.errors.record_error(msg);
+                        log::debug!("search value rollout error: {msg}");
+                    }
+                    RolloutOutcome::Panic { msg } => {
+                        self.errors.record_panic(msg);
+                        log::warn!("search value rollout panic: {msg}");
+                    }
+                }
+            }
+        }
+
+        // Update value metrics
+        self.value_truncated_count += n_truncated;
+        self.value_terminated_count += n_terminated;
+
+        if leaf_results.is_empty() && truncated_obs.is_empty() {
+            log::debug!("value search: no valid rollout leaves — skipping override");
+            self.skips.insufficient_data += 1;
+            self.record_elapsed(start);
+            return None;
+        }
+
+        // Batch evaluate truncated leaves with value head
+        if !truncated_obs.is_empty() {
+            let eval_start = Instant::now();
+            let obs_refs: Vec<&Array2<f32>> = truncated_obs.iter().map(|(_, o)| o).collect();
+            let mortal_value = self.mortal_value.as_ref().unwrap();
+            let values: Vec<f64> = match obs_refs
+                .iter()
+                .map(|obs| mortal_value.evaluate(obs))
+                .collect::<Result<Vec<f64>, _>>()
+            {
+                Ok(vs) => vs,
+                Err(e) => {
+                    log::debug!("value head batch eval error: {e}");
+                    self.record_elapsed(start);
+                    return None;
+                }
+            };
+            let eval_us = Instant::now()
+                .checked_duration_since(eval_start)
+                .unwrap_or(Duration::ZERO)
+                .as_micros() as u64;
+            self.value_eval_count += values.len() as u64;
+            self.value_eval_time_us += eval_us;
+
+            for ((action, _), ev) in truncated_obs.iter().zip(values.iter()) {
+                leaf_results.push(LeafData { action: *action, ev: *ev });
+            }
+        }
+
+        // Accumulate per-action statistics
+        let mut action_sums: Vec<f64> = vec![0.0; actions.len()];
+        let mut action_sum_sq: Vec<f64> = vec![0.0; actions.len()];
+        let mut action_counts: Vec<usize> = vec![0; actions.len()];
+
+        for leaf in &leaf_results {
+            let value = leaf.ev - current_ev;
+            let ai = actions.iter().position(|&a| a == leaf.action).unwrap();
+            action_sums[ai] += value;
+            action_sum_sq[ai] += value * value;
+            action_counts[ai] += 1;
+        }
+
+        // Track avg terminated samples per action
+        for &c in &action_counts {
+            self.terminated_per_action_sum += c as u64;
+            self.terminated_per_action_count += 1;
+        }
+
+        // Guard: need at least 2 actions with ≥2 samples for meaningful t-test
+        let actions_with_enough = action_counts.iter().filter(|&&c| c >= 2).count();
+        if actions_with_enough < 2 {
+            log::debug!(
+                "value search: only {} actions have ≥2 samples (need 2) — skipping override",
+                actions_with_enough,
+            );
+            self.skips.insufficient_data += 1;
+            self.record_elapsed(start);
+            return None;
+        }
+
+        log::debug!(
+            "value search: terminated={}, truncated={}, value_evals={}, current_ev={:.3}",
+            n_terminated, n_truncated, truncated_obs.len(), current_ev,
+        );
+
+        let result = self.decide_override(
+            &actions, &candidates, &action_sums, &action_sum_sq, &action_counts,
+        );
+        self.record_elapsed(start);
+
+        if result.is_some() {
+            self.override_count += 1;
+            self.value_override_count += 1;
+        }
+        result
+    }
+
     /// Record elapsed time from `start` into `search_times_us`.
     fn record_elapsed(&mut self, start: Instant) {
         let elapsed_us = Instant::now()
@@ -980,6 +1244,35 @@ impl Drop for SearchIntegration {
             msg
         };
 
+        // Append value-head metrics if any value searches were performed
+        let msg = if self.value_search_count > 0 {
+            let total_rollouts = self.value_truncated_count + self.value_terminated_count;
+            let truncation_rate = if total_rollouts > 0 {
+                self.value_truncated_count as f64 / total_rollouts as f64 * 100.0
+            } else {
+                0.0
+            };
+            let value_override_pct = if self.value_search_count > 0 {
+                f64::from(self.value_override_count) / f64::from(self.value_search_count) * 100.0
+            } else {
+                0.0
+            };
+            format!(
+                "{msg}\n             Value: searches={}, overrides={} ({:.1}%), evals={}, eval_time={:.1}ms, \
+                 truncated={}, terminated={}, truncation_rate={:.1}%",
+                self.value_search_count,
+                self.value_override_count,
+                value_override_pct,
+                self.value_eval_count,
+                self.value_eval_time_us as f64 / 1000.0,
+                self.value_truncated_count,
+                self.value_terminated_count,
+                truncation_rate,
+            )
+        } else {
+            msg
+        };
+
         // Effect size diagnostics
         let msg = if !self.override_effects.is_empty() {
             let n = self.override_effects.len();
@@ -1076,6 +1369,11 @@ impl MortalBatchAgent {
                     .getattr("search_grp_model")
                     .and_then(|v| v.extract())
                     .ok();
+                // Mortal value model path (optional, alternative to GRP)
+                let value_model_path: Option<String> = obj
+                    .getattr("search_value_model")
+                    .and_then(|v| v.extract())
+                    .ok();
                 let grp_max_steps: u32 = obj
                     .getattr("search_max_steps")
                     .and_then(|v| v.extract())
@@ -1085,7 +1383,7 @@ impl MortalBatchAgent {
                     .and_then(|v| v.extract())
                     .ok();
 
-                Some((n_particles, seed, weight, grp_model_path, grp_max_steps, grp_placement_pts))
+                Some((n_particles, seed, weight, grp_model_path, value_model_path, grp_max_steps, grp_placement_pts))
             } else {
                 None
             };
@@ -1101,7 +1399,7 @@ impl MortalBatchAgent {
         })?;
 
         let search = search_cfg
-            .map(|(n_particles, seed, weight, grp_model_path, grp_max_steps, grp_placement_pts)| -> anyhow::Result<SearchIntegration> {
+            .map(|(n_particles, seed, weight, grp_model_path, value_model_path, grp_max_steps, grp_placement_pts)| -> anyhow::Result<SearchIntegration> {
                 let rng = match seed {
                     Some(s) => ChaCha12Rng::seed_from_u64(s),
                     None => ChaCha12Rng::from_os_rng(),
@@ -1115,6 +1413,13 @@ impl MortalBatchAgent {
                 }).transpose()
                 .context("failed to load GRP ONNX model")?;
 
+                let mortal_value = value_model_path.map(|path| {
+                    log::info!("Loading Mortal value model from {path}");
+                    let obs_channels = obs_shape(version).0;
+                    MortalValueEvaluator::load(&path, obs_channels)
+                }).transpose()
+                .context("failed to load Mortal value ONNX model")?;
+
                 Ok(SearchIntegration {
                     rng,
                     config: ParticleConfig::new(n_particles),
@@ -1123,6 +1428,15 @@ impl MortalBatchAgent {
                     min_effect_size: 0.1,
                     grp,
                     grp_max_steps,
+                    mortal_value,
+                    value_obs_version: version,
+                    value_placement_pts: placement_pts,
+                    value_search_count: 0_u32,
+                    value_override_count: 0_u32,
+                    value_eval_count: 0_u64,
+                    value_eval_time_us: 0_u64,
+                    value_truncated_count: 0_u64,
+                    value_terminated_count: 0_u64,
                     grp_game_states: HashMap::new(),
                     search_count: 0_u32,
                     override_count: 0_u32,
@@ -1428,7 +1742,15 @@ impl BatchAgent for MortalBatchAgent {
             if let Some(ref mut search) = self.search {
                 // Use GRP-based search when a GRP model is loaded,
                 // otherwise fall back to terminal rollout search.
-                let override_action = if search.grp.is_some() {
+                let override_action = if search.mortal_value.is_some() {
+                    search.maybe_override_value(
+                        index,
+                        state,
+                        &self.q_values[action_idx],
+                        &self.masks_recv[action_idx],
+                        actor,
+                    )
+                } else if search.grp.is_some() {
                     search.maybe_override_grp(
                         index,
                         state,
@@ -1799,6 +2121,15 @@ mod tests {
             min_effect_size: 0.1,
             grp: None,
             grp_max_steps: 100,
+            mortal_value: None,
+            value_obs_version: 4,
+            value_placement_pts: [6.0, 4.0, 2.0, 0.0],
+            value_search_count: 0,
+            value_override_count: 0,
+            value_eval_count: 0,
+            value_eval_time_us: 0,
+            value_truncated_count: 0,
+            value_terminated_count: 0,
             grp_game_states: HashMap::new(),
             search_count,
             override_count,
@@ -2149,5 +2480,51 @@ mod tests {
         let result = si.decide_override(&actions, &candidates, &sums, &sum_sq, &counts);
         assert_eq!(result, Some(1), "should override with effect 0.5 > 0.1");
         assert_eq!(si.skips.small_effect, 0);
+    }
+
+    // --- Value head tests ---
+
+    #[test]
+    fn value_metrics_default_zero() {
+        let si = make_test_si(0, 0);
+        assert_eq!(si.value_search_count, 0);
+        assert_eq!(si.value_override_count, 0);
+        assert_eq!(si.value_eval_count, 0);
+        assert_eq!(si.value_eval_time_us, 0);
+        assert_eq!(si.value_truncated_count, 0);
+        assert_eq!(si.value_terminated_count, 0);
+        assert!(si.mortal_value.is_none());
+    }
+
+    #[test]
+    fn search_integration_drop_with_value_data() {
+        let mut si = make_test_si(5, 2);
+        si.value_search_count = 5;
+        si.value_override_count = 2;
+        si.value_eval_count = 100;
+        si.value_eval_time_us = 30_000;
+        si.value_truncated_count = 80;
+        si.value_terminated_count = 20;
+        si.search_times_us = vec![2000, 4000, 6000, 8000, 10000];
+        drop(si); // should not panic and should log value metrics
+    }
+
+    #[test]
+    fn scores_to_placement_ev_integration() {
+        use crate::search::mortal_value::scores_to_placement_ev;
+        let pts = [6.0, 4.0, 2.0, 0.0];
+
+        // Clear ranking: player 0 first, player 3 last
+        let scores = [40000, 30000, 20000, 10000];
+        assert_eq!(scores_to_placement_ev(&scores, 0, &pts), 6.0);
+        assert_eq!(scores_to_placement_ev(&scores, 1, &pts), 4.0);
+        assert_eq!(scores_to_placement_ev(&scores, 2, &pts), 2.0);
+        assert_eq!(scores_to_placement_ev(&scores, 3, &pts), 0.0);
+
+        // Verify sum equals total placement pts
+        let total: f64 = (0..4_u8)
+            .map(|a| scores_to_placement_ev(&scores, a, &pts))
+            .sum();
+        assert!((total - 12.0).abs() < 1e-10);
     }
 }

@@ -105,6 +105,11 @@ pub struct TruncatedResult {
     /// Current kyotaku at leaf.
     #[pyo3(get)]
     pub kyotaku: u8,
+
+    /// Encoded observation at the leaf state for the actor player.
+    /// Only populated when `capture_obs=true` and the rollout was truncated
+    /// (not terminated). Shape: `(obs_channels, 34)`.
+    pub leaf_obs: Option<ndarray::Array2<f32>>,
 }
 
 #[pymethods]
@@ -1178,6 +1183,8 @@ fn run_rollout_truncated(
     inject_action: Option<usize>,
     mut smart_rng: Option<&mut ChaCha12Rng>,
     max_steps: u32,
+    capture_obs: bool,
+    obs_version: u32,
 ) -> Result<TruncatedResult> {
     let mut reactions: [EventExt; 4] = Default::default();
     let mut action_injected = inject_action.is_none();
@@ -1200,6 +1207,14 @@ fn run_rollout_truncated(
                         scores[2] - initial_scores[2],
                         scores[3] - initial_scores[3],
                     ];
+                    let leaf_obs = if capture_obs {
+                        let pid = inject_player.unwrap_or(0) as usize;
+                        let (obs, _mask) = board_state.player_states[pid]
+                            .encode_obs(obs_version, false);
+                        Some(obs)
+                    } else {
+                        None
+                    };
                     // Return max_steps as step count (not the internal counter
                     // which includes the init poll). This keeps the external
                     // semantics: steps = "number of reaction sets consumed".
@@ -1214,6 +1229,7 @@ fn run_rollout_truncated(
                         kyoku: board_state.board.kyoku,
                         honba: board_state.board.honba,
                         kyotaku: board_state.board.kyotaku,
+                        leaf_obs,
                     });
                 }
 
@@ -1281,6 +1297,7 @@ fn run_rollout_truncated(
                     kyoku: result.kyoku,
                     honba: board_state.board.honba,
                     kyotaku: result.kyotaku_left,
+                    leaf_obs: None,
                 });
             }
         }
@@ -1292,6 +1309,10 @@ fn run_rollout_truncated(
 /// Clones the provided BoardState and runs a truncated rollout with the
 /// specified action injected. Returns a `TruncatedResult` with state info
 /// needed for GRP evaluation.
+///
+/// When `capture_obs` is true and the rollout truncates (doesn't terminate),
+/// the actor's encoded observation at the leaf state is captured in
+/// `TruncatedResult::leaf_obs`. `obs_version` controls the encoding format.
 pub fn simulate_action_rollout_prebuilt_truncated(
     board_state: &BoardState,
     initial_scores: [i32; 4],
@@ -1299,6 +1320,8 @@ pub fn simulate_action_rollout_prebuilt_truncated(
     action: usize,
     smart_rng: Option<&mut ChaCha12Rng>,
     max_steps: u32,
+    capture_obs: bool,
+    obs_version: u32,
 ) -> Result<TruncatedResult> {
     run_rollout_truncated(
         board_state.clone(),
@@ -1307,6 +1330,8 @@ pub fn simulate_action_rollout_prebuilt_truncated(
         Some(action),
         smart_rng,
         max_steps,
+        capture_obs,
+        obs_version,
     )
 }
 
@@ -5942,6 +5967,8 @@ mod test {
                 None,
                 Some(&mut thread_rng),
                 5,
+                false,
+                4,
             )
             .unwrap();
 
@@ -5988,6 +6015,8 @@ mod test {
                 None,
                 Some(&mut rng2),
                 10000,
+                false,
+                4,
             )
             .unwrap();
 
@@ -6023,6 +6052,8 @@ mod test {
                 0, // discard 1m
                 Some(&mut action_rng),
                 10,
+                false,
+                4,
             )
             .unwrap();
 
@@ -6058,6 +6089,8 @@ mod test {
                 None,
                 Some(&mut thread_rng),
                 5,
+                false,
+                4,
             )
             .unwrap();
 
@@ -6094,6 +6127,8 @@ mod test {
                 None,
                 Some(&mut thread_rng),
                 0,
+                false,
+                4,
             )
             .unwrap();
 
@@ -6128,6 +6163,8 @@ mod test {
                 None,
                 Some(&mut thread_rng),
                 1,
+                false,
+                4,
             )
             .unwrap();
 
@@ -6168,6 +6205,8 @@ mod test {
                 None,
                 Some(&mut thread_rng),
                 20,
+                false,
+                4,
             )
             .unwrap();
 
@@ -6215,6 +6254,8 @@ mod test {
                     0,
                     Some(&mut r1),
                     15,
+                    false,
+                    4,
                 )
                 .unwrap();
                 let result2 = simulate_action_rollout_prebuilt_truncated(
@@ -6224,6 +6265,8 @@ mod test {
                     0,
                     Some(&mut r2),
                     15,
+                    false,
+                    4,
                 )
                 .unwrap();
 
@@ -6266,6 +6309,8 @@ mod test {
                 None,
                 Some(&mut thread_rng),
                 100_000,
+                false,
+                4,
             )
             .unwrap();
 
@@ -6284,5 +6329,176 @@ mod test {
             all_terminated,
             "with 100k max_steps, all rollouts should terminate naturally"
         );
+    }
+
+    #[test]
+    fn test_truncated_result_leaf_obs_none_by_default() {
+        // When capture_obs=false, leaf_obs should be None for all results
+        let state = setup_basic_game();
+        let config = ParticleConfig::new(5);
+        let mut rng = ChaCha12Rng::seed_from_u64(42);
+
+        let (particles, _) = generate_particles(&state, &config, &mut rng).unwrap();
+        let replayed = replay_player_states(&state).unwrap();
+        let base = derive_midgame_context_base(state.event_history());
+        let player_id = state.player_id();
+
+        for particle in &particles {
+            let board_state =
+                build_midgame_board_state_with_base(&state, &replayed, particle, &base).unwrap();
+            let initial_scores = board_state.board.scores;
+
+            let mut action_rng = ChaCha12Rng::seed_from_u64(999);
+            let result = simulate_action_rollout_prebuilt_truncated(
+                &board_state,
+                initial_scores,
+                player_id,
+                0,
+                Some(&mut action_rng),
+                10,
+                false, // capture_obs=false
+                4,
+            )
+            .unwrap();
+
+            assert!(
+                result.leaf_obs.is_none(),
+                "leaf_obs should be None when capture_obs=false"
+            );
+        }
+    }
+
+    #[test]
+    fn test_truncated_result_leaf_obs_captured_on_truncation() {
+        // When capture_obs=true and rollout truncates, leaf_obs should be
+        // Some with correct shape (obs_shape(version).0, 34)
+        let state = setup_basic_game();
+        let config = ParticleConfig::new(5);
+        let mut rng = ChaCha12Rng::seed_from_u64(42);
+
+        let (particles, _) = generate_particles(&state, &config, &mut rng).unwrap();
+        let replayed = replay_player_states(&state).unwrap();
+        let base = derive_midgame_context_base(state.event_history());
+        let player_id = state.player_id();
+
+        let version = 4_u32;
+        let expected_channels = crate::consts::obs_shape(version).0;
+
+        let mut found_truncated = false;
+        for particle in &particles {
+            let board_state =
+                build_midgame_board_state_with_base(&state, &replayed, particle, &base).unwrap();
+            let initial_scores = board_state.board.scores;
+
+            let mut action_rng = ChaCha12Rng::seed_from_u64(999);
+            let result = simulate_action_rollout_prebuilt_truncated(
+                &board_state,
+                initial_scores,
+                player_id,
+                0,
+                Some(&mut action_rng),
+                5, // short max_steps to force truncation
+                true, // capture_obs=true
+                version,
+            )
+            .unwrap();
+
+            if !result.terminated {
+                found_truncated = true;
+                let obs = result.leaf_obs.as_ref().expect("truncated should have leaf_obs");
+                assert_eq!(
+                    obs.dim(),
+                    (expected_channels, 34),
+                    "leaf_obs shape should be ({}, 34)",
+                    expected_channels
+                );
+            }
+        }
+        assert!(found_truncated, "should have at least one truncated result with max_steps=5");
+    }
+
+    #[test]
+    fn test_truncated_result_leaf_obs_none_on_termination() {
+        // When rollout terminates naturally, leaf_obs should be None
+        // regardless of capture_obs setting
+        let state = setup_basic_game();
+        let config = ParticleConfig::new(5);
+        let mut rng = ChaCha12Rng::seed_from_u64(42);
+
+        let (particles, _) = generate_particles(&state, &config, &mut rng).unwrap();
+        let replayed = replay_player_states(&state).unwrap();
+        let base = derive_midgame_context_base(state.event_history());
+        let player_id = state.player_id();
+
+        let mut found_terminated = false;
+        for particle in &particles {
+            let board_state =
+                build_midgame_board_state_with_base(&state, &replayed, particle, &base).unwrap();
+            let initial_scores = board_state.board.scores;
+
+            let mut action_rng = ChaCha12Rng::seed_from_u64(999);
+            let result = simulate_action_rollout_prebuilt_truncated(
+                &board_state,
+                initial_scores,
+                player_id,
+                0,
+                Some(&mut action_rng),
+                100000, // large max_steps to allow termination
+                true,   // capture_obs=true
+                4,
+            )
+            .unwrap();
+
+            if result.terminated {
+                found_terminated = true;
+                assert!(
+                    result.leaf_obs.is_none(),
+                    "terminated result should have leaf_obs=None"
+                );
+            }
+        }
+        assert!(
+            found_terminated,
+            "with 100k max_steps, should have at least one terminated result"
+        );
+    }
+
+    #[test]
+    fn test_truncated_result_backward_compat() {
+        // Existing test behavior unchanged with capture_obs=false
+        let state = setup_basic_game();
+        let config = ParticleConfig::new(3);
+        let mut rng = ChaCha12Rng::seed_from_u64(42);
+
+        let (particles, _) = generate_particles(&state, &config, &mut rng).unwrap();
+        let replayed = replay_player_states(&state).unwrap();
+        let base = derive_midgame_context_base(state.event_history());
+        let player_id = state.player_id();
+
+        for particle in &particles {
+            let board_state =
+                build_midgame_board_state_with_base(&state, &replayed, particle, &base).unwrap();
+            let initial_scores = board_state.board.scores;
+
+            let mut action_rng = ChaCha12Rng::seed_from_u64(999);
+            let result = simulate_action_rollout_prebuilt_truncated(
+                &board_state,
+                initial_scores,
+                player_id,
+                0,
+                Some(&mut action_rng),
+                10,
+                false, // backward compat
+                4,
+            )
+            .unwrap();
+
+            // Basic validation — same as original tests
+            assert!(result.steps <= 10);
+            assert!(result.leaf_obs.is_none());
+            for &s in &result.scores {
+                assert!(s >= -100000 && s <= 200000, "score {s} out of range");
+            }
+        }
     }
 }
