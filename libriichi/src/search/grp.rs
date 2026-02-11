@@ -72,7 +72,7 @@ impl GrpEvaluator {
             .with_context(|| format!("failed to load ONNX model from {onnx_path}"))?
             .with_input_fact(
                 0,
-                InferenceFact::dt_shape(f64::datum_type(), tvec![1.into(), TDim::from(&seq_sym), 7.into()]),
+                InferenceFact::dt_shape(f32::datum_type(), tvec![1.into(), TDim::from(&seq_sym), 7.into()]),
             )?
             .into_optimized()
             .context("failed to optimize ONNX model")?
@@ -94,13 +94,13 @@ impl GrpEvaluator {
     ) -> Result<f64> {
         ensure!(player_id < 4, "player_id must be 0-3, got {player_id}");
 
-        // Build input sequence: history entries + leaf entry
+        // Build input sequence: history entries + leaf entry (cast f64 -> f32 for ONNX)
         let seq_len = history.len() + 1;
-        let mut input_data = Vec::with_capacity(seq_len * 7);
+        let mut input_data: Vec<f32> = Vec::with_capacity(seq_len * 7);
         for entry in history {
-            input_data.extend_from_slice(entry);
+            input_data.extend(entry.iter().map(|&v| v as f32));
         }
-        input_data.extend_from_slice(leaf);
+        input_data.extend(leaf.iter().map(|&v| v as f32));
 
         // Create tensor: shape (1, seq_len, 7)
         let input_tensor = tract_ndarray::Array3::from_shape_vec(
@@ -113,11 +113,11 @@ impl GrpEvaluator {
         let result = self.model.run(tvec![input_tensor.into_tvalue()])
             .context("GRP inference failed")?;
 
-        // Extract logits: shape (1, 24)
+        // Extract logits: shape (1, 24), cast f32 -> f64
         let logits_tensor = result[0]
-            .to_array_view::<f64>()
+            .to_array_view::<f32>()
             .context("failed to extract logits")?;
-        let logits: Vec<f64> = logits_tensor.iter().copied().collect();
+        let logits: Vec<f64> = logits_tensor.iter().map(|&v| f64::from(v)).collect();
         ensure!(logits.len() == 24, "expected 24 logits, got {}", logits.len());
 
         // Compute placement probabilities for this player

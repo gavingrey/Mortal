@@ -6,10 +6,12 @@ Usage:
 
 The wrapper avoids PackedSequence by using raw GRU + fc directly,
 accepting a simple (1, seq_len, 7) tensor as input.
+Exports as float32 for broad ONNX runtime compatibility (tract, onnxruntime).
 """
 
 import os
 import sys
+import numpy as np
 import torch
 import torch.nn as nn
 
@@ -70,19 +72,13 @@ def main():
     wrapper = GRPExportWrapper(grp)
     wrapper.eval()
 
-    # Validate at multiple sequence lengths
-    print("Validating wrapper against original model...")
+    # Validate wrapper matches original in f64
+    print("Validating wrapper against original model (f64)...")
     for seq_len in [1, 3, 5, 8]:
         x = torch.randn(1, seq_len, 7, dtype=torch.float64)
-
-        # Original model forward (uses pack_padded_sequence internally)
         with torch.no_grad():
-            orig_out = grp([x.squeeze(0)])  # GRP.forward takes List[Tensor]
-
-        # Wrapper forward
-        with torch.no_grad():
+            orig_out = grp([x.squeeze(0)])
             wrap_out = wrapper(x)
-
         diff = (orig_out - wrap_out).abs().max().item()
         print(f"  seq_len={seq_len}: max_diff={diff:.2e}", end="")
         if diff < 1e-10:
@@ -90,11 +86,30 @@ def main():
         else:
             print(f" WARNING: large difference!")
 
-    # Export to ONNX
-    print(f"\nExporting to {output_path}")
-    dummy_input = torch.randn(1, 3, 7, dtype=torch.float64)
+    # Convert to float32 for ONNX export (tract and onnxruntime support f32 GRU)
+    print("\nConverting model to float32 for export...")
+    wrapper_f32 = wrapper.float()
+
+    # Validate f32 vs f64 precision loss is acceptable
+    print("Validating f32 precision loss...")
+    for seq_len in [1, 3, 5, 8]:
+        x64 = torch.randn(1, seq_len, 7, dtype=torch.float64)
+        x32 = x64.float()
+        with torch.no_grad():
+            out64 = wrapper(x64)
+            out32 = wrapper_f32(x32)
+        diff = (out64.float() - out32).abs().max().item()
+        print(f"  seq_len={seq_len}: f64 vs f32 max_diff={diff:.2e}", end="")
+        if diff < 1e-3:
+            print(" OK")
+        else:
+            print(f" WARNING: large difference!")
+
+    # Export to ONNX as float32
+    print(f"\nExporting to {output_path} (float32)")
+    dummy_input = torch.randn(1, 3, 7, dtype=torch.float32)
     torch.onnx.export(
-        wrapper,
+        wrapper_f32,
         dummy_input,
         output_path,
         input_names=['input'],
@@ -106,18 +121,30 @@ def main():
         opset_version=17,
     )
 
-    # Verify the exported ONNX model structure
-    print("Verifying exported ONNX model...")
+    # Verify with onnx checker
+    print("Verifying exported ONNX model structure...")
     import onnx
-
     model = onnx.load(output_path)
     onnx.checker.check_model(model)
     print(f"  ONNX model validated OK")
     print(f"  Inputs: {[i.name for i in model.graph.input]}")
     print(f"  Outputs: {[o.name for o in model.graph.output]}")
 
-    # Note: onnxruntime does not support float64 GRU, so we skip runtime verification.
-    # The Rust tract runtime handles f64 correctly (configured in grp.rs).
+    # Verify with onnxruntime
+    print("Verifying with onnxruntime...")
+    import onnxruntime as ort
+    session = ort.InferenceSession(output_path)
+    for seq_len in [1, 3, 5, 8]:
+        x = torch.randn(1, seq_len, 7, dtype=torch.float32)
+        with torch.no_grad():
+            ref_out = wrapper_f32(x).numpy()
+        onnx_out = session.run(None, {'input': x.numpy()})[0]
+        diff = np.abs(ref_out - onnx_out).max()
+        print(f"  seq_len={seq_len}: PyTorch vs ONNX max_diff={diff:.2e}", end="")
+        if diff < 1e-5:
+            print(" OK")
+        else:
+            print(f" WARNING: large difference!")
 
     file_size = os.path.getsize(output_path)
     print(f"\nDone! ONNX model saved to {output_path} ({file_size / 1024:.1f} KB)")
