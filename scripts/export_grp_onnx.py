@@ -43,7 +43,14 @@ def main():
     output_path = sys.argv[2]
 
     print(f"Loading GRP model from {model_path}")
-    state_dict = torch.load(model_path, map_location='cpu', weights_only=True)
+    checkpoint = torch.load(model_path, map_location='cpu', weights_only=False)
+
+    # Handle full checkpoint (with 'model', 'optimizer', etc.) or bare state dict
+    if 'model' in checkpoint and isinstance(checkpoint['model'], dict):
+        print("Detected full checkpoint format, extracting 'model' key")
+        state_dict = checkpoint['model']
+    else:
+        state_dict = checkpoint
 
     # Detect hidden_size and num_layers from state dict
     # GRU weight_ih_l0 shape: (3*hidden_size, input_size)
