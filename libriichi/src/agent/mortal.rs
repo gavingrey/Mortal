@@ -7,6 +7,7 @@ use crate::search::grp::{self, GrpEntry, GrpEvaluator};
 use crate::search::{particle, simulator};
 use crate::state::PlayerState;
 use crate::{must_tile, tu8};
+use std::collections::HashMap;
 use std::mem;
 use std::panic;
 use std::sync::Arc;
@@ -103,6 +104,13 @@ impl ErrorMetrics {
     }
 }
 
+/// Per-game GRP history state, tracking kyoku boundary entries.
+#[derive(Clone, Default)]
+struct GrpGameState {
+    history: Vec<GrpEntry>,
+    current_kyoku: Option<(u8, GrpEntry)>,
+}
+
 /// Optional search integration that overrides DQN actions with
 /// particle-based rollout evaluation at critical decision points.
 struct SearchIntegration {
@@ -115,9 +123,9 @@ struct SearchIntegration {
     grp: Option<GrpEvaluator>,
     grp_max_steps: u32,
 
-    // GRP history accumulated across kyoku boundaries
-    grp_history: Vec<GrpEntry>,
-    current_kyoku_grp: Option<(u8, GrpEntry)>,
+    // Per-game GRP history (keyed by game index within the batch).
+    // Each game accumulates its own kyoku boundary entries independently.
+    grp_game_states: HashMap<usize, GrpGameState>,
 
     // Core counts
     search_count: u32,
@@ -332,16 +340,17 @@ impl SearchIntegration {
     /// Update the GRP history accumulator for the current kyoku.
     ///
     /// When we enter a new kyoku (detected by `grand_kyoku` change), pushes
-    /// the previous kyoku's entry to `grp_history` and creates a new one
+    /// the previous kyoku's entry to the game's history and creates a new one
     /// from the current event log's `StartKyoku` event.
-    fn update_grp_history(&mut self, state: &PlayerState, grand_kyoku: u8) {
-        let need_update = match &self.current_kyoku_grp {
+    fn update_grp_history(&mut self, game_index: usize, state: &PlayerState, grand_kyoku: u8) {
+        let gs = self.grp_game_states.entry(game_index).or_default();
+        let need_update = match &gs.current_kyoku {
             None => true,
             Some((gk, _)) => *gk != grand_kyoku,
         };
         if need_update {
-            if let Some((_, prev_entry)) = self.current_kyoku_grp.take() {
-                self.grp_history.push(prev_entry);
+            if let Some((_, prev_entry)) = gs.current_kyoku.take() {
+                gs.history.push(prev_entry);
             }
             // Find the StartKyoku event (first event in per-kyoku history)
             for event in state.event_history().iter().rev() {
@@ -351,7 +360,7 @@ impl SearchIntegration {
                 {
                     let gk = (bakaze.as_u8() - tu8!(E)) * 4 + (kyoku - 1);
                     let entry = grp::make_grp_entry(gk, *honba, *kyotaku, scores);
-                    self.current_kyoku_grp = Some((grand_kyoku, entry));
+                    gs.current_kyoku = Some((grand_kyoku, entry));
                     break;
                 }
             }
@@ -486,6 +495,7 @@ impl SearchIntegration {
     /// better action, `None` to keep DQN choice.
     fn maybe_override_grp(
         &mut self,
+        game_index: usize,
         state: &PlayerState,
         q_values: &[f32; ACTION_SPACE],
         masks: &[bool; ACTION_SPACE],
@@ -503,10 +513,10 @@ impl SearchIntegration {
         self.grp_search_count += 1;
         let max_steps = self.grp_max_steps;
 
-        // Update GRP history accumulator
+        // Update GRP history accumulator for this specific game
         let bakaze_u8 = state.bakaze().as_u8();
         let grand_kyoku = (bakaze_u8 - tu8!(E)) * 4 + state.kyoku();
-        self.update_grp_history(state, grand_kyoku);
+        self.update_grp_history(game_index, state, grand_kyoku);
 
         // Build current state GRP entry for baseline
         let player_id = state.player_id();
@@ -526,7 +536,8 @@ impl SearchIntegration {
         let baseline_eval_start = Instant::now();
         let current_ev = {
             let grp = self.grp.as_ref().unwrap();
-            grp.evaluate_leaf_impl(&self.grp_history, &current_entry, player_id)
+            let gs = self.grp_game_states.entry(game_index).or_default();
+            grp.evaluate_leaf_impl(&gs.history, &current_entry, player_id)
         };
         let current_ev = match current_ev {
             Ok(ev) => ev,
@@ -554,7 +565,8 @@ impl SearchIntegration {
         }
 
         let grp = self.grp.as_ref().unwrap();
-        let history = &self.grp_history;
+        let gs = self.grp_game_states.entry(game_index).or_default();
+        let history = &gs.history;
 
         let per_particle: Vec<Vec<GrpOutcome>> = particles
             .par_iter()
@@ -991,8 +1003,7 @@ impl MortalBatchAgent {
                     search_weight: weight,
                     grp,
                     grp_max_steps,
-                    grp_history: Vec::new(),
-                    current_kyoku_grp: None,
+                    grp_game_states: HashMap::new(),
                     search_count: 0_u32,
                     override_count: 0_u32,
                     grp_eval_count: 0_u64,
@@ -1136,11 +1147,10 @@ impl BatchAgent for MortalBatchAgent {
         self.is_oracle.then_some(self.version)
     }
 
-    fn start_game(&mut self, _index: usize) -> Result<()> {
-        // Clear GRP history so it doesn't leak across games (hanchan).
+    fn start_game(&mut self, index: usize) -> Result<()> {
+        // Clear this game's GRP history so it doesn't leak across hanchan.
         if let Some(si) = &mut self.search {
-            si.grp_history.clear();
-            si.current_kyoku_grp = None;
+            si.grp_game_states.remove(&index);
         }
         Ok(())
     }
@@ -1295,6 +1305,7 @@ impl BatchAgent for MortalBatchAgent {
                 // otherwise fall back to terminal rollout search.
                 let override_action = if search.grp.is_some() {
                     search.maybe_override_grp(
+                        index,
                         state,
                         &self.q_values[action_idx],
                         &self.masks_recv[action_idx],
@@ -1661,8 +1672,7 @@ mod tests {
             search_weight: 0.3,
             grp: None,
             grp_max_steps: 20,
-            grp_history: Vec::new(),
-            current_kyoku_grp: None,
+            grp_game_states: HashMap::new(),
             search_count,
             override_count,
             grp_eval_count: 0,
@@ -1854,22 +1864,32 @@ mod tests {
     #[test]
     fn grp_history_starts_empty() {
         let si = make_test_si(0, 0);
-        assert!(si.grp_history.is_empty());
-        assert!(si.current_kyoku_grp.is_none());
+        assert!(si.grp_game_states.is_empty());
     }
 
     #[test]
-    fn reset_grp_history_clears_game_state() {
+    fn grp_game_states_are_per_game() {
         let mut si = make_test_si(5, 2);
-        si.grp_history = vec![[1.0, 0.0, 0.0, 2.5, 2.5, 2.5, 2.5]];
-        si.current_kyoku_grp = Some((4, [4.0, 1.0, 0.0, 2.5, 2.5, 2.5, 2.5]));
 
-        // Simulate what start_game does
-        si.grp_history.clear();
-        si.current_kyoku_grp = None;
+        // Simulate two different games populating their GRP state
+        let gs0 = si.grp_game_states.entry(0).or_default();
+        gs0.history.push([1.0, 0.0, 0.0, 2.5, 2.5, 2.5, 2.5]);
+        gs0.current_kyoku = Some((4, [4.0, 1.0, 0.0, 2.5, 2.5, 2.5, 2.5]));
 
-        assert!(si.grp_history.is_empty(), "grp_history should be cleared");
-        assert!(si.current_kyoku_grp.is_none(), "current_kyoku_grp should be cleared");
+        let gs1 = si.grp_game_states.entry(1).or_default();
+        gs1.history.push([0.0, 1.0, 0.0, 3.0, 2.0, 2.5, 2.5]);
+
+        // Game 0 and game 1 should have independent histories
+        assert_eq!(si.grp_game_states[&0].history.len(), 1);
+        assert_eq!(si.grp_game_states[&1].history.len(), 1);
+        assert!(si.grp_game_states[&0].current_kyoku.is_some());
+        assert!(si.grp_game_states[&1].current_kyoku.is_none());
+
+        // start_game clears only the specific game
+        si.grp_game_states.remove(&0);
+        assert!(!si.grp_game_states.contains_key(&0));
+        assert_eq!(si.grp_game_states[&1].history.len(), 1);
+
         // Metrics should NOT be cleared (they accumulate across games)
         assert_eq!(si.search_count, 5);
         assert_eq!(si.override_count, 2);
