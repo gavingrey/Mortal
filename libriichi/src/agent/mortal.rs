@@ -67,6 +67,7 @@ struct SkipMetrics {
     particle_gen_error: u32,
     replay_error: u32,
     insufficient_data: u32,
+    small_effect: u32,
 }
 
 /// Tracks error categories during search rollouts.
@@ -118,6 +119,9 @@ struct SearchIntegration {
     config: ParticleConfig,
     max_candidates: usize,
     search_weight: f32,
+    /// Minimum absolute mean difference to override DQN (practical significance).
+    /// On a [0, 6] placement-points scale, 0.1 ≈ 5% of one rank shift.
+    min_effect_size: f64,
 
     // GRP value truncation (optional — when None, uses terminal rollouts)
     grp: Option<GrpEvaluator>,
@@ -145,6 +149,14 @@ struct SearchIntegration {
 
     // Time tracking (per-search for percentiles)
     search_times_us: Vec<u64>,
+
+    // Effect size diagnostics
+    override_effects: Vec<f64>,
+    blocked_effect_sum: f64,
+    blocked_effect_count: u32,
+    /// Sum of (terminated_per_action) across all searches, for avg computation
+    terminated_per_action_sum: u64,
+    terminated_per_action_count: u64,
 
     // Particle utilization
     particles_requested: u32,
@@ -305,6 +317,18 @@ impl SearchIntegration {
 
         let mean_best = search_means[search_best_idx];
         let mean_dqn = search_means[dqn_idx];
+        let effect = mean_best - mean_dqn;
+
+        // Minimum practical effect size: don't override unless the mean
+        // difference is large enough to matter. With placement_pts [6,4,2,0],
+        // 0.1 ≈ 5% of one rank shift — below that, statistical significance
+        // is just noise from the GRP's limited discriminative power.
+        if effect < self.min_effect_size {
+            self.skips.small_effect += 1;
+            self.blocked_effect_sum += effect;
+            self.blocked_effect_count += 1;
+            return None;
+        }
 
         // Bessel-corrected sample variance: (sum_sq - n * mean²) / (n - 1)
         let var_best =
@@ -330,11 +354,12 @@ impl SearchIntegration {
         let threshold = 3.0 * (1.0 - f64::from(self.search_weight));
 
         if t_stat > threshold {
-            log::info!(
-                "GRP override: action {} → {} | current_ev={:.3} | means=[{}] | counts=[{}] | t={:.2} > {:.2}",
+            self.override_effects.push(effect);
+            log::debug!(
+                "GRP override: action {} → {} | effect={:.4} | means=[{}] | counts=[{}] | t={:.2} > {:.2}",
                 dqn_action,
                 search_best_action,
-                0.0, // current_ev not available here; logged at call site
+                effect,
                 search_means.iter().enumerate().map(|(i, m)| format!("a{}={:.3}", actions[i], m)).collect::<Vec<_>>().join(", "),
                 action_counts.iter().enumerate().map(|(i, c)| format!("a{}={}", actions[i], c)).collect::<Vec<_>>().join(", "),
                 t_stat,
@@ -751,6 +776,12 @@ impl SearchIntegration {
             action_counts[ai] += 1;
         }
 
+        // Track avg terminated samples per action
+        for &c in &action_counts {
+            self.terminated_per_action_sum += c as u64;
+            self.terminated_per_action_count += 1;
+        }
+
         // Guard: need at least 2 actions with ≥2 terminated samples for meaningful t-test
         let actions_with_enough = action_counts.iter().filter(|&&c| c >= 2).count();
         if actions_with_enough < 2 {
@@ -873,7 +904,8 @@ impl Drop for SearchIntegration {
             + self.skips.no_particles
             + self.skips.particle_gen_error
             + self.skips.replay_error
-            + self.skips.insufficient_data;
+            + self.skips.insufficient_data
+            + self.skips.small_effect;
         let error_total = self.errors.total();
 
         if self.search_count == 0 && skip_total == 0 {
@@ -904,7 +936,7 @@ impl Drop for SearchIntegration {
             "\n=== Search Metrics ===\n\
              Searches: {} | Overrides: {} ({:.1}%) | Errors: {} ({:.1}%)\n\
              Skips: {} (criticality={}, candidates={}, no_particles={}, \
-             particle_err={}, replay_err={}, insufficient_data={})\n\
+             particle_err={}, replay_err={}, insufficient_data={}, small_effect={})\n\
              Errors: panics={}, rollout_errors={}\n\
              Time: total={}ms, avg={}us, p50={}us, p95={}us, p99={}us\n\
              Particles: requested={}, generated={} ({:.0}% fill), gen_attempts={}",
@@ -928,6 +960,7 @@ impl Drop for SearchIntegration {
             self.skips.particle_gen_error,
             self.skips.replay_error,
             self.skips.insufficient_data,
+            self.skips.small_effect,
             self.errors.panics,
             self.errors.rollout_errors,
             total_time_us / 1000,
@@ -944,6 +977,32 @@ impl Drop for SearchIntegration {
         // Append GRP metrics if any GRP searches were performed
         let msg = if self.grp_search_count > 0 {
             format!("{msg}\n             {}", self.grp_metrics_summary())
+        } else {
+            msg
+        };
+
+        // Effect size diagnostics
+        let msg = if !self.override_effects.is_empty() {
+            let n = self.override_effects.len();
+            let sum: f64 = self.override_effects.iter().sum();
+            let avg = sum / n as f64;
+            let min = self.override_effects.iter().copied().fold(f64::INFINITY, f64::min);
+            let max = self.override_effects.iter().copied().fold(f64::NEG_INFINITY, f64::max);
+            let blocked_avg = if self.blocked_effect_count > 0 {
+                self.blocked_effect_sum / f64::from(self.blocked_effect_count)
+            } else {
+                0.0
+            };
+            let avg_terminated = if self.terminated_per_action_count > 0 {
+                self.terminated_per_action_sum as f64 / self.terminated_per_action_count as f64
+            } else {
+                0.0
+            };
+            format!(
+                "{msg}\n             Effects: override avg={avg:.4} min={min:.4} max={max:.4} (N={n}), \
+                 blocked avg={blocked_avg:.4} (N={}), avg_terminated/action={avg_terminated:.1}",
+                self.blocked_effect_count,
+            )
         } else {
             msg
         };
@@ -1062,6 +1121,7 @@ impl MortalBatchAgent {
                     config: ParticleConfig::new(n_particles),
                     max_candidates: 5,
                     search_weight: weight,
+                    min_effect_size: 0.1,
                     grp,
                     grp_max_steps,
                     grp_game_states: HashMap::new(),
@@ -1076,6 +1136,11 @@ impl MortalBatchAgent {
                     skips: SkipMetrics::default(),
                     errors: ErrorMetrics::default(),
                     search_times_us: Vec::new(),
+                    override_effects: Vec::new(),
+                    blocked_effect_sum: 0.0,
+                    blocked_effect_count: 0_u32,
+                    terminated_per_action_sum: 0_u64,
+                    terminated_per_action_count: 0_u64,
                     particles_requested: 0_u32,
                     particles_generated: 0_u32,
                     particle_gen_attempts: 0_u32,
@@ -1688,6 +1753,7 @@ mod tests {
         assert_eq!(sm.particle_gen_error, 0);
         assert_eq!(sm.replay_error, 0);
         assert_eq!(sm.insufficient_data, 0);
+        assert_eq!(sm.small_effect, 0);
     }
 
     #[test]
@@ -1731,6 +1797,7 @@ mod tests {
             config: ParticleConfig::new(10),
             max_candidates: 5,
             search_weight: 0.3,
+            min_effect_size: 0.1,
             grp: None,
             grp_max_steps: 100,
             grp_game_states: HashMap::new(),
@@ -1745,6 +1812,11 @@ mod tests {
             skips: SkipMetrics::default(),
             errors: ErrorMetrics::default(),
             search_times_us: Vec::new(),
+            override_effects: Vec::new(),
+            blocked_effect_sum: 0.0,
+            blocked_effect_count: 0,
+            terminated_per_action_sum: 0,
+            terminated_per_action_count: 0,
             particles_requested: 0,
             particles_generated: 0,
             particle_gen_attempts: 0,
@@ -1769,6 +1841,7 @@ mod tests {
             particle_gen_error: 1,
             replay_error: 0,
             insufficient_data: 1,
+            small_effect: 3,
         };
         si.search_times_us = vec![1000, 2000, 3000, 5000, 10000];
         si.particles_requested = 500;
@@ -2040,5 +2113,42 @@ mod tests {
     fn grp_default_max_steps_is_100() {
         let si = make_test_si(0, 0);
         assert_eq!(si.grp_max_steps, 100);
+    }
+
+    #[test]
+    fn decide_override_small_effect_blocked() {
+        // Even if statistically significant, tiny effect sizes should be blocked.
+        // Simulates GRP producing near-identical values for all actions.
+        let mut si = make_test_si(0, 0);
+        si.search_weight = 1.0; // threshold = 0, would always override
+        si.min_effect_size = 0.1;
+        let actions = vec![0, 1];
+        let candidates = vec![(0, 1.0), (1, 0.5)];
+        // Action 0: mean=3.010, action 1: mean=3.015 — effect = 0.005 < 0.1
+        let sums = vec![30.10, 30.15];
+        let sum_sq = vec![90.6001, 90.9002]; // tiny variance
+        let counts = vec![10, 10];
+
+        let result = si.decide_override(&actions, &candidates, &sums, &sum_sq, &counts);
+        assert!(result.is_none(), "should not override with effect 0.005 < 0.1");
+        assert_eq!(si.skips.small_effect, 1);
+    }
+
+    #[test]
+    fn decide_override_large_effect_passes() {
+        // Effect size above threshold should proceed to t-test.
+        let mut si = make_test_si(0, 0);
+        si.search_weight = 1.0; // threshold = 0
+        si.min_effect_size = 0.1;
+        let actions = vec![0, 1];
+        let candidates = vec![(0, 1.0), (1, 0.5)];
+        // Action 0: mean=3.0, action 1: mean=3.5 — effect = 0.5 >> 0.1
+        let sums = vec![30.0, 35.0];
+        let sum_sq = vec![90.1, 122.6]; // small variance
+        let counts = vec![10, 10];
+
+        let result = si.decide_override(&actions, &candidates, &sums, &sum_sq, &counts);
+        assert_eq!(result, Some(1), "should override with effect 0.5 > 0.1");
+        assert_eq!(si.skips.small_effect, 0);
     }
 }
