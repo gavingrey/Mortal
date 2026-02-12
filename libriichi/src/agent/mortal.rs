@@ -1003,12 +1003,16 @@ impl SearchIntegration {
             return None;
         }
 
-        // Batch evaluate truncated leaves with value head (parallel via rayon)
+        // Batch evaluate truncated leaves with value head
         if !truncated_obs.is_empty() {
             let eval_start = Instant::now();
-            let obs_batch: Vec<Array2<f32>> = truncated_obs.iter().map(|(_, o)| o.clone()).collect();
+            let obs_refs: Vec<&Array2<f32>> = truncated_obs.iter().map(|(_, o)| o).collect();
             let mortal_value = self.mortal_value.as_ref().unwrap();
-            let values: Vec<f64> = match mortal_value.evaluate_batch(&obs_batch) {
+            let values: Vec<f64> = match obs_refs
+                .iter()
+                .map(|obs| mortal_value.evaluate(obs))
+                .collect::<Result<Vec<f64>, _>>()
+            {
                 Ok(vs) => vs,
                 Err(e) => {
                     log::debug!("value head batch eval error: {e}");

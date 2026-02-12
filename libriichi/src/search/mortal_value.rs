@@ -1,6 +1,5 @@
 use anyhow::{Context, Result};
 use ndarray::Array2;
-use rayon::prelude::*;
 use std::sync::Arc;
 
 use tract_onnx::prelude::*;
@@ -88,16 +87,13 @@ impl MortalValueEvaluator {
         Ok(value)
     }
 
-    /// Evaluate multiple observations in parallel using rayon.
+    /// Evaluate multiple observations by looping over `evaluate`.
     ///
     /// Each observation should be shape `(obs_channels, 34)`.
     /// Returns one scalar value per observation.
-    ///
-    /// The underlying tract `SimplePlan::run` takes `&self` and the model is
-    /// wrapped in `Arc`, so concurrent evaluation across threads is safe.
     pub fn evaluate_batch(&self, observations: &[Array2<f32>]) -> Result<Vec<f64>> {
         observations
-            .par_iter()
+            .iter()
             .map(|obs| self.evaluate(obs))
             .collect()
     }
