@@ -32,7 +32,6 @@ pyo3 = { version = "0.25", features = ["auto-initialize", "multiple-pymethods", 
 indicatif = { version = "0.17", features = ["rayon"] }
 tinyvec = { version = "1", features = ["alloc", "serde", "rustc_1_57"] }
 tract-onnx = "0.21"
-ort = { version = "2.0.0-rc.11", default-features = false, features = ["load-dynamic"], optional = true }
 serde = { version = "1", features = ["derive"] }
 derive_more = { version = "2", features = ["add", "add_assign", "sum"] }
 mimalloc = { version = "0.1", default-features = false, optional = true }
@@ -53,4 +52,3 @@ mimalloc = ["dep:mimalloc"]
 pymod = ["pyo3/extension-module"]
 abi3 = ["pyo3/abi3"]
 sp_reproduce_cpp_ver = []
-ort-value = ["dep:ort"]
