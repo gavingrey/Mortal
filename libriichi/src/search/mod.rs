@@ -1,7 +1,6 @@
 pub mod config;
 pub mod grp;
 pub mod heuristic;
-pub mod mortal_value;
 pub mod particle;
 pub mod simulator;
 
@@ -261,8 +260,6 @@ impl SearchModule {
                         action,
                         action_rng.as_mut(),
                         max_steps,
-                        false,
-                        4,
                     )?;
                     action_results.push((action, result));
                 }
