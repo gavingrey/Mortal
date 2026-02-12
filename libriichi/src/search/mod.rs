@@ -438,7 +438,6 @@ mod test {
     #[test]
     fn test_boardstate_clone_independence() {
         // Clone a BoardState, step the original forward, verify clone is unchanged.
-        use crate::arena::Board;
         use crate::search::config::ParticleConfig;
         use crate::search::particle::generate_particles;
 
