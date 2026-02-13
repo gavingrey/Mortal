@@ -128,7 +128,12 @@ def main():
             ref_out = dqn(phi, mask.to(torch.bool))
             wrap_out = wrapper(obs, mask)
 
-        diff = (ref_out - wrap_out).abs().max().item()
+        # Compare only finite values (masked actions are -inf; -inf - -inf = NaN)
+        finite = torch.isfinite(ref_out) & torch.isfinite(wrap_out)
+        if finite.any():
+            diff = (ref_out[finite] - wrap_out[finite]).abs().max().item()
+        else:
+            diff = 0.0
         print(f"  batch={batch_size}: max_diff={diff:.2e}", end="")
         if diff < 1e-6:
             print(" OK")
@@ -181,12 +186,21 @@ def main():
             'mask': mask.numpy(),
         })[0]
 
-        diff = np.abs(ref_out - onnx_out).max()
-        print(f"  batch={batch_size}: PyTorch vs ONNX max_diff={diff:.2e}", end="")
-        if diff < 1e-5:
+        # Compare only finite values (masked actions are -inf; -inf - -inf = NaN)
+        ref_finite = np.isfinite(ref_out)
+        onnx_finite = np.isfinite(onnx_out)
+        both_finite = ref_finite & onnx_finite
+        if both_finite.any():
+            diff = np.abs(ref_out[both_finite] - onnx_out[both_finite]).max()
+        else:
+            diff = 0.0
+        # Non-finite positions should match (both -inf where masked)
+        inf_match = np.array_equal(ref_finite, onnx_finite)
+        print(f"  batch={batch_size}: PyTorch vs ONNX max_diff={diff:.2e}, inf_match={inf_match}", end="")
+        if diff < 1e-5 and inf_match:
             print(" OK")
         else:
-            print(f" WARNING: large difference!")
+            print(f" WARNING: large difference or inf mismatch!")
 
     file_size = os.path.getsize(args.output_path)
     print(f"\nDone! ONNX model saved to {args.output_path} ({file_size / 1024 / 1024:.1f} MB)")
