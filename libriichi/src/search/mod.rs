@@ -379,6 +379,103 @@ impl SearchModule {
 
         Ok(results)
     }
+
+    /// Collect leaf observation tensors from truncated rollouts.
+    ///
+    /// Runs the same particle generation + truncated rollout logic as
+    /// `evaluate_actions_truncated`, but additionally collects the
+    /// observation tensor and action mask at each leaf state.
+    ///
+    /// Returns a list of `(action_idx, obs_flat, mask_f32, terminated, deltas)`
+    /// tuples that Python can batch-evaluate on GPU.
+    ///
+    /// - `obs_flat`: flattened `(channels * 34)` f32 observation tensor
+    /// - `mask_f32`: 46-element f32 mask (1.0 = valid, 0.0 = invalid)
+    /// - `terminated`: whether the rollout ended naturally
+    /// - `deltas`: score deltas [i32; 4] (absolute seats)
+    pub fn collect_leaf_obs(
+        &mut self,
+        state: &PlayerState,
+        actions: Vec<usize>,
+        max_steps: u32,
+        obs_version: u32,
+    ) -> PyResult<Vec<(usize, Vec<f32>, Vec<f32>, bool, [i32; 4])>> {
+        let start = Instant::now();
+
+        let (particles, attempts) =
+            particle::generate_particles(state, &self.config, &mut self.rng)
+                .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))?;
+        self.last_gen_attempts = attempts;
+        self.last_gen_accepted = particles.len();
+
+        if particles.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let replayed = simulator::replay_player_states(state)
+            .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))?;
+
+        let base = simulator::derive_midgame_context_base(state.event_history());
+
+        let use_smart = self.use_smart_policy;
+        let player_id = state.player_id();
+        let seeds: Vec<u64> = (0..particles.len())
+            .map(|_| self.rng.next_u64())
+            .collect();
+
+        let per_particle: Result<Vec<Vec<(usize, TruncatedResult)>>, anyhow::Error> = particles
+            .into_par_iter()
+            .enumerate()
+            .map(|(i, particle)| {
+                let board_state = simulator::build_midgame_board_state_with_base(
+                    state, &replayed, &particle, &base,
+                )?;
+                let initial_scores = board_state.board.scores;
+
+                let mut particle_rng = ChaCha12Rng::seed_from_u64(seeds[i]);
+
+                let mut action_results = Vec::with_capacity(actions.len());
+                for &action in &actions {
+                    let action_seed = particle_rng.next_u64();
+                    let mut action_rng = if use_smart {
+                        Some(ChaCha12Rng::seed_from_u64(action_seed))
+                    } else {
+                        None
+                    };
+
+                    let result = simulator::simulate_action_rollout_prebuilt_truncated_with_obs(
+                        &board_state,
+                        initial_scores,
+                        player_id,
+                        action,
+                        action_rng.as_mut(),
+                        max_steps,
+                        obs_version,
+                    )?;
+                    action_results.push((action, result));
+                }
+
+                Ok(action_results)
+            })
+            .collect();
+
+        self.last_evaluate_time_ms = start.elapsed().as_secs_f64() * 1000.0;
+
+        let per_particle = per_particle
+            .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))?;
+
+        // Flatten into Python-friendly tuples
+        let mut entries = Vec::new();
+        for particle_results in per_particle {
+            for (action, result) in particle_results {
+                if let (Some(obs), Some(mask)) = (result.leaf_obs, result.leaf_mask) {
+                    entries.push((action, obs, mask, result.terminated, result.deltas));
+                }
+            }
+        }
+
+        Ok(entries)
+    }
 }
 
 #[cfg(test)]
@@ -887,6 +984,132 @@ mod test {
                 assert!(!r.terminated, "max_steps=0 should not be terminated");
                 assert_eq!(r.deltas, [0, 0, 0, 0], "max_steps=0 should have zero deltas");
             }
+        }
+    }
+
+    #[test]
+    fn test_collect_leaf_obs_basic() {
+        // Verify collect_leaf_obs returns entries with properly shaped obs/mask.
+        let state = setup_basic_game();
+        let mut sm = SearchModule::with_seed(5, 42);
+
+        let entries = sm
+            .collect_leaf_obs(&state, vec![0, 8], 100, 4)
+            .unwrap();
+
+        // Should have some entries (5 particles × 2 actions = up to 10)
+        assert!(!entries.is_empty(), "should collect at least some leaf obs");
+
+        // Verify obs shape: v4 has 1012 channels × 34 = 34408 elements
+        let expected_obs_len = 1012 * 34;
+        let expected_mask_len = 46;
+
+        for (action, obs, mask, _terminated, deltas) in &entries {
+            assert!(
+                *action == 0 || *action == 8,
+                "action should be 0 or 8, got {action}"
+            );
+            assert_eq!(
+                obs.len(),
+                expected_obs_len,
+                "obs should have {expected_obs_len} elements, got {}",
+                obs.len()
+            );
+            assert_eq!(
+                mask.len(),
+                expected_mask_len,
+                "mask should have {expected_mask_len} elements, got {}",
+                mask.len()
+            );
+            // Mask values should be 0.0 or 1.0
+            for &m in mask {
+                assert!(
+                    m == 0.0 || m == 1.0,
+                    "mask values should be 0.0 or 1.0, got {m}"
+                );
+            }
+            // Deltas should be reasonable
+            for &d in deltas {
+                assert!(
+                    d.abs() <= 200_000,
+                    "delta {d} out of reasonable range"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn test_collect_leaf_obs_v3_shape() {
+        // Verify obs shape for v3 (934 channels)
+        let state = setup_basic_game();
+        let mut sm = SearchModule::with_seed(3, 123);
+
+        let entries = sm
+            .collect_leaf_obs(&state, vec![0], 100, 3)
+            .unwrap();
+
+        let expected_obs_len = 934 * 34;
+        for (_, obs, _, _, _) in &entries {
+            assert_eq!(
+                obs.len(),
+                expected_obs_len,
+                "v3 obs should have {expected_obs_len} elements, got {}",
+                obs.len()
+            );
+        }
+    }
+
+    #[test]
+    fn test_collect_leaf_obs_determinism() {
+        // Same seed → same results
+        let state = setup_basic_game();
+
+        let mut sm1 = SearchModule::with_seed(5, 42);
+        let entries1 = sm1
+            .collect_leaf_obs(&state, vec![0, 8], 50, 4)
+            .unwrap();
+
+        let mut sm2 = SearchModule::with_seed(5, 42);
+        let entries2 = sm2
+            .collect_leaf_obs(&state, vec![0, 8], 50, 4)
+            .unwrap();
+
+        assert_eq!(entries1.len(), entries2.len(), "same seed should give same count");
+        for ((a1, obs1, mask1, t1, d1), (a2, obs2, mask2, t2, d2)) in
+            entries1.iter().zip(entries2.iter())
+        {
+            assert_eq!(a1, a2, "actions should match");
+            assert_eq!(obs1, obs2, "obs should match");
+            assert_eq!(mask1, mask2, "masks should match");
+            assert_eq!(t1, t2, "terminated should match");
+            assert_eq!(d1, d2, "deltas should match");
+        }
+    }
+
+    #[test]
+    fn test_collect_leaf_obs_empty_particles() {
+        // No particles → empty result (no error)
+        let state = setup_basic_game();
+        let mut sm = SearchModule::with_seed(0, 42); // 0 particles
+        let entries = sm
+            .collect_leaf_obs(&state, vec![0], 100, 4)
+            .unwrap();
+        assert!(entries.is_empty(), "0 particles should give empty results");
+    }
+
+    #[test]
+    fn test_collect_leaf_obs_max_steps_zero() {
+        // max_steps=0: truncation at step 0 should still collect obs
+        let state = setup_basic_game();
+        let mut sm = SearchModule::with_seed(3, 42);
+        let entries = sm
+            .collect_leaf_obs(&state, vec![0], 0, 4)
+            .unwrap();
+
+        // All should be non-terminated (truncated at step 0)
+        for (_, _, _, terminated, deltas) in &entries {
+            assert!(!terminated, "max_steps=0 should not terminate");
+            assert_eq!(*deltas, [0, 0, 0, 0], "max_steps=0 should have zero deltas");
         }
     }
 }

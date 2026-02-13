@@ -105,6 +105,16 @@ pub struct TruncatedResult {
     /// Current kyotaku at leaf.
     #[pyo3(get)]
     pub kyotaku: u8,
+
+    /// Flattened observation tensor at the leaf state (channels * 34).
+    /// Only populated when `collect_obs=true` is passed to the rollout.
+    #[pyo3(get)]
+    pub leaf_obs: Option<Vec<f32>>,
+
+    /// Action mask at the leaf state (46 elements, as f32 0.0/1.0).
+    /// Only populated when `collect_obs=true` is passed to the rollout.
+    #[pyo3(get)]
+    pub leaf_mask: Option<Vec<f32>>,
 }
 
 #[pymethods]
@@ -122,7 +132,8 @@ impl TruncatedResult {
     fn __repr__(&self) -> String {
         format!(
             "TruncatedResult(scores={:?}, deltas={:?}, steps={}, terminated={}, \
-             hora={}, abort={}, renchan={}, kyoku={}, honba={}, kyotaku={})",
+             hora={}, abort={}, renchan={}, kyoku={}, honba={}, kyotaku={}, \
+             has_obs={})",
             self.scores,
             self.deltas,
             self.steps,
@@ -133,6 +144,7 @@ impl TruncatedResult {
             self.kyoku,
             self.honba,
             self.kyotaku,
+            self.leaf_obs.is_some(),
         )
     }
 }
@@ -1178,10 +1190,15 @@ fn run_rollout_truncated(
     inject_action: Option<usize>,
     mut smart_rng: Option<&mut ChaCha12Rng>,
     max_steps: u32,
+    collect_obs: bool,
+    obs_version: u32,
 ) -> Result<TruncatedResult> {
     let mut reactions: [EventExt; 4] = Default::default();
     let mut action_injected = inject_action.is_none();
     let mut steps = 0_u32;
+    // The player whose perspective we encode obs from (always the injected
+    // player, or player 0 for no-injection rollouts).
+    let obs_player = inject_player.unwrap_or(0) as usize;
 
     loop {
         match board_state.poll(reactions)? {
@@ -1200,6 +1217,19 @@ fn run_rollout_truncated(
                         scores[2] - initial_scores[2],
                         scores[3] - initial_scores[3],
                     ];
+
+                    // Collect leaf obs from the searching player's perspective
+                    let (leaf_obs, leaf_mask) = if collect_obs {
+                        let ctx = board_state.agent_context();
+                        let ps = &ctx.player_states[obs_player];
+                        let (obs_2d, mask_1d) = ps.encode_obs(obs_version, false);
+                        let obs_flat: Vec<f32> = obs_2d.into_raw_vec_and_offset().0;
+                        let mask_f32: Vec<f32> = mask_1d.iter().map(|&b| if b { 1.0 } else { 0.0 }).collect();
+                        (Some(obs_flat), Some(mask_f32))
+                    } else {
+                        (None, None)
+                    };
+
                     // Return max_steps as step count (not the internal counter
                     // which includes the init poll). This keeps the external
                     // semantics: steps = "number of reaction sets consumed".
@@ -1214,6 +1244,8 @@ fn run_rollout_truncated(
                         kyoku: board_state.board.kyoku,
                         honba: board_state.board.honba,
                         kyotaku: board_state.board.kyotaku,
+                        leaf_obs,
+                        leaf_mask,
                     });
                 }
 
@@ -1263,6 +1295,20 @@ fn run_rollout_truncated(
                 }
             }
             Poll::End => {
+                // Collect leaf obs BEFORE calling end() since end() may
+                // invalidate state. For terminated rollouts the position is
+                // terminal so the obs is the final game state.
+                let (leaf_obs, leaf_mask) = if collect_obs {
+                    let ctx = board_state.agent_context();
+                    let ps = &ctx.player_states[obs_player];
+                    let (obs_2d, mask_1d) = ps.encode_obs(obs_version, false);
+                    let obs_flat: Vec<f32> = obs_2d.into_raw_vec_and_offset().0;
+                    let mask_f32: Vec<f32> = mask_1d.iter().map(|&b| if b { 1.0 } else { 0.0 }).collect();
+                    (Some(obs_flat), Some(mask_f32))
+                } else {
+                    (None, None)
+                };
+
                 let result = board_state.end();
                 let deltas = [
                     result.scores[0] - initial_scores[0],
@@ -1281,6 +1327,8 @@ fn run_rollout_truncated(
                     kyoku: result.kyoku,
                     honba: board_state.board.honba,
                     kyotaku: result.kyotaku_left,
+                    leaf_obs,
+                    leaf_mask,
                 });
             }
         }
@@ -1307,6 +1355,34 @@ pub fn simulate_action_rollout_prebuilt_truncated(
         Some(action),
         smart_rng,
         max_steps,
+        false,
+        4,
+    )
+}
+
+/// Simulate a truncated action rollout on a pre-built BoardState,
+/// collecting leaf observation tensors for DQN evaluation.
+///
+/// Same as `simulate_action_rollout_prebuilt_truncated` but also encodes
+/// the leaf PlayerState observation for the searching player.
+pub fn simulate_action_rollout_prebuilt_truncated_with_obs(
+    board_state: &BoardState,
+    initial_scores: [i32; 4],
+    player_id: u8,
+    action: usize,
+    smart_rng: Option<&mut ChaCha12Rng>,
+    max_steps: u32,
+    obs_version: u32,
+) -> Result<TruncatedResult> {
+    run_rollout_truncated(
+        board_state.clone(),
+        initial_scores,
+        Some(player_id),
+        Some(action),
+        smart_rng,
+        max_steps,
+        true,
+        obs_version,
     )
 }
 
@@ -5942,6 +6018,8 @@ mod test {
                 None,
                 Some(&mut thread_rng),
                 5,
+                false,
+                4,
             )
             .unwrap();
 
@@ -5988,6 +6066,8 @@ mod test {
                 None,
                 Some(&mut rng2),
                 10000,
+                false,
+                4,
             )
             .unwrap();
 
@@ -6058,6 +6138,8 @@ mod test {
                 None,
                 Some(&mut thread_rng),
                 5,
+                false,
+                4,
             )
             .unwrap();
 
@@ -6094,6 +6176,8 @@ mod test {
                 None,
                 Some(&mut thread_rng),
                 0,
+                false,
+                4,
             )
             .unwrap();
 
@@ -6128,6 +6212,8 @@ mod test {
                 None,
                 Some(&mut thread_rng),
                 1,
+                false,
+                4,
             )
             .unwrap();
 
@@ -6168,6 +6254,8 @@ mod test {
                 None,
                 Some(&mut thread_rng),
                 20,
+                false,
+                4,
             )
             .unwrap();
 
@@ -6266,6 +6354,8 @@ mod test {
                 None,
                 Some(&mut thread_rng),
                 100_000,
+                false,
+                4,
             )
             .unwrap();
 
@@ -6284,5 +6374,137 @@ mod test {
             all_terminated,
             "with 100k max_steps, all rollouts should terminate naturally"
         );
+    }
+
+    #[test]
+    fn truncated_with_obs_collection() {
+        // Verify that obs collection produces valid tensors at the leaf.
+        let state = setup_basic_game();
+        let config = ParticleConfig::new(3);
+        let mut rng = ChaCha12Rng::seed_from_u64(42);
+
+        let (particles, _) = generate_particles(&state, &config, &mut rng).unwrap();
+        let replayed = replay_player_states(&state).unwrap();
+        let base = derive_midgame_context_base(state.event_history());
+        let player_id = state.player_id();
+
+        for particle in &particles {
+            let board_state =
+                build_midgame_board_state_with_base(&state, &replayed, particle, &base).unwrap();
+            let initial_scores = board_state.board.scores;
+
+            let mut action_rng = ChaCha12Rng::seed_from_u64(999);
+            let result = simulate_action_rollout_prebuilt_truncated_with_obs(
+                &board_state,
+                initial_scores,
+                player_id,
+                0, // discard 1m
+                Some(&mut action_rng),
+                50,
+                4, // v4 obs
+            )
+            .unwrap();
+
+            // Obs should be present
+            assert!(result.leaf_obs.is_some(), "leaf_obs should be Some");
+            assert!(result.leaf_mask.is_some(), "leaf_mask should be Some");
+
+            let obs = result.leaf_obs.unwrap();
+            let mask = result.leaf_mask.unwrap();
+
+            // v4: 1012 channels × 34 = 34408 elements
+            assert_eq!(obs.len(), 1012 * 34, "obs should have 1012*34 elements");
+            assert_eq!(mask.len(), 46, "mask should have 46 elements");
+
+            // Mask values should be 0.0 or 1.0
+            for &m in &mask {
+                assert!(m == 0.0 || m == 1.0, "mask value should be 0 or 1, got {m}");
+            }
+        }
+    }
+
+    #[test]
+    fn truncated_without_obs_collection() {
+        // Verify that normal truncated rollout has None obs.
+        let state = setup_basic_game();
+        let config = ParticleConfig::new(3);
+        let mut rng = ChaCha12Rng::seed_from_u64(42);
+
+        let (particles, _) = generate_particles(&state, &config, &mut rng).unwrap();
+        let replayed = replay_player_states(&state).unwrap();
+        let base = derive_midgame_context_base(state.event_history());
+        let player_id = state.player_id();
+
+        for particle in &particles {
+            let board_state =
+                build_midgame_board_state_with_base(&state, &replayed, particle, &base).unwrap();
+            let initial_scores = board_state.board.scores;
+
+            let mut action_rng = ChaCha12Rng::seed_from_u64(999);
+            let result = simulate_action_rollout_prebuilt_truncated(
+                &board_state,
+                initial_scores,
+                player_id,
+                0,
+                Some(&mut action_rng),
+                50,
+            )
+            .unwrap();
+
+            // Obs should NOT be present when collect_obs=false
+            assert!(result.leaf_obs.is_none(), "leaf_obs should be None");
+            assert!(result.leaf_mask.is_none(), "leaf_mask should be None");
+        }
+    }
+
+    #[test]
+    fn truncated_obs_same_result_as_without() {
+        // Obs collection should not change rollout outcomes.
+        let state = setup_basic_game();
+        let config = ParticleConfig::new(5);
+        let mut rng = ChaCha12Rng::seed_from_u64(42);
+
+        let (particles, _) = generate_particles(&state, &config, &mut rng).unwrap();
+        let replayed = replay_player_states(&state).unwrap();
+        let base = derive_midgame_context_base(state.event_history());
+        let player_id = state.player_id();
+
+        for particle in &particles {
+            let board_state =
+                build_midgame_board_state_with_base(&state, &replayed, particle, &base).unwrap();
+            let initial_scores = board_state.board.scores;
+
+            // Without obs
+            let mut rng1 = ChaCha12Rng::seed_from_u64(777);
+            let r_no_obs = simulate_action_rollout_prebuilt_truncated(
+                &board_state,
+                initial_scores,
+                player_id,
+                0,
+                Some(&mut rng1),
+                50,
+            )
+            .unwrap();
+
+            // With obs
+            let mut rng2 = ChaCha12Rng::seed_from_u64(777);
+            let r_with_obs = simulate_action_rollout_prebuilt_truncated_with_obs(
+                &board_state,
+                initial_scores,
+                player_id,
+                0,
+                Some(&mut rng2),
+                50,
+                4,
+            )
+            .unwrap();
+
+            // Core rollout results should be identical
+            assert_eq!(r_no_obs.scores, r_with_obs.scores, "scores should match");
+            assert_eq!(r_no_obs.deltas, r_with_obs.deltas, "deltas should match");
+            assert_eq!(r_no_obs.steps, r_with_obs.steps, "steps should match");
+            assert_eq!(r_no_obs.terminated, r_with_obs.terminated, "terminated should match");
+            assert_eq!(r_no_obs.kyoku, r_with_obs.kyoku, "kyoku should match");
+        }
     }
 }
