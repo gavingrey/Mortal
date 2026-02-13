@@ -74,21 +74,28 @@ def main():
     print(f"\nLoading model from {args.model_path}")
     checkpoint = torch.load(args.model_path, map_location='cpu', weights_only=True)
 
-    if 'model' in checkpoint and isinstance(checkpoint['model'], dict):
-        print("Detected full checkpoint format, extracting 'model' key")
+    # Training checkpoints use 'mortal' (Brain) and 'current_dqn' (DQN) keys.
+    # Exported model dicts may use 'brain.' and 'dqn.' prefixed keys under 'model'.
+    if 'mortal' in checkpoint and 'current_dqn' in checkpoint:
+        print("Detected training checkpoint format ('mortal' + 'current_dqn' keys)")
+        brain_sd = checkpoint['mortal']
+        dqn_sd = checkpoint['current_dqn']
+    elif 'model' in checkpoint and isinstance(checkpoint['model'], dict):
+        print("Detected exported model format ('model' key with brain./dqn. prefixes)")
         state_dict = checkpoint['model']
+        brain_sd = {k.removeprefix('brain.'): v for k, v in state_dict.items() if k.startswith('brain.')}
+        dqn_sd = {k.removeprefix('dqn.'): v for k, v in state_dict.items() if k.startswith('dqn.')}
+        if not brain_sd or not dqn_sd:
+            raise ValueError(
+                f"'model' key found but missing 'brain.' or 'dqn.' prefixes. "
+                f"Found {len(brain_sd)} brain keys and {len(dqn_sd)} dqn keys. "
+                f"Sample keys: {list(state_dict.keys())[:5]}"
+            )
     else:
-        state_dict = checkpoint
-
-    # Separate brain and dqn state dicts
-    brain_sd = {k.removeprefix('brain.'): v for k, v in state_dict.items() if k.startswith('brain.')}
-    dqn_sd = {k.removeprefix('dqn.'): v for k, v in state_dict.items() if k.startswith('dqn.')}
-
-    if not brain_sd or not dqn_sd:
         raise ValueError(
-            f"State dict must contain 'brain.' and 'dqn.' prefixes. "
-            f"Found {len(brain_sd)} brain keys and {len(dqn_sd)} dqn keys. "
-            f"Sample keys: {list(state_dict.keys())[:5]}"
+            f"Unrecognized checkpoint format. "
+            f"Expected 'mortal'+'current_dqn' or 'model' keys. "
+            f"Found keys: {list(checkpoint.keys())[:10]}"
         )
 
     print(f"Brain keys: {len(brain_sd)}, DQN keys: {len(dqn_sd)}")
