@@ -1,3 +1,6 @@
+# DEPRECATED: Search configuration is now handled in Rust-side
+# SearchIntegration (libriichi/src/agent/mortal.rs). Configure via
+# MortalEngine parameters (search_particles, search_weight, etc.).
 from dataclasses import dataclass, field
 from typing import Optional, Tuple
 

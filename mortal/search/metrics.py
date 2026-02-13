@@ -1,3 +1,5 @@
+# DEPRECATED: Search metrics are now tracked in Rust-side SearchIntegration
+# and printed via its Drop impl (libriichi/src/agent/mortal.rs).
 """Search metrics collection for monitoring and analysis."""
 
 import numpy as np

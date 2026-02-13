@@ -28,6 +28,7 @@ class MortalEngine:
         search_grp_model = None,
         search_max_steps = 100,
         search_placement_pts = None,
+        search_policy_model = None,
     ):
         self.engine_type = 'mortal'
         self.device = device or torch.device('cpu')
@@ -54,6 +55,7 @@ class MortalEngine:
         self.search_grp_model = search_grp_model
         self.search_max_steps = search_max_steps
         self.search_placement_pts = search_placement_pts or [6.0, 4.0, 2.0, 0.0]
+        self.search_policy_model = search_policy_model
 
     def react_batch(self, obs, masks, invisible_obs):
         try:

@@ -4,6 +4,7 @@ use crate::consts::ACTION_SPACE;
 use crate::mjai::{Event, EventExt, Metadata};
 use crate::search::config::ParticleConfig;
 use crate::search::grp::{self, GrpEntry, GrpEvaluator};
+use crate::search::policy::PolicyEvaluator;
 use crate::search::{particle, simulator};
 use crate::state::PlayerState;
 use crate::{must_tile, tu8};
@@ -123,6 +124,11 @@ struct SearchIntegration {
     /// On a [0, 6] placement-points scale, 0.1 ≈ 5% of one rank shift.
     min_effect_size: f64,
 
+    // Policy evaluator (optional — when Some, runs obs encoding + ONNX inference
+    // in Rust, bypassing the Python engine for Q-value computation)
+    policy: Option<PolicyEvaluator>,
+    policy_version: u32,
+
     // GRP value truncation (optional — when None, uses terminal rollouts)
     grp: Option<GrpEvaluator>,
     grp_max_steps: u32,
@@ -185,6 +191,48 @@ struct SearchContext {
 }
 
 impl SearchIntegration {
+    /// Compute Q-values and mask using the Rust-side policy evaluator.
+    ///
+    /// Returns `Some((q_values, mask))` if a policy model is loaded,
+    /// `None` otherwise (caller should use Python-provided values).
+    fn compute_q_values(
+        &self,
+        state: &PlayerState,
+    ) -> Option<([f32; ACTION_SPACE], [bool; ACTION_SPACE])> {
+        let policy = self.policy.as_ref()?;
+        let (obs_2d, mask_1d) = state.encode_obs(self.policy_version, false);
+
+        // Flatten obs from (channels, 34) to a flat Vec<f32>
+        let obs_flat: Vec<f32> = match obs_2d.as_slice() {
+            Some(slice) => slice.to_vec(),
+            None => {
+                log::warn!("obs array is not contiguous, cannot evaluate policy");
+                return None;
+            }
+        };
+
+        // Convert ndarray mask to fixed array
+        if mask_1d.len() != ACTION_SPACE {
+            log::warn!(
+                "mask length mismatch: expected {ACTION_SPACE}, got {}",
+                mask_1d.len()
+            );
+            return None;
+        }
+        let mut mask = [false; ACTION_SPACE];
+        for (dest, &val) in mask.iter_mut().zip(mask_1d.iter()) {
+            *dest = val;
+        }
+
+        match policy.evaluate_impl(&obs_flat, &mask) {
+            Ok(q_values) => Some((q_values, mask)),
+            Err(e) => {
+                log::warn!("policy evaluate error: {e}");
+                None
+            }
+        }
+    }
+
     /// Common preamble shared by `maybe_override` and `maybe_override_grp`.
     ///
     /// Performs criticality check, candidate selection, particle generation,
@@ -1086,7 +1134,13 @@ impl MortalBatchAgent {
                     .and_then(|v| v.extract())
                     .ok();
 
-                Some((n_particles, seed, weight, grp_model_path, grp_max_steps, grp_placement_pts))
+                // Policy model path (optional — enables Rust-side obs encoding + ONNX inference)
+                let policy_model_path: Option<String> = obj
+                    .getattr("search_policy_model")
+                    .and_then(|v| v.extract())
+                    .ok();
+
+                Some((n_particles, seed, weight, grp_model_path, grp_max_steps, grp_placement_pts, policy_model_path))
             } else {
                 None
             };
@@ -1102,7 +1156,7 @@ impl MortalBatchAgent {
         })?;
 
         let search = search_cfg
-            .map(|(n_particles, seed, weight, grp_model_path, grp_max_steps, grp_placement_pts)| -> anyhow::Result<SearchIntegration> {
+            .map(|(n_particles, seed, weight, grp_model_path, grp_max_steps, grp_placement_pts, policy_model_path)| -> anyhow::Result<SearchIntegration> {
                 let rng = match seed {
                     Some(s) => ChaCha12Rng::seed_from_u64(s),
                     None => ChaCha12Rng::from_os_rng(),
@@ -1116,12 +1170,21 @@ impl MortalBatchAgent {
                 }).transpose()
                 .context("failed to load GRP ONNX model")?;
 
+                let obs_channels = crate::consts::obs_shape(version).0;
+                let policy = policy_model_path.map(|path| {
+                    log::info!("Loading policy model from {path} (obs_channels={obs_channels})");
+                    PolicyEvaluator::load_impl(&path, obs_channels)
+                }).transpose()
+                .context("failed to load policy ONNX model")?;
+
                 Ok(SearchIntegration {
                     rng,
                     config: ParticleConfig::new(n_particles),
                     max_candidates: 5,
                     search_weight: weight,
                     min_effect_size: 0.1,
+                    policy,
+                    policy_version: version,
                     grp,
                     grp_max_steps,
                     grp_game_states: HashMap::new(),
@@ -1427,21 +1490,32 @@ impl BatchAgent for MortalBatchAgent {
         // riichi (two-step action), so don't risk suppressing it.
         let action = if action != 37 {
             if let Some(ref mut search) = self.search {
+                // When a Rust policy model is loaded, use its Q-values and mask
+                // for search decisions (avoids dependency on Python engine values).
+                // Falls back to Python-provided values when policy is None.
+                let (q_values_ref, masks_ref) = if let Some((policy_q, policy_mask)) =
+                    search.compute_q_values(state)
+                {
+                    (policy_q, policy_mask)
+                } else {
+                    (self.q_values[action_idx], self.masks_recv[action_idx])
+                };
+
                 // Use GRP-based search when a GRP model is loaded,
                 // otherwise fall back to terminal rollout search.
                 let override_action = if search.grp.is_some() {
                     search.maybe_override_grp(
                         index,
                         state,
-                        &self.q_values[action_idx],
-                        &self.masks_recv[action_idx],
+                        &q_values_ref,
+                        &masks_ref,
                         actor,
                     )
                 } else {
                     search.maybe_override(
                         state,
-                        &self.q_values[action_idx],
-                        &self.masks_recv[action_idx],
+                        &q_values_ref,
+                        &masks_ref,
                         actor,
                     )
                 };
@@ -1798,6 +1872,8 @@ mod tests {
             max_candidates: 5,
             search_weight: 0.3,
             min_effect_size: 0.1,
+            policy: None,
+            policy_version: 4,
             grp: None,
             grp_max_steps: 100,
             grp_game_states: HashMap::new(),

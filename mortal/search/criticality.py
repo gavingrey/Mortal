@@ -1,3 +1,5 @@
+# DEPRECATED: Criticality computation is now handled in Rust-side
+# SearchIntegration::is_critical() (libriichi/src/agent/mortal.rs).
 import numpy as np
 
 # Mortal action space layout (from consts.rs):

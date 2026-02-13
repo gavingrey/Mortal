@@ -2,6 +2,7 @@ pub mod config;
 pub mod grp;
 pub mod heuristic;
 pub mod particle;
+pub mod policy;
 pub mod simulator;
 
 use crate::py_helper::add_submodule;
@@ -902,5 +903,6 @@ pub(crate) fn register_module(
     m.add_class::<RolloutResult>()?;
     m.add_class::<TruncatedResult>()?;
     m.add_class::<GrpEvaluator>()?;
+    m.add_class::<policy::PolicyEvaluator>()?;
     add_submodule(py, prefix, super_mod, &m)
 }

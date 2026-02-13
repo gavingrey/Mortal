@@ -1,3 +1,6 @@
+# DEPRECATED: This Python search engine is superseded by the Rust-side
+# PolicyEvaluator + SearchIntegration pipeline (libriichi/src/search/policy.rs,
+# libriichi/src/agent/mortal.rs). Use search_policy_model in MortalEngine instead.
 import time
 import logging
 import numpy as np
