@@ -71,6 +71,17 @@ struct SkipMetrics {
     small_effect: u32,
 }
 
+/// Per-search diagnostic record for Step 4.0 signal quality analysis.
+#[allow(dead_code)]
+struct DiagnosticRecord {
+    dqn_action: usize,
+    search_best_action: usize,
+    effect: f64,           // mean_best - mean_dqn (0 when agree, NAN when insufficient data)
+    action_means: Vec<f64>, // per-candidate mean values
+    action_counts: Vec<usize>,
+    agreed: bool,
+}
+
 /// Tracks error categories during search rollouts.
 #[derive(Default)]
 struct ErrorMetrics {
@@ -168,6 +179,9 @@ struct SearchIntegration {
     particles_requested: u32,
     particles_generated: u32,
     particle_gen_attempts: u32,
+
+    /// Diagnostic mode: collect all per-search records (Step 4.0)
+    diagnostic_records: Vec<DiagnosticRecord>,
 }
 
 /// Extract a human-readable message from a caught panic payload.
@@ -348,6 +362,14 @@ impl SearchIntegration {
 
         // If search agrees with DQN, no override needed
         if search_best_action == dqn_action {
+            self.diagnostic_records.push(DiagnosticRecord {
+                dqn_action,
+                search_best_action,
+                effect: 0.0,
+                action_means: search_means.clone(),
+                action_counts: action_counts.to_vec(),
+                agreed: true,
+            });
             return None;
         }
 
@@ -360,12 +382,30 @@ impl SearchIntegration {
         // Need at least 2 samples for variance estimation
         if n_best < 2 || n_dqn < 2 {
             self.skips.insufficient_data += 1;
+            self.diagnostic_records.push(DiagnosticRecord {
+                dqn_action,
+                search_best_action,
+                effect: f64::NAN,
+                action_means: search_means.clone(),
+                action_counts: action_counts.to_vec(),
+                agreed: false,
+            });
             return None;
         }
 
         let mean_best = search_means[search_best_idx];
         let mean_dqn = search_means[dqn_idx];
         let effect = mean_best - mean_dqn;
+
+        // Record diagnostic for all disagreements with computable effect
+        self.diagnostic_records.push(DiagnosticRecord {
+            dqn_action,
+            search_best_action,
+            effect,
+            action_means: search_means.clone(),
+            action_counts: action_counts.to_vec(),
+            agreed: false,
+        });
 
         // Minimum practical effect size: don't override unless the mean
         // difference is large enough to matter. With placement_pts [6,4,2,0],
@@ -1055,6 +1095,68 @@ impl Drop for SearchIntegration {
             msg
         };
 
+        // Step 4.0 Diagnostic summary
+        let msg = if !self.diagnostic_records.is_empty() {
+            let total = self.diagnostic_records.len();
+            let agreed = self.diagnostic_records.iter().filter(|r| r.agreed).count();
+            let disagreed = total - agreed;
+            let disagree_pct = disagreed as f64 / total as f64 * 100.0;
+
+            // Effect size histogram (only disagreements with finite effect)
+            let effects: Vec<f64> = self.diagnostic_records.iter()
+                .filter(|r| !r.agreed && r.effect.is_finite())
+                .map(|r| r.effect)
+                .collect();
+
+            let mut buckets = [0_u32; 6]; // <0, 0-0.01, 0.01-0.05, 0.05-0.1, 0.1-0.5, >0.5
+            for &e in &effects {
+                match e {
+                    e if e < 0.0 => buckets[0] += 1,
+                    e if e < 0.01 => buckets[1] += 1,
+                    e if e < 0.05 => buckets[2] += 1,
+                    e if e < 0.1 => buckets[3] += 1,
+                    e if e < 0.5 => buckets[4] += 1,
+                    _ => buckets[5] += 1,
+                }
+            }
+
+            let median = if !effects.is_empty() {
+                let mut sorted = effects.clone();
+                sorted.sort_by(|a, b| a.total_cmp(b));
+                sorted[sorted.len() / 2]
+            } else {
+                0.0
+            };
+
+            let mean_effect = if !effects.is_empty() {
+                effects.iter().sum::<f64>() / effects.len() as f64
+            } else {
+                0.0
+            };
+
+            let nan_count = self.diagnostic_records.iter()
+                .filter(|r| !r.agreed && !r.effect.is_finite())
+                .count();
+
+            let gate_pass = disagree_pct > 5.0 && median > 0.05;
+
+            format!(
+                "{msg}\n\
+                 \n=== Step 4.0 Diagnostic ===\n\
+                 Decisions: {} total, {} agreed ({:.1}%), {} disagreed ({:.1}%)\n\
+                 Effect sizes (disagreements): mean={:.4}, median={:.4}, nan={}\n\
+                 Histogram: <0={}, [0,0.01)={}, [0.01,0.05)={}, [0.05,0.1)={}, [0.1,0.5)={}, >=0.5={}\n\
+                 Gate: disagree>{:.0}% AND median>0.05 → {}",
+                total, agreed, 100.0 - disagree_pct, disagreed, disagree_pct,
+                mean_effect, median, nan_count,
+                buckets[0], buckets[1], buckets[2], buckets[3], buckets[4], buckets[5],
+                5.0,
+                if gate_pass { "PASS" } else { "FAIL" },
+            )
+        } else {
+            msg
+        };
+
         if error_total > 0 {
             log::warn!("{msg}");
             if !self.errors.unique_msgs.is_empty() {
@@ -1140,7 +1242,12 @@ impl MortalBatchAgent {
                     .and_then(|v| v.extract())
                     .ok();
 
-                Some((n_particles, seed, weight, grp_model_path, grp_max_steps, grp_placement_pts, policy_model_path))
+                let min_effect_size: f64 = obj
+                    .getattr("search_min_effect_size")
+                    .and_then(|v| v.extract())
+                    .unwrap_or(0.1);
+
+                Some((n_particles, seed, weight, grp_model_path, grp_max_steps, grp_placement_pts, policy_model_path, min_effect_size))
             } else {
                 None
             };
@@ -1156,7 +1263,7 @@ impl MortalBatchAgent {
         })?;
 
         let search = search_cfg
-            .map(|(n_particles, seed, weight, grp_model_path, grp_max_steps, grp_placement_pts, policy_model_path)| -> anyhow::Result<SearchIntegration> {
+            .map(|(n_particles, seed, weight, grp_model_path, grp_max_steps, grp_placement_pts, policy_model_path, min_effect_size)| -> anyhow::Result<SearchIntegration> {
                 let rng = match seed {
                     Some(s) => ChaCha12Rng::seed_from_u64(s),
                     None => ChaCha12Rng::from_os_rng(),
@@ -1182,7 +1289,7 @@ impl MortalBatchAgent {
                     config: ParticleConfig::new(n_particles),
                     max_candidates: 5,
                     search_weight: weight,
-                    min_effect_size: 0.1,
+                    min_effect_size,
                     policy,
                     policy_version: version,
                     grp,
@@ -1207,6 +1314,7 @@ impl MortalBatchAgent {
                     particles_requested: 0_u32,
                     particles_generated: 0_u32,
                     particle_gen_attempts: 0_u32,
+                    diagnostic_records: Vec::new(),
                 })
             }).transpose()?;
 
@@ -1896,6 +2004,7 @@ mod tests {
             particles_requested: 0,
             particles_generated: 0,
             particle_gen_attempts: 0,
+            diagnostic_records: Vec::new(),
         }
     }
 
