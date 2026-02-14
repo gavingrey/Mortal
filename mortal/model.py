@@ -284,3 +284,15 @@ class GRP(nn.Module):
         labels = torch.zeros(batch_size, dtype=torch.int64, device=mappings.device)
         labels[mappings[:, 1]] = mappings[:, 0]
         return labels
+
+class ValueNet(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.fc = nn.Linear(1024, 4)
+        nn.init.zeros_(self.fc.bias)
+
+    def forward(self, phi: Tensor) -> Tensor:
+        return self.fc(phi)
+
+    def predict_proba(self, phi: Tensor) -> Tensor:
+        return self.fc(phi).softmax(-1)
