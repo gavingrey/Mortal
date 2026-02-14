@@ -286,13 +286,21 @@ class GRP(nn.Module):
         return labels
 
 class ValueNet(nn.Module):
-    def __init__(self):
+    def __init__(self, hidden_dim=None):
         super().__init__()
-        self.fc = nn.Linear(1024, 4)
+        self.hidden_dim = hidden_dim
+        if hidden_dim is not None:
+            self.hidden = nn.Linear(1024, hidden_dim)
+            self.act = nn.Mish()
+            self.fc = nn.Linear(hidden_dim, 4)
+        else:
+            self.fc = nn.Linear(1024, 4)
         nn.init.zeros_(self.fc.bias)
 
     def forward(self, phi: Tensor) -> Tensor:
+        if self.hidden_dim is not None:
+            phi = self.act(self.hidden(phi))
         return self.fc(phi)
 
     def predict_proba(self, phi: Tensor) -> Tensor:
-        return self.fc(phi).softmax(-1)
+        return self.forward(phi).softmax(-1)

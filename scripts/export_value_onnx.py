@@ -46,6 +46,7 @@ def main():
     parser.add_argument('--version', type=int, default=4, help='Model version (default: 4)')
     parser.add_argument('--conv-channels', type=int, default=192, help='ResNet conv channels (default: 192)')
     parser.add_argument('--num-blocks', type=int, default=40, help='ResNet num blocks (default: 40)')
+    parser.add_argument('--hidden-dim', type=int, default=None, help='ValueNet hidden dim override (auto-detected from checkpoint)')
     args = parser.parse_args()
 
     version = args.version
@@ -68,7 +69,9 @@ def main():
     value_checkpoint = torch.load(args.value_path, map_location='cpu', weights_only=True)
     value_sd = value_checkpoint['model']
 
-    value_net = ValueNet()
+    hidden_dim = args.hidden_dim or value_checkpoint.get('hidden_dim')
+    print(f"  hidden_dim={'auto:' if args.hidden_dim is None else 'override:'}{hidden_dim}")
+    value_net = ValueNet(hidden_dim=hidden_dim)
     value_net.load_state_dict(value_sd)
     value_net.eval()
 

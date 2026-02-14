@@ -94,7 +94,8 @@ def train():
     logging.info('loaded pre-trained Brain encoder (frozen)')
 
     # Initialize ValueNet head
-    value_net = ValueNet().to(device)
+    hidden_dim = cfg.get('hidden_dim')
+    value_net = ValueNet(hidden_dim=hidden_dim).to(device)
     optimizer = optim.AdamW(value_net.parameters(), lr=cfg['optim']['lr'])
 
     state_file = cfg['state_file']
@@ -237,6 +238,7 @@ def train():
                 'optimizer': optimizer.state_dict(),
                 'steps': steps,
                 'timestamp': datetime.now().timestamp(),
+                'hidden_dim': hidden_dim,
             }
             torch.save(state, state_file)
             pb = tqdm(total=save_every, desc='TRAIN')
