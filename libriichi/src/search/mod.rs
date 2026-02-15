@@ -3,6 +3,7 @@ pub mod grp;
 pub mod heuristic;
 pub mod particle;
 pub mod policy;
+pub mod posthoc;
 pub mod simulator;
 
 use crate::py_helper::add_submodule;

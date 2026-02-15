@@ -34,6 +34,8 @@ tinyvec = { version = "1", features = ["alloc", "serde", "rustc_1_57"] }
 tract-onnx = "0.21"
 serde = { version = "1", features = ["derive"] }
 derive_more = { version = "2", features = ["add", "add_assign", "sum"] }
+rmp-serde = "1"
+clap = { version = "4", features = ["derive"] }
 mimalloc = { version = "0.1", default-features = false, optional = true }
 
 [build-dependencies]
@@ -45,6 +47,11 @@ criterion = "0.6"
 [[bench]]
 name = "bench"
 harness = false
+
+[[bin]]
+name = "posthoc_search"
+path = "src/bin/posthoc_search.rs"
+required-features = []
 
 [features]
 default = ["pymod", "mimalloc"]
