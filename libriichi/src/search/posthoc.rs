@@ -763,7 +763,7 @@ pub fn process_batch(
 
 /// Write decision records to a MessagePack file.
 pub fn write_records(records: &[DecisionRecord], output_path: &Path) -> Result<()> {
-    let data = rmp_serde::to_vec(records)
+    let data = rmp_serde::to_vec_named(records)
         .context("failed to serialize records")?;
     fs::write(output_path, &data)
         .with_context(|| format!("failed to write {}", output_path.display()))?;
