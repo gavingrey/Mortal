@@ -36,6 +36,8 @@ pub struct GameplayLoader {
     always_include_kan_select: bool,
     #[pyo3(get)]
     augmented: bool,
+    #[pyo3(get)]
+    random_suit_perm: bool,
 
     #[derivative(Debug = "ignore")]
     player_names_set: AHashSet<String>,
@@ -89,6 +91,7 @@ impl GameplayLoader {
         trust_seed = false,
         always_include_kan_select = true,
         augmented = false,
+        random_suit_perm = false,
     ))]
     fn new(
         version: u32,
@@ -98,6 +101,7 @@ impl GameplayLoader {
         trust_seed: bool,
         always_include_kan_select: bool,
         augmented: bool,
+        random_suit_perm: bool,
     ) -> Self {
         let player_names = player_names.unwrap_or_default();
         let player_names_set = player_names.iter().cloned().collect();
@@ -111,6 +115,7 @@ impl GameplayLoader {
             trust_seed,
             always_include_kan_select,
             augmented,
+            random_suit_perm,
             player_names_set,
             excludes_set,
         }
@@ -123,7 +128,16 @@ impl GameplayLoader {
             .map(json::from_str)
             .collect::<Result<Vec<Event>, _>>()
             .context("failed to parse log")?;
-        if self.augmented {
+        if self.random_suit_perm {
+            const PERMS: [[u8; 3]; 6] = [
+                [0, 1, 2], [0, 2, 1], [1, 0, 2],
+                [1, 2, 0], [2, 0, 1], [2, 1, 0],
+            ];
+            let perm = PERMS[rand::random_range(0_usize..6)];
+            if perm != [0, 1, 2] {
+                events.iter_mut().for_each(|e| e.permute_suit(perm));
+            }
+        } else if self.augmented {
             events.iter_mut().for_each(Event::augment);
         }
         self.load_events(&events)

@@ -44,6 +44,7 @@ player_names_files = []
 num_epochs = 1
 enable_augmentation = false
 augmented_first = false
+# suit_augment_mode = 'none'  # 'random' for 6x suit permutation, 'legacy' for 2x man/pin swap
 
 [env]
 gamma = 1

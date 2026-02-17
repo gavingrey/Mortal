@@ -184,10 +184,8 @@ impl Event {
         )
     }
 
-    pub fn augment(&mut self) {
-        const fn swap_tile(t: &mut Tile) {
-            *t = t.augment();
-        }
+    pub fn permute_suit(&mut self, perm: [u8; 3]) {
+        let mut swap_tile = |t: &mut Tile| { *t = t.permute_suit(perm); };
 
         match self {
             Self::StartKyoku {
@@ -198,22 +196,26 @@ impl Event {
             } => {
                 swap_tile(bakaze);
                 swap_tile(dora_marker);
-                tehais.iter_mut().flatten().for_each(swap_tile);
+                tehais.iter_mut().flatten().for_each(&mut swap_tile);
             }
             Self::Tsumo { pai, .. } | Self::Dahai { pai, .. } => swap_tile(pai),
             Self::Chi { pai, consumed, .. } | Self::Pon { pai, consumed, .. } => {
                 swap_tile(pai);
-                consumed.iter_mut().for_each(swap_tile);
+                consumed.iter_mut().for_each(&mut swap_tile);
             }
             Self::Daiminkan { pai, consumed, .. } | Self::Kakan { pai, consumed, .. } => {
                 swap_tile(pai);
-                consumed.iter_mut().for_each(swap_tile);
+                consumed.iter_mut().for_each(&mut swap_tile);
             }
-            Self::Ankan { consumed, .. } => consumed.iter_mut().for_each(swap_tile),
+            Self::Ankan { consumed, .. } => consumed.iter_mut().for_each(&mut swap_tile),
             Self::Dora { dora_marker } => swap_tile(dora_marker),
-            Self::Hora { ura_markers, .. } => ura_markers.iter_mut().flatten().for_each(swap_tile),
+            Self::Hora { ura_markers, .. } => ura_markers.iter_mut().flatten().for_each(&mut swap_tile),
             _ => (),
         }
+    }
+
+    pub fn augment(&mut self) {
+        self.permute_suit([1, 0, 2]);
     }
 }
 

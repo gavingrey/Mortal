@@ -54,6 +54,7 @@ def train():
     num_epochs = config['dataset']['num_epochs']
     enable_augmentation = config['dataset']['enable_augmentation']
     augmented_first = config['dataset']['augmented_first']
+    suit_augment_mode = config['dataset'].get('suit_augment_mode')
     eps = config['optim']['eps']
     betas = config['optim']['betas']
     weight_decay = config['optim']['weight_decay']
@@ -193,6 +194,7 @@ def train():
             num_epochs = num_epochs,
             enable_augmentation = enable_augmentation,
             augmented_first = augmented_first,
+            suit_augment_mode = suit_augment_mode,
         )
         data_loader = iter(DataLoader(
             dataset = file_data,

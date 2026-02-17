@@ -21,6 +21,7 @@ class FileDatasetsIter(IterableDataset):
         num_epochs = 1,
         enable_augmentation = False,
         augmented_first = False,
+        suit_augment_mode = None,
     ):
         super().__init__()
         self.version = version
@@ -36,6 +37,14 @@ class FileDatasetsIter(IterableDataset):
         self.augmented_first = augmented_first
         self.iterator = None
 
+        # Resolve suit_augment_mode: explicit setting overrides legacy flags
+        if suit_augment_mode is not None:
+            self.suit_augment_mode = suit_augment_mode
+        elif enable_augmentation:
+            self.suit_augment_mode = 'legacy'
+        else:
+            self.suit_augment_mode = 'none'
+
     def build_iter(self):
         # do not put it in __init__, it won't work on Windows
         self.grp = GRP(**config['grp']['network'])
@@ -44,11 +53,15 @@ class FileDatasetsIter(IterableDataset):
         self.reward_calc = RewardCalculator(self.grp, self.pts)
 
         for _ in range(self.num_epochs):
-            yield from self.load_files(self.augmented_first)
-            if self.enable_augmentation:
-                yield from self.load_files(not self.augmented_first)
+            if self.suit_augment_mode == 'random':
+                yield from self.load_files(random_suit_perm=True)
+            elif self.suit_augment_mode == 'legacy':
+                yield from self.load_files(augmented=self.augmented_first)
+                yield from self.load_files(augmented=not self.augmented_first)
+            else:
+                yield from self.load_files()
 
-    def load_files(self, augmented):
+    def load_files(self, augmented=False, random_suit_perm=False):
         # shuffle the file list for each epoch
         random.shuffle(self.file_list)
 
@@ -58,6 +71,7 @@ class FileDatasetsIter(IterableDataset):
             player_names = self.player_names,
             excludes = self.excludes,
             augmented = augmented,
+            random_suit_perm = random_suit_perm,
         )
         self.buffer = []
 
