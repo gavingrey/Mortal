@@ -203,7 +203,8 @@ def train():
             drop_last = False,
             num_workers = num_workers,
             pin_memory = True,
-            prefetch_factor = 2 if num_workers > 0 else None,
+            prefetch_factor = 3 if num_workers > 0 else None,
+            persistent_workers = num_workers > 0,
             worker_init_fn = worker_init_fn,
         ))
 
