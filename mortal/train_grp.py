@@ -139,7 +139,7 @@ def train():
         dataset = train_file_data,
         batch_size = batch_size,
         drop_last = True,
-        num_workers = 1,
+        num_workers = 0,
         collate_fn = collate,
     ))
 
@@ -152,7 +152,7 @@ def train():
         dataset = val_file_data,
         batch_size = batch_size,
         drop_last = True,
-        num_workers = 1,
+        num_workers = 0,
         collate_fn = collate,
     ))
 
