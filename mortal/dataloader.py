@@ -22,6 +22,7 @@ class FileDatasetsIter(IterableDataset):
         enable_augmentation = False,
         augmented_first = False,
         suit_augment_mode = None,
+        include_shanten = False,
     ):
         super().__init__()
         self.version = version
@@ -35,6 +36,7 @@ class FileDatasetsIter(IterableDataset):
         self.num_epochs = num_epochs
         self.enable_augmentation = enable_augmentation
         self.augmented_first = augmented_first
+        self.include_shanten = include_shanten
         self.iterator = None
 
         # Resolve suit_augment_mode: explicit setting overrides legacy flags
@@ -108,6 +110,8 @@ class FileDatasetsIter(IterableDataset):
                 # per game
                 grp = game.take_grp()
                 player_id = game.take_player_id()
+                if self.include_shanten:
+                    shantens = game.take_shantens()
 
                 game_size = len(obs)
 
@@ -137,6 +141,10 @@ class FileDatasetsIter(IterableDataset):
                     ]
                     if self.oracle:
                         entry.insert(1, invisible_obs[i])
+                    if self.include_shanten:
+                        s = shantens[i]
+                        entry.append(min(s + 1, 7))   # shanten_class: 8 classes
+                        entry.append(1 if s == -1 else 0)  # tenpai_label: binary
                     self.buffer.append(entry)
 
     def __iter__(self):
