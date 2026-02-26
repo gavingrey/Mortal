@@ -4,7 +4,7 @@ import numpy as np
 class RewardCalculator:
     def __init__(self, grp=None, pts=None, uniform_init=False, shared_stats=None):
         self.device = torch.device('cpu')
-        self.grp = grp.to(self.device).eval()
+        self.grp = grp.to(self.device).eval() if grp is not None else None
         self.uniform_init = uniform_init
         self.shared_stats = shared_stats  # {'count': Value, 'mean': Value, 'M2': Value, 'lock': Lock}
 
