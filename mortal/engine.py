@@ -21,6 +21,7 @@ class MortalEngine:
         boltzmann_epsilon = 0,
         boltzmann_temp = 1,
         top_p = 1,
+        explore_rate = 0,
         enable_search = False,
         search_seed = None,
         search_particles = 50,
@@ -48,6 +49,7 @@ class MortalEngine:
         self.boltzmann_epsilon = boltzmann_epsilon
         self.boltzmann_temp = boltzmann_temp
         self.top_p = top_p
+        self.explore_rate = explore_rate
 
         self.enable_search = enable_search
         self.search_seed = search_seed
@@ -58,6 +60,8 @@ class MortalEngine:
         self.search_placement_pts = search_placement_pts or [6.0, 4.0, 2.0, 0.0]
         self.search_policy_model = search_policy_model
         self.search_min_effect_size = search_min_effect_size
+
+        self.is_policy = hasattr(dqn, 'fc1')  # CategoricalPolicy has fc1, DQN does not
 
     def react_batch(self, obs, masks, invisible_obs):
         try:
@@ -88,7 +92,16 @@ class MortalEngine:
                 phi = self.brain(obs)
                 q_out = self.dqn(phi, masks)
 
-        if self.boltzmann_epsilon > 0:
+        if self.is_policy:
+            # q_out is probabilities from CategoricalPolicy
+            if self.explore_rate > 0:
+                is_greedy = torch.full((batch_size,), 1 - self.explore_rate, device=self.device).bernoulli().to(torch.bool)
+                sampled = Categorical(probs=q_out).sample()
+                actions = torch.where(is_greedy, q_out.argmax(-1), sampled)
+            else:
+                is_greedy = torch.ones(batch_size, dtype=torch.bool, device=self.device)
+                actions = q_out.argmax(-1)
+        elif self.boltzmann_epsilon > 0:
             is_greedy = torch.full((batch_size,), 1-self.boltzmann_epsilon, device=self.device).bernoulli().to(torch.bool)
             logits = (q_out / self.boltzmann_temp).masked_fill(~masks, -torch.inf)
             sampled = sample_top_p(logits, self.top_p)

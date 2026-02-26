@@ -4,7 +4,7 @@ import numpy as np
 import torch
 import secrets
 import os
-from model import Brain, DQN
+from model import Brain, DQN, CategoricalPolicy
 from engine import MortalEngine
 from libriichi.arena import OneVsThree
 from config import config
@@ -20,55 +20,45 @@ def main():
     if (key := cfg.get('seed_key', -1)) == -1:
         key = secrets.randbits(64)
 
+    def load_engine(state, engine_cfg):
+        cfg_inner = state['config']
+        version = cfg_inner['control'].get('version', 1)
+        conv_channels = cfg_inner['resnet']['conv_channels']
+        num_blocks = cfg_inner['resnet']['num_blocks']
+        norm = cfg_inner['resnet'].get('norm', 'BN')
+        brain = Brain(version=version, conv_channels=conv_channels, num_blocks=num_blocks, norm=norm).eval()
+        brain.load_state_dict(state['mortal'])
+
+        if 'policy_net' in state:
+            head = CategoricalPolicy().eval()
+            head.load_state_dict(state['policy_net'])
+        else:
+            head = DQN(version=version).eval()
+            head.load_state_dict(state['current_dqn'])
+
+        if engine_cfg['enable_compile']:
+            brain.compile()
+            head.compile()
+        return MortalEngine(
+            brain,
+            head,
+            is_oracle = False,
+            version = version,
+            device = torch.device(engine_cfg['device']),
+            enable_amp = engine_cfg['enable_amp'],
+            enable_rule_based_agari_guard = engine_cfg['enable_rule_based_agari_guard'],
+            name = engine_cfg['name'],
+        ), version
+
     if use_akochan:
         os.environ['AKOCHAN_DIR'] = cfg['akochan']['dir']
         os.environ['AKOCHAN_TACTICS'] = cfg['akochan']['tactics']
     else:
         state = torch.load(cfg['champion']['state_file'], weights_only=False, map_location=torch.device('cpu'))
-        cham_cfg = state['config']
-        version = cham_cfg['control'].get('version', 1)
-        conv_channels = cham_cfg['resnet']['conv_channels']
-        num_blocks = cham_cfg['resnet']['num_blocks']
-        mortal = Brain(version=version, conv_channels=conv_channels, num_blocks=num_blocks).eval()
-        dqn = DQN(version=version).eval()
-        mortal.load_state_dict(state['mortal'])
-        dqn.load_state_dict(state['current_dqn'])
-        if cfg['champion']['enable_compile']:
-            mortal.compile()
-            dqn.compile()
-        engine_cham = MortalEngine(
-            mortal,
-            dqn,
-            is_oracle = False,
-            version = version,
-            device = torch.device(cfg['champion']['device']),
-            enable_amp = cfg['champion']['enable_amp'],
-            enable_rule_based_agari_guard = cfg['champion']['enable_rule_based_agari_guard'],
-            name = cfg['champion']['name'],
-        )
+        engine_cham, _ = load_engine(state, cfg['champion'])
 
     state = torch.load(cfg['challenger']['state_file'], weights_only=False, map_location=torch.device('cpu'))
-    chal_cfg = state['config']
-    version = chal_cfg['control'].get('version', 1)
-    conv_channels = chal_cfg['resnet']['conv_channels']
-    num_blocks = chal_cfg['resnet']['num_blocks']
-    mortal = Brain(version=version, conv_channels=conv_channels, num_blocks=num_blocks).eval()
-    dqn = DQN(version=version).eval()
-    mortal.load_state_dict(state['mortal'])
-    dqn.load_state_dict(state['current_dqn'])
-    if cfg['challenger']['enable_compile']:
-        mortal.compile()
-        dqn.compile()
-    engine_chal = MortalEngine(
-        mortal,
-        dqn,
-        is_oracle = False,
-        version = version,
-        device = torch.device(cfg['challenger']['device']),
-        enable_amp = cfg['challenger']['enable_amp'],
-        enable_rule_based_agari_guard = cfg['challenger']['enable_rule_based_agari_guard'],
-        name = cfg['challenger']['name'],
-    )
+    engine_chal, version = load_engine(state, cfg['challenger'])
 
     seed_start = 10000
     for i, seed in enumerate(range(seed_start, seed_start + seeds_per_iter * iters, seeds_per_iter)):

@@ -23,6 +23,8 @@ class FileDatasetsIter(IterableDataset):
         augmented_first = False,
         suit_augment_mode = None,
         include_shanten = False,
+        policy_gradient = False,
+        shared_stats = None,
     ):
         super().__init__()
         self.version = version
@@ -37,6 +39,8 @@ class FileDatasetsIter(IterableDataset):
         self.enable_augmentation = enable_augmentation
         self.augmented_first = augmented_first
         self.include_shanten = include_shanten
+        self.policy_gradient = policy_gradient
+        self.shared_stats = shared_stats
         self.iterator = None
 
         # Resolve suit_augment_mode: explicit setting overrides legacy flags
@@ -52,7 +56,7 @@ class FileDatasetsIter(IterableDataset):
         self.grp = GRP(**config['grp']['network'])
         grp_state = torch.load(config['grp']['state_file'], weights_only=True, map_location=torch.device('cpu'))
         self.grp.load_state_dict(grp_state['model'])
-        self.reward_calc = RewardCalculator(self.grp, self.pts)
+        self.reward_calc = RewardCalculator(self.grp, self.pts, shared_stats=self.shared_stats)
 
         for _ in range(self.num_epochs):
             if self.suit_augment_mode == 'random':
@@ -104,48 +108,63 @@ class FileDatasetsIter(IterableDataset):
                 actions = game.take_actions()
                 masks = game.take_masks()
                 at_kyoku = game.take_at_kyoku()
-                dones = game.take_dones()
-                apply_gamma = game.take_apply_gamma()
 
                 # per game
                 grp = game.take_grp()
                 player_id = game.take_player_id()
-                if self.include_shanten:
-                    shantens = game.take_shantens()
 
                 game_size = len(obs)
 
                 grp_feature = grp.take_feature()
                 rank_by_player = grp.take_rank_by_player()
                 kyoku_rewards = self.reward_calc.calc_delta_pt(player_id, grp_feature, rank_by_player)
-                assert len(kyoku_rewards) >= at_kyoku[-1] + 1 # usually they are equal, unless there is no action in the last kyoku
+                assert len(kyoku_rewards) >= at_kyoku[-1] + 1
 
-                final_scores = grp.take_final_scores()
-                scores_seq = np.concatenate((grp_feature[:, 3:] * 1e4, [final_scores]))
-                rank_by_player_seq = (-scores_seq).argsort(-1, kind='stable').argsort(-1, kind='stable')
-                player_ranks = rank_by_player_seq[:, player_id]
-
-                steps_to_done = np.zeros(game_size, dtype=np.int64)
-                for i in reversed(range(game_size)):
-                    if not dones[i]:
-                        steps_to_done[i] = steps_to_done[i + 1] + int(apply_gamma[i])
-
-                for i in range(game_size):
-                    entry = [
-                        obs[i],
-                        actions[i],
-                        masks[i],
-                        steps_to_done[i],
-                        kyoku_rewards[at_kyoku[i]],
-                        player_ranks[at_kyoku[i] + 1],
-                    ]
-                    if self.oracle:
-                        entry.insert(1, invisible_obs[i])
+                if self.policy_gradient:
+                    # Policy gradient mode: emit (obs, actions, masks, advantage)
+                    for i in range(game_size):
+                        entry = [
+                            obs[i],
+                            actions[i],
+                            masks[i],
+                            kyoku_rewards[at_kyoku[i]],
+                        ]
+                        if self.oracle:
+                            entry.insert(1, invisible_obs[i])
+                        self.buffer.append(entry)
+                else:
+                    # DQN mode: emit (obs, actions, masks, steps_to_done, kyoku_rewards, player_ranks)
+                    dones = game.take_dones()
+                    apply_gamma = game.take_apply_gamma()
                     if self.include_shanten:
-                        s = shantens[i]
-                        entry.append(min(s + 1, 7))   # shanten_class: 8 classes
-                        entry.append(1 if s == -1 else 0)  # tenpai_label: binary
-                    self.buffer.append(entry)
+                        shantens = game.take_shantens()
+
+                    final_scores = grp.take_final_scores()
+                    scores_seq = np.concatenate((grp_feature[:, 3:] * 1e4, [final_scores]))
+                    rank_by_player_seq = (-scores_seq).argsort(-1, kind='stable').argsort(-1, kind='stable')
+                    player_ranks = rank_by_player_seq[:, player_id]
+
+                    steps_to_done = np.zeros(game_size, dtype=np.int64)
+                    for i in reversed(range(game_size)):
+                        if not dones[i]:
+                            steps_to_done[i] = steps_to_done[i + 1] + int(apply_gamma[i])
+
+                    for i in range(game_size):
+                        entry = [
+                            obs[i],
+                            actions[i],
+                            masks[i],
+                            steps_to_done[i],
+                            kyoku_rewards[at_kyoku[i]],
+                            player_ranks[at_kyoku[i] + 1],
+                        ]
+                        if self.oracle:
+                            entry.insert(1, invisible_obs[i])
+                        if self.include_shanten:
+                            s = shantens[i]
+                            entry.append(min(s + 1, 7))
+                            entry.append(1 if s == -1 else 0)
+                        self.buffer.append(entry)
 
     def __iter__(self):
         if self.iterator is None:

@@ -105,11 +105,29 @@ class ResNet(nn.Module):
     def forward(self, x):
         return self.net(x)
 
+def orthogonal_init(layer, gain=1.0):
+    nn.init.orthogonal_(layer.weight, gain=gain)
+    nn.init.constant_(layer.bias, 0)
+
+class CategoricalPolicy(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.fc1 = nn.Linear(1024, 256)
+        self.fc2 = nn.Linear(256, ACTION_SPACE)
+        orthogonal_init(self.fc1)
+        orthogonal_init(self.fc2)
+
+    def forward(self, phi, mask):
+        phi = torch.tanh(self.fc1(phi))
+        phi = self.fc2(phi).masked_fill(~mask, -torch.inf)
+        return torch.softmax(phi, dim=-1)
+
 class Brain(nn.Module):
-    def __init__(self, *, conv_channels, num_blocks, is_oracle=False, version=1):
+    def __init__(self, *, conv_channels, num_blocks, is_oracle=False, version=1, norm='BN'):
         super().__init__()
         self.is_oracle = is_oracle
         self.version = version
+        self.norm = norm
 
         in_channels = obs_shape(version)[0]
         if is_oracle:
@@ -132,7 +150,10 @@ class Brain(nn.Module):
             case 2:
                 pass
             case 3 | 4:
-                norm_builder = partial(nn.BatchNorm1d, conv_channels, momentum=0.01, eps=1e-3)
+                if norm == 'GN':
+                    norm_builder = partial(nn.GroupNorm, num_channels=conv_channels, num_groups=32, eps=1e-3)
+                else:
+                    norm_builder = partial(nn.BatchNorm1d, conv_channels, momentum=0.01, eps=1e-3)
             case _:
                 raise ValueError(f'Unexpected version {self.version}')
 

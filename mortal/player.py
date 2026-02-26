@@ -5,7 +5,7 @@ import shutil
 import secrets
 import logging
 from os import path
-from model import Brain, DQN
+from model import Brain, DQN, CategoricalPolicy
 from engine import MortalEngine
 from libriichi.stat import Stat
 from libriichi.arena import OneVsThree
@@ -21,17 +21,24 @@ class TestPlayer:
         version = cfg['control'].get('version', 1)
         conv_channels = cfg['resnet']['conv_channels']
         num_blocks = cfg['resnet']['num_blocks']
-        stable_mortal = Brain(version=version, conv_channels=conv_channels, num_blocks=num_blocks).eval()
-        stable_dqn = DQN(version=version).eval()
+        norm = cfg['resnet'].get('norm', 'BN')
+        stable_mortal = Brain(version=version, conv_channels=conv_channels, num_blocks=num_blocks, norm=norm).eval()
         stable_mortal.load_state_dict(state['mortal'])
-        stable_dqn.load_state_dict(state['current_dqn'])
+
+        if 'policy_net' in state:
+            stable_head = CategoricalPolicy().eval()
+            stable_head.load_state_dict(state['policy_net'])
+        else:
+            stable_head = DQN(version=version).eval()
+            stable_head.load_state_dict(state['current_dqn'])
+
         if baseline_cfg['enable_compile']:
             stable_mortal.compile()
-            stable_dqn.compile()
+            stable_head.compile()
 
         self.baseline_engine = MortalEngine(
             stable_mortal,
-            stable_dqn,
+            stable_head,
             is_oracle = False,
             version = version,
             device = device,
@@ -42,11 +49,11 @@ class TestPlayer:
         self.chal_version = config['control']['version']
         self.log_dir = path.abspath(config['test_play']['log_dir'])
 
-    def test_play(self, seed_count, mortal, dqn, device):
+    def test_play(self, seed_count, mortal, action_head, device):
         torch.backends.cudnn.benchmark = False
         engine_chal = MortalEngine(
             mortal,
-            dqn,
+            action_head,
             is_oracle = False,
             version = self.chal_version,
             device = device,
@@ -82,17 +89,24 @@ class TrainPlayer:
         version = cfg['control'].get('version', 1)
         conv_channels = cfg['resnet']['conv_channels']
         num_blocks = cfg['resnet']['num_blocks']
-        stable_mortal = Brain(version=version, conv_channels=conv_channels, num_blocks=num_blocks).eval()
-        stable_dqn = DQN(version=version).eval()
+        norm = cfg['resnet'].get('norm', 'BN')
+        stable_mortal = Brain(version=version, conv_channels=conv_channels, num_blocks=num_blocks, norm=norm).eval()
         stable_mortal.load_state_dict(state['mortal'])
-        stable_dqn.load_state_dict(state['current_dqn'])
+
+        if 'policy_net' in state:
+            stable_head = CategoricalPolicy().eval()
+            stable_head.load_state_dict(state['policy_net'])
+        else:
+            stable_head = DQN(version=version).eval()
+            stable_head.load_state_dict(state['current_dqn'])
+
         if baseline_cfg['enable_compile']:
             stable_mortal.compile()
-            stable_dqn.compile()
+            stable_head.compile()
 
         self.baseline_engine = MortalEngine(
             stable_mortal,
-            stable_dqn,
+            stable_head,
             is_oracle = False,
             version = version,
             device = device,
@@ -110,23 +124,25 @@ class TrainPlayer:
         self.train_seed = 10000
 
         self.seed_count = cfg['games'] // 4
-        self.boltzmann_epsilon = cfg['boltzmann_epsilon']
-        self.boltzmann_temp = cfg['boltzmann_temp']
-        self.top_p = cfg['top_p']
+        self.boltzmann_epsilon = cfg.get('boltzmann_epsilon', 0)
+        self.boltzmann_temp = cfg.get('boltzmann_temp', 1)
+        self.top_p = cfg.get('top_p', 1)
+        self.explore_rate = cfg.get('explore_rate', 0)
 
         self.repeats = cfg['repeats']
         self.repeat_counter = 0
 
-    def train_play(self, mortal, dqn, device):
+    def train_play(self, mortal, action_head, device):
         torch.backends.cudnn.benchmark = False
         engine_chal = MortalEngine(
             mortal,
-            dqn,
+            action_head,
             is_oracle = False,
             version = self.chal_version,
             boltzmann_epsilon = self.boltzmann_epsilon,
             boltzmann_temp = self.boltzmann_temp,
             top_p = self.top_p,
+            explore_rate = self.explore_rate,
             device = device,
             enable_amp = True,
             name = 'trainee',
