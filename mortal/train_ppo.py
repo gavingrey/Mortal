@@ -116,13 +116,23 @@ def train():
             policy_net.load_state_dict(state['policy_net'])
         else:
             logging.warning('no policy_net in checkpoint — starting from orthogonal init')
+        is_ppo_checkpoint = 'ppo_iter' in state
         if 'optimizer' in state:
-            optimizer.load_state_dict(state['optimizer'])
-            scheduler.load_state_dict(state['scheduler'])
+            if is_ppo_checkpoint:
+                optimizer.load_state_dict(state['optimizer'])
+                scheduler.load_state_dict(state['scheduler'])
+                logging.info(f'restored optimizer/scheduler from PPO checkpoint')
+            else:
+                logging.info(f'skipping optimizer/scheduler from non-PPO checkpoint (fresh optimizer for PPO)')
         scaler.load_state_dict(state['scaler'])
         best_perf = state.get('best_perf', best_perf)
-        steps = state.get('steps', 0)
-        ppo_iter = state.get('ppo_iter', 0)
+        if is_ppo_checkpoint:
+            steps = state.get('steps', 0)
+            ppo_iter = state.get('ppo_iter', 0)
+        else:
+            steps = 0
+            ppo_iter = 0
+            logging.info(f'reset steps/ppo_iter to 0 for PPO transition')
 
     optimizer.zero_grad(set_to_none=True)
 
