@@ -504,7 +504,10 @@ def train():
         if (iteration + 1) % eval_every == 0:
             logging.info(f'running evaluation at iteration {iteration + 1}...')
             run_test_play()
-            # BUG: CUDA hang after eval in online mode — restart workaround
+            # Advance ppo_iter so restart doesn't repeat this iteration
+            ppo_iter = iteration + 1
+            save_state()
+            # CUDA hang after eval in online mode — restart workaround
             sys.exit(0)
 
         gc.collect()
