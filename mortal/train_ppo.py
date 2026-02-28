@@ -35,7 +35,6 @@ def train():
     save_every = config['control']['save_every']
     test_every = config['control']['test_every']
     test_games = config['test_play']['games']
-    old_update_every = config['control'].get('old_update_every', 400)
     assert save_every % opt_step_every == 0
     assert test_every % save_every == 0
 
@@ -62,6 +61,8 @@ def train():
     ppo_cfg = config.get('ppo', {})
     num_iters = ppo_cfg.get('num_iters', 500)
     eval_every = ppo_cfg.get('eval_every', 50)
+    ppo_epochs = ppo_cfg.get('ppo_epochs', 3)
+    target_kl = ppo_cfg.get('target_kl', 0.015)
 
     norm = config['resnet'].get('norm', 'GN')  # Default to GN for online training
     mortal = Brain(version=version, norm=norm, **{k: v for k, v in config['resnet'].items() if k != 'norm'}).to(device)
@@ -252,7 +253,7 @@ def train():
         writer.add_scalar('self_play/avg_pt', avg_pt, steps)
 
         # --- Training phase ---
-        # Create shared stats for this iteration
+        # Create shared stats for this iteration (persists across epochs for consistent normalization)
         manager = multiprocessing.Manager()
         shared_stats = {
             'count': manager.Value('d', 0.0),
@@ -260,27 +261,6 @@ def train():
             'M2': manager.Value('d', 0.0),
             'lock': manager.Lock(),
         }
-
-        file_data = FileDatasetsIter(
-            version = version,
-            file_list = file_list,
-            pts = pts,
-            file_batch_size = file_batch_size,
-            player_names = ['trainee'],
-            num_epochs = 1,
-            policy_gradient = True,
-            shared_stats = shared_stats,
-        )
-        data_loader = iter(DataLoader(
-            dataset = file_data,
-            batch_size = batch_size,
-            drop_last = False,
-            num_workers = num_workers,
-            pin_memory = True,
-            prefetch_factor = 3 if num_workers > 0 else None,
-            persistent_workers = False,  # Per-iteration data, no persistence
-            worker_init_fn = worker_init_fn,
-        ))
 
         iter_stats = {
             'ppo_loss': 0,
@@ -290,12 +270,6 @@ def train():
             'approx_kl': 0,
             'batch_count': 0,
         }
-
-        remaining_obs = []
-        remaining_actions = []
-        remaining_masks = []
-        remaining_advantages = []
-        remaining_bs = 0
 
         def train_batch(obs, actions, masks, advantage):
             nonlocal steps
@@ -307,7 +281,7 @@ def train():
             bs = obs.shape[0]
             assert masks[range(bs), actions].all()
 
-            # Old policy log probs
+            # Old policy log probs (old policy is frozen for entire iteration)
             with torch.no_grad():
                 with torch.autocast(device.type, enabled=enable_amp):
                     old_phi = Old_mortal(obs)
@@ -360,40 +334,75 @@ def train():
                 optimizer.zero_grad(set_to_none=True)
             scheduler.step()
 
-            # Sync old policy periodically
-            if steps % old_update_every == 0:
-                Old_mortal.load_state_dict(mortal.state_dict())
-                Old_policy_net.load_state_dict(policy_net.state_dict())
-                logging.info(f'old policy synced at step {steps}')
+        # Multi-epoch PPO: train on each batch of self-play data multiple times
+        for epoch in range(ppo_epochs):
+            # Shuffle file order each epoch for diversity
+            epoch_files = file_list.copy()
+            random.shuffle(epoch_files)
 
-        for obs, actions, masks, advantage in data_loader:
-            bs = obs.shape[0]
-            if bs != batch_size:
-                remaining_obs.append(obs)
-                remaining_actions.append(actions)
-                remaining_masks.append(masks)
-                remaining_advantages.append(advantage)
-                remaining_bs += bs
-                continue
-            train_batch(obs, actions, masks, advantage)
+            file_data = FileDatasetsIter(
+                version = version,
+                file_list = epoch_files,
+                pts = pts,
+                file_batch_size = file_batch_size,
+                player_names = ['trainee'],
+                num_epochs = 1,
+                policy_gradient = True,
+                shared_stats = shared_stats,
+            )
+            data_loader = iter(DataLoader(
+                dataset = file_data,
+                batch_size = batch_size,
+                drop_last = False,
+                num_workers = num_workers,
+                pin_memory = True,
+                prefetch_factor = 3 if num_workers > 0 else None,
+                persistent_workers = False,
+                worker_init_fn = worker_init_fn,
+            ))
 
-        remaining_batches = remaining_bs // batch_size
-        if remaining_batches > 0:
-            obs = torch.cat(remaining_obs, dim=0)
-            actions = torch.cat(remaining_actions, dim=0)
-            masks = torch.cat(remaining_masks, dim=0)
-            advantage = torch.cat(remaining_advantages, dim=0)
-            start = 0
-            end = batch_size
-            while end <= remaining_bs:
-                train_batch(
-                    obs[start:end],
-                    actions[start:end],
-                    masks[start:end],
-                    advantage[start:end],
-                )
-                start = end
-                end += batch_size
+            remaining_obs = []
+            remaining_actions = []
+            remaining_masks = []
+            remaining_advantages = []
+            remaining_bs = 0
+
+            for obs, actions, masks, advantage in data_loader:
+                bs = obs.shape[0]
+                if bs != batch_size:
+                    remaining_obs.append(obs)
+                    remaining_actions.append(actions)
+                    remaining_masks.append(masks)
+                    remaining_advantages.append(advantage)
+                    remaining_bs += bs
+                    continue
+                train_batch(obs, actions, masks, advantage)
+
+            remaining_batches = remaining_bs // batch_size
+            if remaining_batches > 0:
+                obs = torch.cat(remaining_obs, dim=0)
+                actions = torch.cat(remaining_actions, dim=0)
+                masks = torch.cat(remaining_masks, dim=0)
+                advantage = torch.cat(remaining_advantages, dim=0)
+                start = 0
+                end = batch_size
+                while end <= remaining_bs:
+                    train_batch(
+                        obs[start:end],
+                        actions[start:end],
+                        masks[start:end],
+                        advantage[start:end],
+                    )
+                    start = end
+                    end += batch_size
+
+            # KL early stopping: if policy has diverged too far, skip remaining epochs
+            bc = max(iter_stats['batch_count'], 1)
+            avg_kl = iter_stats['approx_kl'] / bc
+            logging.info(f'  epoch {epoch}: avg_kl={avg_kl:.6f}, batches={iter_stats["batch_count"]}')
+            if avg_kl > target_kl and epoch < ppo_epochs - 1:
+                logging.info(f'  KL early stopping at epoch {epoch + 1}/{ppo_epochs} (avg_kl={avg_kl:.6f} > {target_kl})')
+                break
 
         # Log iteration stats
         bc = max(iter_stats['batch_count'], 1)
@@ -403,6 +412,7 @@ def train():
         writer.add_scalar('important_ratio/ratio_max', iter_stats['ratio_max'], steps)
         writer.add_scalar('important_ratio/approx_kl', iter_stats['approx_kl'] / bc, steps)
         writer.add_scalar('hparam/lr', scheduler.get_last_lr()[0], steps)
+        writer.add_scalar('ppo/epochs_used', epoch + 1, steps)
 
         # Log Welford stats
         with shared_stats['lock']:
@@ -422,13 +432,9 @@ def train():
             f'entropy={iter_stats["entropy"]/bc:.4f}, '
             f'ratio={iter_stats["ratio_mean"]/bc:.4f}, '
             f'approx_kl={iter_stats["approx_kl"]/bc:.6f}, '
+            f'epochs={epoch+1}/{ppo_epochs}, '
             f'batches={bc}'
         )
-
-        # Early stopping on KL divergence
-        avg_kl = iter_stats['approx_kl'] / bc
-        if avg_kl > 0.02:
-            logging.warning(f'approx_kl={avg_kl:.6f} > 0.02, consider reducing LR or increasing old_update_every')
 
         # Save checkpoint every iteration
         save_state()
