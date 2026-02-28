@@ -64,6 +64,15 @@ def train():
     ppo_epochs = ppo_cfg.get('ppo_epochs', 3)
     target_kl = ppo_cfg.get('target_kl', 0.015)
 
+    # Dynamic entropy targeting config (Suphx Equation 3)
+    ent_cfg = config.get('entropy_targeting', {})
+    ent_targeting_enabled = ent_cfg.get('enabled', False)
+    ent_target = ent_cfg.get('target', 2.0)
+    ent_adapt_rate = ent_cfg.get('adapt_rate', 0.01)
+    ent_weight_min = ent_cfg.get('weight_min', 0.01)
+    ent_weight_max = ent_cfg.get('weight_max', 0.5)
+    ent_floor = ent_cfg.get('floor', 0.5)
+
     norm = config['resnet'].get('norm', 'GN')  # Default to GN for online training
     mortal = Brain(version=version, norm=norm, **{k: v for k, v in config['resnet'].items() if k != 'norm'}).to(device)
     policy_net = CategoricalPolicy().to(device)
@@ -141,6 +150,9 @@ def train():
         if is_ppo_checkpoint:
             steps = state.get('steps', 0)
             ppo_iter = state.get('ppo_iter', 0)
+            if 'entropy_weight' in state:
+                entropy_weight = state['entropy_weight']
+                logging.info(f'restored entropy_weight={entropy_weight:.6f}')
         else:
             steps = 0
             ppo_iter = 0
@@ -167,6 +179,7 @@ def train():
             'scaler': scaler.state_dict(),
             'steps': steps,
             'ppo_iter': ppo_iter,
+            'entropy_weight': entropy_weight,
             'timestamp': datetime.now().timestamp(),
             'best_perf': best_perf,
             'config': config,
@@ -435,6 +448,28 @@ def train():
             writer.add_scalar('stats/mean', w_mean, steps)
             writer.add_scalar('stats/std_dev', w_std, steps)
 
+        # Dynamic entropy targeting (Suphx Equation 3: alpha += beta * (H_target - H_bar))
+        avg_entropy = iter_stats['entropy'] / bc
+        if ent_targeting_enabled:
+            old_weight = entropy_weight
+            entropy_error = ent_target - avg_entropy
+            entropy_weight += ent_adapt_rate * entropy_error
+            entropy_weight = max(ent_weight_min, min(ent_weight_max, entropy_weight))
+            if abs(entropy_weight - old_weight) > 1e-6:
+                logging.info(f'  entropy targeting: {avg_entropy:.4f} vs target {ent_target:.2f}, '
+                             f'weight {old_weight:.4f} -> {entropy_weight:.4f}')
+            writer.add_scalar('entropy/target', ent_target, steps)
+            writer.add_scalar('entropy/weight', entropy_weight, steps)
+
+            # Entropy floor with rollback (safety net)
+            if avg_entropy < ent_floor:
+                logging.warning(f'ENTROPY COLLAPSE DETECTED: {avg_entropy:.4f} < floor {ent_floor}')
+                logging.warning(f'Rolling back to old policy, doubling entropy weight')
+                policy_net.load_state_dict(Old_policy_net.state_dict())
+                entropy_weight = min(entropy_weight * 2.0, ent_weight_max)
+                logging.warning(f'Entropy weight after doubling: {entropy_weight:.4f}')
+                writer.add_scalar('entropy/rollback', 1, steps)
+
         writer.flush()
         logging.info(
             f'iter {iteration}: steps={steps}, '
@@ -442,6 +477,7 @@ def train():
             f'entropy={iter_stats["entropy"]/bc:.4f}, '
             f'ratio={iter_stats["ratio_mean"]/bc:.4f}, '
             f'approx_kl={iter_stats["approx_kl"]/bc:.6f}, '
+            f'ent_w={entropy_weight:.4f}, '
             f'epochs={epoch+1}/{ppo_epochs}, '
             f'batches={bc}'
         )
