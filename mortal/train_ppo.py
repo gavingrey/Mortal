@@ -290,6 +290,8 @@ def train():
 
         iter_stats = {
             'ppo_loss': 0,
+            'clip_loss': 0,
+            'entropy_loss': 0,
             'entropy': 0,
             'ratio_mean': 0,
             'ratio_max': 0,
@@ -349,6 +351,8 @@ def train():
 
             with torch.inference_mode():
                 iter_stats['ppo_loss'] += loss.item()
+                iter_stats['clip_loss'] += clip_loss.mean().item()
+                iter_stats['entropy_loss'] += entropy_loss.item()
                 iter_stats['entropy'] += entropy.item()
                 iter_stats['ratio_mean'] += ratio.mean().item()
                 iter_stats['ratio_max'] = max(iter_stats['ratio_max'], ratio.max().item())
@@ -440,6 +444,8 @@ def train():
         # Log iteration stats
         bc = max(iter_stats['batch_count'], 1)
         writer.add_scalar('loss/ppo_loss', iter_stats['ppo_loss'] / bc, steps)
+        writer.add_scalar('loss/clip_loss', iter_stats['clip_loss'] / bc, steps)
+        writer.add_scalar('loss/entropy_loss', iter_stats['entropy_loss'] / bc, steps)
         writer.add_scalar('entropy/entropy', iter_stats['entropy'] / bc, steps)
         writer.add_scalar('important_ratio/ratio', iter_stats['ratio_mean'] / bc, steps)
         writer.add_scalar('important_ratio/ratio_max', iter_stats['ratio_max'], steps)
@@ -489,6 +495,8 @@ def train():
         logging.info(
             f'iter {iteration}: steps={steps}, '
             f'loss={iter_stats["ppo_loss"]/bc:.4f}, '
+            f'clip_loss={iter_stats["clip_loss"]/bc:.4f}, '
+            f'ent_loss={iter_stats["entropy_loss"]/bc:.4f}, '
             f'entropy={iter_stats["entropy"]/bc:.4f}, '
             f'ratio={iter_stats["ratio_mean"]/bc:.4f}, '
             f'approx_kl={iter_stats["approx_kl"]/bc:.6f}, '
