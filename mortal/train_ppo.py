@@ -82,7 +82,8 @@ def train():
     logging.info(f'version: {version}')
     logging.info(f'norm: {norm}')
     logging.info(f'obs shape: {obs_shape(version)}')
-    logging.info(f'brain FROZEN: {parameter_count(mortal):,} params (no gradients)')
+    brain_params = sum(p.numel() for p in mortal.parameters())
+    logging.info(f'brain FROZEN: {brain_params:,} params (no gradients)')
     logging.info(f'policy_net TRAINABLE: {parameter_count(policy_net):,} params')
 
     decay_params = []
@@ -127,9 +128,12 @@ def train():
         is_ppo_checkpoint = 'ppo_iter' in state
         if 'optimizer' in state:
             if is_ppo_checkpoint:
-                optimizer.load_state_dict(state['optimizer'])
-                scheduler.load_state_dict(state['scheduler'])
-                logging.info(f'restored optimizer/scheduler from PPO checkpoint')
+                try:
+                    optimizer.load_state_dict(state['optimizer'])
+                    scheduler.load_state_dict(state['scheduler'])
+                    logging.info(f'restored optimizer/scheduler from PPO checkpoint')
+                except ValueError:
+                    logging.warning('optimizer state incompatible (param group size changed) — using fresh optimizer')
             else:
                 logging.info(f'skipping optimizer/scheduler from non-PPO checkpoint (fresh optimizer for PPO)')
         scaler.load_state_dict(state['scaler'])
