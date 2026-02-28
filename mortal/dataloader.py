@@ -25,6 +25,7 @@ class FileDatasetsIter(IterableDataset):
         include_shanten = False,
         policy_gradient = False,
         shared_stats = None,
+        gamma = 1.0,
     ):
         super().__init__()
         self.version = version
@@ -41,6 +42,7 @@ class FileDatasetsIter(IterableDataset):
         self.include_shanten = include_shanten
         self.policy_gradient = policy_gradient
         self.shared_stats = shared_stats
+        self.gamma = gamma
         self.iterator = None
 
         # Resolve suit_augment_mode: explicit setting overrides legacy flags
@@ -122,12 +124,25 @@ class FileDatasetsIter(IterableDataset):
 
                 if self.policy_gradient:
                     # Policy gradient mode: emit (obs, actions, masks, advantage)
+                    # Temporal discounting: weight = gamma^steps_to_done
+                    # Later decisions (fewer steps to done) get higher weight,
+                    # breaking the flat per-kyoku advantage that causes clip_loss≈0
+                    dones = game.take_dones()
+                    apply_gamma = game.take_apply_gamma()
+
+                    steps_to_done = np.zeros(game_size, dtype=np.int64)
+                    for i in reversed(range(game_size)):
+                        if not dones[i]:
+                            steps_to_done[i] = steps_to_done[i + 1] + int(apply_gamma[i])
+
                     for i in range(game_size):
+                        weight = self.gamma ** steps_to_done[i]
+                        weighted_advantage = kyoku_rewards[at_kyoku[i]] * weight
                         entry = [
                             obs[i],
                             actions[i],
                             masks[i],
-                            kyoku_rewards[at_kyoku[i]],
+                            weighted_advantage,
                         ]
                         if self.oracle:
                             entry.insert(1, invisible_obs[i])

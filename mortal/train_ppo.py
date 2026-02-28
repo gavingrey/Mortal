@@ -44,6 +44,7 @@ def train():
     enable_compile = config['control']['enable_compile']
 
     pts = config['env']['pts']
+    gamma = config['env'].get('gamma', 1.0)
     file_batch_size = config['dataset']['file_batch_size']
     num_workers = config['dataset']['num_workers']
     eps = config['optim']['eps']
@@ -94,6 +95,7 @@ def train():
     brain_params = sum(p.numel() for p in mortal.parameters())
     logging.info(f'brain FROZEN: {brain_params:,} params (no gradients)')
     logging.info(f'policy_net TRAINABLE: {parameter_count(policy_net):,} params')
+    logging.info(f'temporal discount gamma: {gamma}')
 
     decay_params = []
     no_decay_params = []
@@ -386,6 +388,7 @@ def train():
                 num_epochs = 1,
                 policy_gradient = True,
                 shared_stats = shared_stats,
+                gamma = gamma,
             )
             data_loader = iter(DataLoader(
                 dataset = file_data,
