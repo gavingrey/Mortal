@@ -104,17 +104,6 @@ class TrainPlayer:
             stable_mortal.compile()
             stable_head.compile()
 
-        self.baseline_engine = MortalEngine(
-            stable_mortal,
-            stable_head,
-            is_oracle = False,
-            version = version,
-            device = device,
-            enable_amp = True,
-            enable_rule_based_agari_guard = True,
-            name = 'baseline',
-        )
-
         profile = os.environ.get('TRAIN_PLAY_PROFILE', 'default')
         logging.info(f'using profile {profile}')
         cfg = config['train_play'][profile]
@@ -128,6 +117,19 @@ class TrainPlayer:
         self.boltzmann_temp = cfg.get('boltzmann_temp', 1)
         self.top_p = cfg.get('top_p', 1)
         self.explore_rate = cfg.get('explore_rate', 0)
+
+        # R3-D: baseline uses same explore_rate as trainee (eliminates exploration asymmetry)
+        self.baseline_engine = MortalEngine(
+            stable_mortal,
+            stable_head,
+            is_oracle = False,
+            version = version,
+            device = device,
+            enable_amp = True,
+            enable_rule_based_agari_guard = False,
+            explore_rate = self.explore_rate,
+            name = 'baseline',
+        )
 
         self.repeats = cfg['repeats']
         self.repeat_counter = 0

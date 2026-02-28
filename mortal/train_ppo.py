@@ -145,7 +145,11 @@ def train():
                     logging.warning('optimizer state incompatible (param group size changed) — using fresh optimizer')
             else:
                 logging.info(f'skipping optimizer/scheduler from non-PPO checkpoint (fresh optimizer for PPO)')
-        scaler.load_state_dict(state['scaler'])
+        if is_ppo_checkpoint:
+            scaler.load_state_dict(state['scaler'])
+        else:
+            scaler = GradScaler(device.type, enabled=enable_amp)
+            logging.info('reset GradScaler for PPO transition')
         best_perf = state.get('best_perf', best_perf)
         if is_ppo_checkpoint:
             steps = state.get('steps', 0)
@@ -251,6 +255,9 @@ def train():
             )
             shutil.copy(state_file, best_state_file)
 
+    # R3-E: carry forward Welford stats across iterations (avoids cold-start noise)
+    prev_welford = {'mean': 0.0, 'M2': 0.0, 'count': 0.0}
+
     for iteration in range(ppo_iter, num_iters):
         ppo_iter = iteration
         logging.info(f'=== PPO iteration {iteration} ===')
@@ -272,12 +279,12 @@ def train():
         writer.add_scalar('self_play/avg_pt', avg_pt, steps)
 
         # --- Training phase ---
-        # Create shared stats for this iteration (persists across epochs for consistent normalization)
+        # Create shared stats for this iteration, seeded from previous iteration (R3-E)
         manager = multiprocessing.Manager()
         shared_stats = {
-            'count': manager.Value('d', 0.0),
-            'mean': manager.Value('d', 0.0),
-            'M2': manager.Value('d', 0.0),
+            'count': manager.Value('d', prev_welford['count']),
+            'mean': manager.Value('d', prev_welford['mean']),
+            'M2': manager.Value('d', prev_welford['M2']),
             'lock': manager.Lock(),
         }
 
@@ -299,6 +306,9 @@ def train():
             advantage = advantage.to(dtype=torch.float32, device=device)
             bs = obs.shape[0]
             assert masks[range(bs), actions].all()
+
+            # R3-C: per-batch advantage normalization (standard PPO practice)
+            advantage = (advantage - advantage.mean()) / (advantage.std() + 1e-8)
 
             # Brain is frozen — compute features once, no gradient needed
             with torch.no_grad():
@@ -447,6 +457,8 @@ def train():
             writer.add_scalar('stats/count', w_count, steps)
             writer.add_scalar('stats/mean', w_mean, steps)
             writer.add_scalar('stats/std_dev', w_std, steps)
+        # R3-E: carry forward to next iteration
+        prev_welford = {'mean': w_mean, 'M2': w_M2, 'count': w_count}
 
         # Dynamic entropy targeting (Suphx Equation 3: alpha += beta * (H_target - H_bar))
         avg_entropy = iter_stats['entropy'] / bc
@@ -467,7 +479,10 @@ def train():
                 logging.warning(f'Rolling back to old policy, doubling entropy weight')
                 policy_net.load_state_dict(Old_policy_net.state_dict())
                 entropy_weight = min(entropy_weight * 2.0, ent_weight_max)
-                logging.warning(f'Entropy weight after doubling: {entropy_weight:.4f}')
+                # R3-G: reset optimizer to avoid momentum pointing toward collapsed trajectory
+                optimizer = optim.AdamW(param_groups, lr=1, weight_decay=0, betas=betas, eps=eps)
+                scheduler = LinearWarmUpCosineAnnealingLR(optimizer, **config['optim']['scheduler'])
+                logging.warning(f'Entropy weight after doubling: {entropy_weight:.4f} (optimizer reset)')
                 writer.add_scalar('entropy/rollback', 1, steps)
 
         writer.flush()
