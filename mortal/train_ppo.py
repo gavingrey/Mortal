@@ -67,16 +67,23 @@ def train():
     norm = config['resnet'].get('norm', 'GN')  # Default to GN for online training
     mortal = Brain(version=version, norm=norm, **{k: v for k, v in config['resnet'].items() if k != 'norm'}).to(device)
     policy_net = CategoricalPolicy().to(device)
-    all_models = (mortal, policy_net)
+
+    # Freeze Brain: PPO only trains the 274K policy head, not the 21M Brain
+    mortal.eval()
+    for param in mortal.parameters():
+        param.requires_grad = False
+
+    all_models = (policy_net,)
     if enable_compile:
+        mortal.compile()
         for m in all_models:
             m.compile()
 
     logging.info(f'version: {version}')
     logging.info(f'norm: {norm}')
     logging.info(f'obs shape: {obs_shape(version)}')
-    logging.info(f'mortal params: {parameter_count(mortal):,}')
-    logging.info(f'policy_net params: {parameter_count(policy_net):,}')
+    logging.info(f'brain FROZEN: {parameter_count(mortal):,} params (no gradients)')
+    logging.info(f'policy_net TRAINABLE: {parameter_count(policy_net):,} params')
 
     decay_params = []
     no_decay_params = []
@@ -137,8 +144,7 @@ def train():
 
     optimizer.zero_grad(set_to_none=True)
 
-    # Old policy for importance sampling ratio
-    Old_mortal = deepcopy(mortal).eval()
+    # Old policy for importance sampling ratio (Brain is frozen, only policy_net changes)
     Old_policy_net = deepcopy(policy_net).eval()
 
     if device.type == 'cuda':
@@ -165,8 +171,7 @@ def train():
 
     def run_test_play():
         stat = test_player.test_play(test_games // 4, mortal, policy_net, device)
-        mortal.train()
-        policy_net.train()
+        policy_net.train()  # mortal stays eval (frozen)
 
         avg_pt = stat.avg_pt([90, 45, 0, -135])
         better = avg_pt >= best_perf['avg_pt'] and stat.avg_rank <= best_perf['avg_rank']
@@ -234,16 +239,13 @@ def train():
         logging.info(f'=== PPO iteration {iteration} ===')
 
         # Sync old policy to current before self-play (ensures ratio starts at 1.0)
-        Old_mortal.load_state_dict(mortal.state_dict())
         Old_policy_net.load_state_dict(policy_net.state_dict())
 
         # --- Self-play phase ---
         logging.info('generating self-play games...')
-        mortal.eval()
-        policy_net.eval()
+        policy_net.eval()  # mortal is always eval (frozen)
         rankings, file_list = train_player.train_play(mortal, policy_net, device)
-        mortal.train()
-        policy_net.train()
+        policy_net.train()  # mortal stays eval (frozen)
 
         rankings_np = np.array(rankings)
         avg_rank = rankings_np @ np.arange(1, 5) / rankings_np.sum()
@@ -281,16 +283,20 @@ def train():
             bs = obs.shape[0]
             assert masks[range(bs), actions].all()
 
+            # Brain is frozen — compute features once, no gradient needed
+            with torch.no_grad():
+                with torch.autocast(device.type, enabled=enable_amp):
+                    phi = mortal(obs)
+
             # Old policy log probs (old policy is frozen for entire iteration)
             with torch.no_grad():
                 with torch.autocast(device.type, enabled=enable_amp):
-                    old_phi = Old_mortal(obs)
-                    old_probs = Old_policy_net(old_phi, masks)
+                    old_probs = Old_policy_net(phi, masks)
                     old_dist = Categorical(probs=old_probs)
                     old_log_prob = old_dist.log_prob(actions)
 
+            # Current policy (gradients flow through policy_net only)
             with torch.autocast(device.type, enabled=enable_amp):
-                phi = mortal(obs)
                 probs = policy_net(phi, masks)
                 dist = Categorical(probs=probs)
                 new_log_prob = dist.log_prob(actions)
