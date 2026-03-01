@@ -299,6 +299,7 @@ def train():
             'ratio_max': 0,
             'approx_kl': 0,
             'batch_count': 0,
+            'adv_std_before_norm': 0,
         }
 
         def train_batch(obs, actions, masks, advantage):
@@ -310,6 +311,9 @@ def train():
             advantage = advantage.to(dtype=torch.float32, device=device)
             bs = obs.shape[0]
             assert masks[range(bs), actions].all()
+
+            with torch.inference_mode():
+                iter_stats['adv_std_before_norm'] += advantage.std().item()
 
             # R3-C: per-batch advantage normalization (standard PPO practice)
             advantage = (advantage - advantage.mean()) / (advantage.std() + 1e-8)
@@ -389,6 +393,7 @@ def train():
                 policy_gradient = True,
                 shared_stats = shared_stats,
                 gamma = gamma,
+                pbrs_shanten = True,  # Step 0a: PBRS closed-form advantages
             )
             data_loader = iter(DataLoader(
                 dataset = file_data,
@@ -455,6 +460,7 @@ def train():
         writer.add_scalar('important_ratio/approx_kl', iter_stats['approx_kl'] / bc, steps)
         writer.add_scalar('hparam/lr', scheduler.get_last_lr()[0], steps)
         writer.add_scalar('ppo/epochs_used', epoch + 1, steps)
+        writer.add_scalar('advantage/std_before_norm', iter_stats['adv_std_before_norm'] / bc, steps)
 
         # Log Welford stats
         with shared_stats['lock']:

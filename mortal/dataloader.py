@@ -26,6 +26,7 @@ class FileDatasetsIter(IterableDataset):
         policy_gradient = False,
         shared_stats = None,
         gamma = 1.0,
+        pbrs_shanten = False,
     ):
         super().__init__()
         self.version = version
@@ -43,6 +44,7 @@ class FileDatasetsIter(IterableDataset):
         self.policy_gradient = policy_gradient
         self.shared_stats = shared_stats
         self.gamma = gamma
+        self.pbrs_shanten = pbrs_shanten
         self.iterator = None
 
         # Resolve suit_augment_mode: explicit setting overrides legacy flags
@@ -123,30 +125,38 @@ class FileDatasetsIter(IterableDataset):
                 assert len(kyoku_rewards) >= at_kyoku[-1] + 1
 
                 if self.policy_gradient:
-                    # Policy gradient mode: emit (obs, actions, masks, advantage)
-                    # Temporal discounting: weight = gamma^steps_to_done
-                    # Later decisions (fewer steps to done) get higher weight,
-                    # breaking the flat per-kyoku advantage that causes clip_loss≈0
-                    dones = game.take_dones()
-                    apply_gamma = game.take_apply_gamma()
+                    if self.pbrs_shanten:
+                        # Step 0a: V(s)=0 + PBRS closed-form
+                        # A(s_t) = shanten(s_t) + R_kyoku (unnormalized)
+                        shantens = game.take_shantens()
+                        for i in range(game_size):
+                            advantage = float(shantens[i]) + kyoku_rewards[at_kyoku[i]]
+                            entry = [obs[i], actions[i], masks[i], advantage]
+                            if self.oracle:
+                                entry.insert(1, invisible_obs[i])
+                            self.buffer.append(entry)
+                    else:
+                        # Original per-kyoku gamma-weighted advantage
+                        dones = game.take_dones()
+                        apply_gamma = game.take_apply_gamma()
 
-                    steps_to_done = np.zeros(game_size, dtype=np.int64)
-                    for i in reversed(range(game_size)):
-                        if not dones[i]:
-                            steps_to_done[i] = steps_to_done[i + 1] + int(apply_gamma[i])
+                        steps_to_done = np.zeros(game_size, dtype=np.int64)
+                        for i in reversed(range(game_size)):
+                            if not dones[i]:
+                                steps_to_done[i] = steps_to_done[i + 1] + int(apply_gamma[i])
 
-                    for i in range(game_size):
-                        weight = self.gamma ** steps_to_done[i]
-                        weighted_advantage = kyoku_rewards[at_kyoku[i]] * weight
-                        entry = [
-                            obs[i],
-                            actions[i],
-                            masks[i],
-                            weighted_advantage,
-                        ]
-                        if self.oracle:
-                            entry.insert(1, invisible_obs[i])
-                        self.buffer.append(entry)
+                        for i in range(game_size):
+                            weight = self.gamma ** steps_to_done[i]
+                            weighted_advantage = kyoku_rewards[at_kyoku[i]] * weight
+                            entry = [
+                                obs[i],
+                                actions[i],
+                                masks[i],
+                                weighted_advantage,
+                            ]
+                            if self.oracle:
+                                entry.insert(1, invisible_obs[i])
+                            self.buffer.append(entry)
                 else:
                     # DQN mode: emit (obs, actions, masks, steps_to_done, kyoku_rewards, player_ranks)
                     dones = game.take_dones()
