@@ -300,6 +300,8 @@ def train():
             'approx_kl': 0,
             'batch_count': 0,
             'adv_std_before_norm': 0,
+            'clip_fraction': 0,
+            'policy_grad_norm': 0,
         }
 
         def train_batch(obs, actions, masks, advantage):
@@ -364,6 +366,8 @@ def train():
                 iter_stats['ratio_max'] = max(iter_stats['ratio_max'], ratio.max().item())
                 approx_kl = ((ratio - 1) - (ratio.log())).mean().item()
                 iter_stats['approx_kl'] += approx_kl
+                clip_frac = ((ratio - 1.0).abs() > clip_ratio).float().mean().item()
+                iter_stats['clip_fraction'] += clip_frac
                 iter_stats['batch_count'] += 1
 
             steps += 1
@@ -371,7 +375,8 @@ def train():
                 if max_grad_norm > 0:
                     scaler.unscale_(optimizer)
                     params = chain.from_iterable(g['params'] for g in optimizer.param_groups)
-                    clip_grad_norm_(params, max_grad_norm)
+                    grad_norm = clip_grad_norm_(params, max_grad_norm)
+                    iter_stats['policy_grad_norm'] += grad_norm.item()
                 scaler.step(optimizer)
                 scaler.update()
                 optimizer.zero_grad(set_to_none=True)
@@ -461,6 +466,8 @@ def train():
         writer.add_scalar('hparam/lr', scheduler.get_last_lr()[0], steps)
         writer.add_scalar('ppo/epochs_used', epoch + 1, steps)
         writer.add_scalar('advantage/std_before_norm', iter_stats['adv_std_before_norm'] / bc, steps)
+        writer.add_scalar('ppo/clip_fraction', iter_stats['clip_fraction'] / bc, steps)
+        writer.add_scalar('ppo/policy_grad_norm', iter_stats['policy_grad_norm'] / bc, steps)
 
         # Log Welford stats
         with shared_stats['lock']:
@@ -503,13 +510,13 @@ def train():
         writer.flush()
         logging.info(
             f'iter {iteration}: steps={steps}, '
-            f'loss={iter_stats["ppo_loss"]/bc:.4f}, '
             f'clip_loss={iter_stats["clip_loss"]/bc:.4f}, '
-            f'ent_loss={iter_stats["entropy_loss"]/bc:.4f}, '
+            f'clip_frac={iter_stats["clip_fraction"]/bc:.4f}, '
             f'entropy={iter_stats["entropy"]/bc:.4f}, '
-            f'ratio={iter_stats["ratio_mean"]/bc:.4f}, '
             f'approx_kl={iter_stats["approx_kl"]/bc:.6f}, '
+            f'grad_norm={iter_stats["policy_grad_norm"]/bc:.4f}, '
             f'adv_std={iter_stats["adv_std_before_norm"]/bc:.4f}, '
+            f'ratio={iter_stats["ratio_mean"]/bc:.4f}, '
             f'ent_w={entropy_weight:.4f}, '
             f'epochs={epoch+1}/{ppo_epochs}, '
             f'batches={bc}'
