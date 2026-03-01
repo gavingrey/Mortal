@@ -509,6 +509,7 @@ def train():
             f'entropy={iter_stats["entropy"]/bc:.4f}, '
             f'ratio={iter_stats["ratio_mean"]/bc:.4f}, '
             f'approx_kl={iter_stats["approx_kl"]/bc:.6f}, '
+            f'adv_std={iter_stats["adv_std_before_norm"]/bc:.4f}, '
             f'ent_w={entropy_weight:.4f}, '
             f'epochs={epoch+1}/{ppo_epochs}, '
             f'batches={bc}'
