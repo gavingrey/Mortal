@@ -27,6 +27,7 @@ class FileDatasetsIter(IterableDataset):
         shared_stats = None,
         gamma = 1.0,
         pbrs_shanten = False,
+        gae_lambda = 0.95,
     ):
         super().__init__()
         self.version = version
@@ -45,6 +46,7 @@ class FileDatasetsIter(IterableDataset):
         self.shared_stats = shared_stats
         self.gamma = gamma
         self.pbrs_shanten = pbrs_shanten
+        self.gae_lambda = gae_lambda
         self.iterator = None
 
         # Resolve suit_augment_mode: explicit setting overrides legacy flags
@@ -126,12 +128,27 @@ class FileDatasetsIter(IterableDataset):
 
                 if self.policy_gradient:
                     if self.pbrs_shanten:
-                        # Step 0a: V(s)=0 + PBRS closed-form
-                        # A(s_t) = shanten(s_t) + R_kyoku (unnormalized)
+                        # Step 0c: GAE with PBRS shanten potential
+                        # delta_t = shanten(s_t) - shanten(s_{t+1}) for non-terminal
+                        # delta_T = shanten(s_T) + R_kyoku for terminal (Phi(terminal)=0)
+                        # GAE: A_t = delta_t + lambda * A_{t+1}
                         shantens = game.take_shantens()
+                        dones = game.take_dones()
+                        lam = self.gae_lambda
+
+                        advantages = np.zeros(game_size, dtype=np.float64)
+                        gae = 0.0
+                        for i in reversed(range(game_size)):
+                            if dones[i]:
+                                delta = kyoku_rewards[at_kyoku[i]] + float(shantens[i])
+                                gae = delta
+                            else:
+                                delta = float(shantens[i]) - float(shantens[i + 1])
+                                gae = delta + lam * gae
+                            advantages[i] = gae
+
                         for i in range(game_size):
-                            advantage = float(shantens[i]) + kyoku_rewards[at_kyoku[i]]
-                            entry = [obs[i], actions[i], masks[i], advantage]
+                            entry = [obs[i], actions[i], masks[i], advantages[i]]
                             if self.oracle:
                                 entry.insert(1, invisible_obs[i])
                             self.buffer.append(entry)

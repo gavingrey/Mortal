@@ -398,7 +398,8 @@ def train():
                 policy_gradient = True,
                 shared_stats = shared_stats,
                 gamma = gamma,
-                pbrs_shanten = True,  # Step 0a: PBRS closed-form advantages
+                pbrs_shanten = True,  # Step 0c: GAE with PBRS shanten
+                gae_lambda = 0.95,
             )
             data_loader = iter(DataLoader(
                 dataset = file_data,
