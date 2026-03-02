@@ -61,8 +61,9 @@ def train():
     awr_clip = policy_cfg.get('awr_clip', 100)
     entropy_weight = policy_cfg.get('entropy_weight', 0.05)
 
+    oracle = config['dataset'].get('oracle', False)
     norm = config['resnet'].get('norm', 'BN')
-    mortal = Brain(version=version, norm=norm, **{k: v for k, v in config['resnet'].items() if k != 'norm'}).to(device)
+    mortal = Brain(version=version, norm=norm, is_oracle=oracle, **{k: v for k, v in config['resnet'].items() if k != 'norm'}).to(device)
     policy_net = CategoricalPolicy().to(device)
     all_models = (mortal, policy_net)
     if enable_compile:
@@ -71,6 +72,7 @@ def train():
 
     logging.info(f'version: {version}')
     logging.info(f'norm: {norm}')
+    logging.info(f'oracle: {oracle}')
     logging.info(f'obs shape: {obs_shape(version)}')
     logging.info(f'mortal params: {parameter_count(mortal):,}')
     logging.info(f'policy_net params: {parameter_count(policy_net):,}')
@@ -194,6 +196,7 @@ def train():
             version = version,
             file_list = file_list,
             pts = pts,
+            oracle = oracle,
             file_batch_size = file_batch_size,
             reserve_ratio = reserve_ratio,
             player_names = player_names,
@@ -216,25 +219,28 @@ def train():
         ))
 
         remaining_obs = []
+        remaining_invisible_obs = []
         remaining_actions = []
         remaining_masks = []
         remaining_advantages = []
         remaining_bs = 0
         pb = tqdm(total=save_every, desc='AWR', initial=steps % save_every)
 
-        def train_batch(obs, actions, masks, advantage):
+        def train_batch(obs, invisible_obs, actions, masks, advantage):
             nonlocal steps
             nonlocal idx
             nonlocal pb
 
             obs = obs.to(dtype=torch.float32, device=device)
+            if invisible_obs is not None:
+                invisible_obs = invisible_obs.to(dtype=torch.float32, device=device)
             actions = actions.to(dtype=torch.int64, device=device)
             masks = masks.to(dtype=torch.bool, device=device)
             advantage = advantage.to(dtype=torch.float32, device=device)
             assert masks[range(batch_size), actions].all()
 
             with torch.autocast(device.type, enabled=enable_amp):
-                phi = mortal(obs)
+                phi = mortal(obs, invisible_obs)
                 probs = policy_net(phi, masks)
                 dist = Categorical(probs=probs)
                 log_prob = dist.log_prob(actions)
@@ -376,20 +382,28 @@ def train():
                         shutil.copy(state_file, best_state_file)
                 pb = tqdm(total=save_every, desc='AWR')
 
-        for obs, actions, masks, advantage in data_loader:
+        for batch in data_loader:
+            if oracle:
+                obs, invisible_obs, actions, masks, advantage = batch
+            else:
+                obs, actions, masks, advantage = batch
+                invisible_obs = None
             bs = obs.shape[0]
             if bs != batch_size:
                 remaining_obs.append(obs)
+                if invisible_obs is not None:
+                    remaining_invisible_obs.append(invisible_obs)
                 remaining_actions.append(actions)
                 remaining_masks.append(masks)
                 remaining_advantages.append(advantage)
                 remaining_bs += bs
                 continue
-            train_batch(obs, actions, masks, advantage)
+            train_batch(obs, invisible_obs, actions, masks, advantage)
 
         remaining_batches = remaining_bs // batch_size
         if remaining_batches > 0:
             obs = torch.cat(remaining_obs, dim=0)
+            invisible_obs = torch.cat(remaining_invisible_obs, dim=0) if remaining_invisible_obs else None
             actions = torch.cat(remaining_actions, dim=0)
             masks = torch.cat(remaining_masks, dim=0)
             advantage = torch.cat(remaining_advantages, dim=0)
@@ -398,6 +412,7 @@ def train():
             while end <= remaining_bs:
                 train_batch(
                     obs[start:end],
+                    invisible_obs[start:end] if invisible_obs is not None else None,
                     actions[start:end],
                     masks[start:end],
                     advantage[start:end],

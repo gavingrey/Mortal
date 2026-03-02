@@ -89,7 +89,7 @@ class MortalEngine:
                     latent = mu
                 q_out = self.dqn(latent, masks)
             case 2 | 3 | 4:
-                phi = self.brain(obs)
+                phi = self.brain(obs, invisible_obs)
                 q_out = self.dqn(phi, masks)
 
         if self.is_policy:

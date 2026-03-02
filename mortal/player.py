@@ -54,7 +54,7 @@ class TestPlayer:
         engine_chal = MortalEngine(
             mortal,
             action_head,
-            is_oracle = False,
+            is_oracle = getattr(mortal, 'is_oracle', False),
             version = self.chal_version,
             device = device,
             enable_amp = True,
