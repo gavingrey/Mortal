@@ -237,7 +237,19 @@ def train():
             actions = actions.to(dtype=torch.int64, device=device)
             masks = masks.to(dtype=torch.bool, device=device)
             advantage = advantage.to(dtype=torch.float32, device=device)
-            assert masks[range(batch_size), actions].all()
+            valid = masks[range(len(actions)), actions]
+            if not valid.all():
+                n_bad = (~valid).sum().item()
+                logging.warning(f'skipping {n_bad}/{len(actions)} samples with invalid action-mask pairs')
+                valid_idx = valid.nonzero(as_tuple=True)[0]
+                obs = obs[valid_idx]
+                if invisible_obs is not None:
+                    invisible_obs = invisible_obs[valid_idx]
+                actions = actions[valid_idx]
+                masks = masks[valid_idx]
+                advantage = advantage[valid_idx]
+                if len(actions) == 0:
+                    return
 
             with torch.autocast(device.type, enabled=enable_amp):
                 phi = mortal(obs, invisible_obs)
