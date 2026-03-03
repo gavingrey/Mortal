@@ -54,6 +54,7 @@ def train():
     betas = config['optim']['betas']
     weight_decay = config['optim']['weight_decay']
     max_grad_norm = config['optim']['max_grad_norm']
+    max_steps = config['optim']['scheduler']['max_steps']
 
     # Policy config
     policy_cfg = config['policy']
@@ -103,6 +104,8 @@ def train():
     }
 
     steps = 0
+    shuffle_seed = random.randint(0, 2**63)
+    files_consumed = 0
     state_file = config['control']['state_file']
     best_state_file = config['control']['best_state_file']
     if path.exists(state_file):
@@ -131,6 +134,8 @@ def train():
             scaler.load_state_dict(state['scaler'])
         best_perf = state.get('best_perf', best_perf)
         steps = state.get('steps', 0)
+        shuffle_seed = state.get('shuffle_seed', shuffle_seed)
+        files_consumed = state.get('files_consumed', 0)
 
     optimizer.zero_grad(set_to_none=True)
 
@@ -190,8 +195,15 @@ def train():
         before_next_test_play = (test_every - steps % test_every) % test_every
         logging.info(f'total steps: {steps:,} (~{before_next_test_play:,})')
 
-        if num_workers > 1:
-            random.shuffle(file_list)
+        # Deterministic shuffle for resumability
+        rng = random.Random(shuffle_seed)
+        rng.shuffle(file_list)
+
+        # Skip already-processed files on resume
+        if files_consumed > 0:
+            logging.info(f'resuming: skipping {files_consumed:,} already-processed files, {len(file_list) - files_consumed:,} remaining')
+            file_list = file_list[files_consumed:]
+
         file_data = FileDatasetsIter(
             version = version,
             file_list = file_list,
@@ -204,6 +216,7 @@ def train():
             enable_augmentation = enable_augmentation,
             augmented_first = augmented_first,
             suit_augment_mode = suit_augment_mode,
+            pre_shuffled = True,
             policy_gradient = True,
             shared_stats = shared_stats,
         )
@@ -321,6 +334,8 @@ def train():
                     'scheduler': scheduler.state_dict(),
                     'scaler': scaler.state_dict(),
                     'steps': steps,
+                    'shuffle_seed': shuffle_seed,
+                    'files_consumed': int(steps * batch_size / 1402),
                     'timestamp': datetime.now().timestamp(),
                     'best_perf': best_perf,
                     'config': config,
@@ -411,6 +426,8 @@ def train():
                 remaining_bs += bs
                 continue
             train_batch(obs, invisible_obs, actions, masks, advantage)
+            if steps >= max_steps:
+                break
 
         remaining_batches = remaining_bs // batch_size
         if remaining_batches > 0:
@@ -429,6 +446,8 @@ def train():
                     masks[start:end],
                     advantage[start:end],
                 )
+                if steps >= max_steps:
+                    break
                 start = end
                 end += batch_size
         pb.close()

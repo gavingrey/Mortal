@@ -23,6 +23,7 @@ class FileDatasetsIter(IterableDataset):
         augmented_first = False,
         suit_augment_mode = None,
         include_shanten = False,
+        pre_shuffled = False,
         policy_gradient = False,
         shared_stats = None,
         gamma = 1.0,
@@ -42,6 +43,7 @@ class FileDatasetsIter(IterableDataset):
         self.enable_augmentation = enable_augmentation
         self.augmented_first = augmented_first
         self.include_shanten = include_shanten
+        self.pre_shuffled = pre_shuffled
         self.policy_gradient = policy_gradient
         self.shared_stats = shared_stats
         self.gamma = gamma
@@ -74,8 +76,9 @@ class FileDatasetsIter(IterableDataset):
                 yield from self.load_files()
 
     def load_files(self, augmented=False, random_suit_perm=False):
-        # shuffle the file list for each epoch
-        random.shuffle(self.file_list)
+        # shuffle the file list for each epoch (skip if pre-shuffled for resumability)
+        if not self.pre_shuffled:
+            random.shuffle(self.file_list)
 
         self.loader = GameplayLoader(
             version = self.version,
