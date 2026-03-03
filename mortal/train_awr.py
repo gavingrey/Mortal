@@ -264,6 +264,17 @@ def train():
                 if len(actions) == 0:
                     return
 
+            # Check for NaN/Inf in inputs (diagnose async CUDA errors)
+            if torch.isnan(obs).any() or torch.isinf(obs).any():
+                logging.error(f'NaN/Inf in obs at step {steps}! nan={torch.isnan(obs).sum()}, inf={torch.isinf(obs).sum()}')
+                return
+            if invisible_obs is not None and (torch.isnan(invisible_obs).any() or torch.isinf(invisible_obs).any()):
+                logging.error(f'NaN/Inf in invisible_obs at step {steps}! nan={torch.isnan(invisible_obs).sum()}, inf={torch.isinf(invisible_obs).sum()}')
+                return
+            if torch.isnan(advantage).any() or torch.isinf(advantage).any():
+                logging.error(f'NaN/Inf in advantage at step {steps}! nan={torch.isnan(advantage).sum()}, inf={torch.isinf(advantage).sum()}')
+                return
+
             with torch.autocast(device.type, enabled=enable_amp):
                 phi = mortal(obs, invisible_obs)
                 probs = policy_net(phi, masks)
@@ -280,6 +291,14 @@ def train():
                 entropy_loss = -entropy_weight * entropy
 
                 loss = awr_loss + entropy_loss
+
+            # Check for NaN/Inf in loss (diagnose async CUDA errors)
+            if torch.isnan(loss) or torch.isinf(loss):
+                logging.error(f'NaN/Inf loss at step {steps}! awr_loss={awr_loss.item()}, entropy={entropy.item()}, loss={loss.item()}')
+                logging.error(f'  phi: nan={torch.isnan(phi).sum()}, inf={torch.isinf(phi).sum()}, range=[{phi.min():.4f}, {phi.max():.4f}]')
+                logging.error(f'  probs: nan={torch.isnan(probs).sum()}, range=[{probs.min():.6f}, {probs.max():.6f}]')
+                logging.error(f'  log_prob: nan={torch.isnan(log_prob).sum()}, range=[{log_prob.min():.4f}, {log_prob.max():.4f}]')
+                return
 
             scaler.scale(loss / opt_step_every).backward()
 
