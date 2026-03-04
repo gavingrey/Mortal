@@ -265,7 +265,7 @@ def train():
                     return
 
             try:
-                with torch.autocast(device.type, enabled=enable_amp):
+                with torch.autocast(device.type, enabled=enable_amp, dtype=torch.bfloat16):
                     phi = mortal(obs, invisible_obs)
                     probs = policy_net(phi, masks)
                     dist = Categorical(probs=probs)
@@ -283,9 +283,6 @@ def train():
                     loss = awr_loss + entropy_loss
 
                 scaler.scale(loss / opt_step_every).backward()
-                # Sync after backward to prevent WSL2 CUDA async race condition
-                # (CUDA_LAUNCH_BLOCKING=1 prevents the crash entirely; this is the targeted fix)
-                torch.cuda.synchronize()
 
                 with torch.inference_mode():
                     stats['awr_loss'] += awr_loss.item()
