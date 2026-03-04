@@ -283,6 +283,9 @@ def train():
                     loss = awr_loss + entropy_loss
 
                 scaler.scale(loss / opt_step_every).backward()
+                # Sync after backward to prevent WSL2 CUDA async race condition
+                # (CUDA_LAUNCH_BLOCKING=1 prevents the crash entirely; this is the targeted fix)
+                torch.cuda.synchronize()
 
                 with torch.inference_mode():
                     stats['awr_loss'] += awr_loss.item()
