@@ -265,7 +265,7 @@ def train():
                     return
 
             try:
-                with torch.autocast(device.type, enabled=enable_amp, dtype=torch.bfloat16):
+                with torch.autocast(device.type, enabled=enable_amp):
                     phi = mortal(obs, invisible_obs)
                     probs = policy_net(phi, masks)
                     dist = Categorical(probs=probs)
