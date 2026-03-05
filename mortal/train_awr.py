@@ -264,72 +264,28 @@ def train():
                 if len(actions) == 0:
                     return
 
-            try:
-                with torch.autocast(device.type, enabled=enable_amp):
-                    phi = mortal(obs, invisible_obs)
-                    probs = policy_net(phi, masks)
-                    dist = Categorical(probs=probs)
-                    log_prob = dist.log_prob(actions)
+            with torch.autocast(device.type, enabled=enable_amp):
+                phi = mortal(obs, invisible_obs)
+                probs = policy_net(phi, masks)
+                dist = Categorical(probs=probs)
+                log_prob = dist.log_prob(actions)
 
-                    exp_adv = torch.exp(advantage / awr_beta)
-                    if awr_clip is not None:
-                        exp_adv = torch.clamp(exp_adv, max=awr_clip)
+                exp_adv = torch.exp(advantage / awr_beta)
+                if awr_clip is not None:
+                    exp_adv = torch.clamp(exp_adv, max=awr_clip)
 
-                    awr_loss = -(exp_adv * log_prob).mean()
+                awr_loss = -(exp_adv * log_prob).mean()
 
-                    entropy = dist.entropy().mean()
-                    entropy_loss = -entropy_weight * entropy
+                entropy = dist.entropy().mean()
+                entropy_loss = -entropy_weight * entropy
 
-                    loss = awr_loss + entropy_loss
+                loss = awr_loss + entropy_loss
 
-                scaler.scale(loss / opt_step_every).backward()
+            scaler.scale(loss / opt_step_every).backward()
 
-                with torch.inference_mode():
-                    stats['awr_loss'] += awr_loss.item()
-                    stats['entropy'] += entropy.item()
-
-            except RuntimeError as e:
-                if 'CUDA' not in str(e):
-                    raise
-                # Force sync to surface the real error location
-                torch.cuda.synchronize()
-                logging.error(f'=== CUDA ERROR at step {steps} ===')
-                logging.error(f'Error: {e}')
-                # Dump input tensor diagnostics
-                logging.error(f'obs: shape={list(obs.shape)}, dtype={obs.dtype}, '
-                              f'nan={torch.isnan(obs).sum().item()}, inf={torch.isinf(obs).sum().item()}, '
-                              f'range=[{obs.min().item():.4f}, {obs.max().item():.4f}]')
-                if invisible_obs is not None:
-                    logging.error(f'invisible_obs: shape={list(invisible_obs.shape)}, dtype={invisible_obs.dtype}, '
-                                  f'nan={torch.isnan(invisible_obs).sum().item()}, inf={torch.isinf(invisible_obs).sum().item()}, '
-                                  f'range=[{invisible_obs.min().item():.4f}, {invisible_obs.max().item():.4f}]')
-                logging.error(f'advantage: nan={torch.isnan(advantage).sum().item()}, inf={torch.isinf(advantage).sum().item()}, '
-                              f'range=[{advantage.min().item():.4f}, {advantage.max().item():.4f}]')
-                # Dump model weight health
-                nan_params, inf_params = 0, 0
-                for name, p in mortal.named_parameters():
-                    if torch.isnan(p).any():
-                        nan_params += 1
-                        logging.error(f'  NaN in param: {name}, count={torch.isnan(p).sum().item()}')
-                    if torch.isinf(p).any():
-                        inf_params += 1
-                        logging.error(f'  Inf in param: {name}, count={torch.isinf(p).sum().item()}')
-                logging.error(f'Model weights: {nan_params} params with NaN, {inf_params} params with Inf')
-                # Dump GradScaler state
-                logging.error(f'GradScaler: scale={scaler.get_scale()}, growth_tracker={scaler._growth_tracker}')
-                # Save crash tensors for offline analysis
-                crash_file = state_file.replace('.pth', '_crash_dump.pth')
-                torch.save({
-                    'step': steps,
-                    'obs': obs.cpu(),
-                    'invisible_obs': invisible_obs.cpu() if invisible_obs is not None else None,
-                    'actions': actions.cpu(),
-                    'masks': masks.cpu(),
-                    'advantage': advantage.cpu(),
-                    'error': str(e),
-                }, crash_file)
-                logging.error(f'Crash tensors saved to {crash_file}')
-                raise
+            with torch.inference_mode():
+                stats['awr_loss'] += awr_loss.item()
+                stats['entropy'] += entropy.item()
 
             steps += 1
             idx += 1
