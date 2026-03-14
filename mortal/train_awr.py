@@ -8,6 +8,7 @@ def train():
     import json
     import shutil
     import random
+    import sys
     import torch
     from os import path
     from glob import glob
@@ -42,6 +43,16 @@ def train():
     enable_amp = config['control']['enable_amp']
     enable_compile = config['control']['enable_compile']
 
+    # AMP dtype: BF16 if available, else FP16
+    amp_dtype_str = config['control'].get('amp_dtype', 'fp16')
+    if amp_dtype_str == 'bf16':
+        amp_dtype = torch.bfloat16
+        # BF16 has full FP32 dynamic range, no GradScaler needed
+        use_grad_scaler = False
+    else:
+        amp_dtype = torch.float16
+        use_grad_scaler = True
+
     pts = config['env']['pts']
     file_batch_size = config['dataset']['file_batch_size']
     reserve_ratio = config['dataset']['reserve_ratio']
@@ -55,12 +66,19 @@ def train():
     weight_decay = config['optim']['weight_decay']
     max_grad_norm = config['optim']['max_grad_norm']
     max_steps = config['optim']['scheduler']['max_steps']
+    prefetch_factor = config['dataset'].get('prefetch_factor', 3)
 
     # Policy config
     policy_cfg = config['policy']
     awr_beta = policy_cfg['awr_beta']
     awr_clip = policy_cfg.get('awr_clip', 100)
     entropy_weight = policy_cfg.get('entropy_weight', 0.05)
+
+    # Precomputed data config
+    use_precomputed = config['dataset'].get('use_precomputed', False)
+    precomputed_dir = config['dataset'].get('precomputed_dir', '')
+    precomputed_rewards_file = config['dataset'].get('precomputed_rewards_file', '')
+    gamma = config['dataset'].get('gamma', 1.0)
 
     oracle = config['dataset'].get('oracle', False)
     norm = config['resnet'].get('norm', 'BN')
@@ -74,9 +92,14 @@ def train():
     logging.info(f'version: {version}')
     logging.info(f'norm: {norm}')
     logging.info(f'oracle: {oracle}')
+    logging.info(f'amp_dtype: {amp_dtype_str}')
     logging.info(f'obs shape: {obs_shape(version)}')
     logging.info(f'mortal params: {parameter_count(mortal):,}')
     logging.info(f'policy_net params: {parameter_count(policy_net):,}')
+    if use_precomputed:
+        logging.info(f'using precomputed shards from: {precomputed_dir}')
+    elif precomputed_rewards_file:
+        logging.info(f'using precomputed rewards from: {precomputed_rewards_file}')
 
     decay_params = []
     no_decay_params = []
@@ -96,7 +119,7 @@ def train():
     ]
     optimizer = optim.AdamW(param_groups, lr=1, weight_decay=0, betas=betas, eps=eps)
     scheduler = LinearWarmUpCosineAnnealingLR(optimizer, **config['optim']['scheduler'])
-    scaler = GradScaler(device.type, enabled=enable_amp)
+    scaler = GradScaler(device.type, enabled=enable_amp and use_grad_scaler)
     test_player = TestPlayer()
     best_perf = {
         'avg_rank': 4.,
@@ -139,14 +162,25 @@ def train():
 
     optimizer.zero_grad(set_to_none=True)
 
-    # Create shared stats for Welford normalization across DataLoader workers
-    manager = multiprocessing.Manager()
-    shared_stats = {
-        'count': manager.Value('d', 0.0),
-        'mean': manager.Value('d', 0.0),
-        'M2': manager.Value('d', 0.0),
-        'lock': manager.Lock(),
-    }
+    # Load precomputed rewards if configured
+    precomputed_rewards = None
+    if precomputed_rewards_file and path.exists(precomputed_rewards_file):
+        logging.info(f'loading precomputed rewards from {precomputed_rewards_file}...')
+        precomputed_rewards = torch.load(precomputed_rewards_file, weights_only=False, map_location='cpu')
+        logging.info(f'precomputed rewards: {len(precomputed_rewards["rewards"]):,} files, '
+                     f'mean={precomputed_rewards["global_mean"]:.6f}, '
+                     f'std={precomputed_rewards["global_std"]:.6f}')
+
+    # Create shared stats for Welford normalization (only when not using precomputed)
+    shared_stats = None
+    if not use_precomputed and precomputed_rewards is None:
+        manager = multiprocessing.Manager()
+        shared_stats = {
+            'count': manager.Value('d', 0.0),
+            'mean': manager.Value('d', 0.0),
+            'M2': manager.Value('d', 0.0),
+            'lock': manager.Lock(),
+        }
 
     if device.type == 'cuda':
         logging.info(f'device: {device} ({torch.cuda.get_device_name(device)})')
@@ -164,72 +198,115 @@ def train():
         nonlocal steps
         nonlocal idx
 
-        player_names_set = set()
-        for filename in config['dataset']['player_names_files']:
-            with open(filename) as f:
-                player_names_set.update(filtered_trimmed_lines(f))
-        player_names = list(player_names_set)
-        logging.info(f'loaded {len(player_names):,} players')
+        if use_precomputed:
+            # Precomputed shard path — bypasses Rust FFI + GRP entirely
+            scripts_dir = config['dataset'].get('scripts_dir', '')
+            if scripts_dir and scripts_dir not in sys.path:
+                sys.path.insert(0, scripts_dir)
+            from precomputed_dataset import PrecomputedAWRDataset, precomputed_worker_init_fn
 
-        file_index = config['dataset']['file_index']
-        if path.exists(file_index):
-            index = torch.load(file_index, weights_only=True)
-            file_list = index['file_list']
+            # Load reward stats
+            reward_stats_path = path.join(precomputed_dir, 'reward_stats.pt')
+            if path.exists(reward_stats_path):
+                reward_stats = torch.load(reward_stats_path, weights_only=True, map_location='cpu')
+                global_mean = float(reward_stats['global_mean'])
+                global_std = float(reward_stats['global_std'])
+                logging.info(f'reward stats: mean={global_mean:.6f}, std={global_std:.6f}')
+            else:
+                logging.warning(f'no reward_stats.pt in {precomputed_dir}, using mean=0 std=1')
+                global_mean = 0.0
+                global_std = 1.0
+
+            file_data = PrecomputedAWRDataset(
+                shard_dir=precomputed_dir,
+                oracle=oracle,
+                gamma=gamma,
+                global_mean=global_mean,
+                global_std=global_std,
+                suit_augment_mode=suit_augment_mode or 'random',
+                num_epochs=num_epochs,
+            )
+            data_loader = iter(DataLoader(
+                dataset=file_data,
+                batch_size=batch_size,
+                drop_last=enable_compile,  # avoid recompilation on remainder batches
+                num_workers=num_workers,
+                pin_memory=True,
+                prefetch_factor=prefetch_factor if num_workers > 0 else None,
+                persistent_workers=num_workers > 0,
+                worker_init_fn=precomputed_worker_init_fn,
+            ))
+            is_uint8_input = True
         else:
-            logging.info('building file index...')
-            file_list = []
-            for pat in config['dataset']['globs']:
-                file_list.extend(glob(pat, recursive=True))
-            if len(player_names_set) > 0:
-                filtered = []
-                for filename in tqdm(file_list, unit='file'):
-                    with gzip.open(filename, 'rt') as f:
-                        start = json.loads(next(f))
-                        if not set(start['names']).isdisjoint(player_names_set):
-                            filtered.append(filename)
-                file_list = filtered
-            file_list.sort(reverse=True)
-            torch.save({'file_list': file_list}, file_index)
-        logging.info(f'file list size: {len(file_list):,}')
+            player_names_set = set()
+            for filename in config['dataset']['player_names_files']:
+                with open(filename) as f:
+                    player_names_set.update(filtered_trimmed_lines(f))
+            player_names = list(player_names_set)
+            logging.info(f'loaded {len(player_names):,} players')
+
+            file_index = config['dataset']['file_index']
+            if path.exists(file_index):
+                index = torch.load(file_index, weights_only=True)
+                file_list = index['file_list']
+            else:
+                logging.info('building file index...')
+                file_list = []
+                for pat in config['dataset']['globs']:
+                    file_list.extend(glob(pat, recursive=True))
+                if len(player_names_set) > 0:
+                    filtered = []
+                    for filename in tqdm(file_list, unit='file'):
+                        with gzip.open(filename, 'rt') as f:
+                            start = json.loads(next(f))
+                            if not set(start['names']).isdisjoint(player_names_set):
+                                filtered.append(filename)
+                    file_list = filtered
+                file_list.sort(reverse=True)
+                torch.save({'file_list': file_list}, file_index)
+            logging.info(f'file list size: {len(file_list):,}')
+
+            # Deterministic shuffle for resumability
+            rng = random.Random(shuffle_seed)
+            rng.shuffle(file_list)
+
+            # Skip already-processed files on resume
+            if files_consumed > 0:
+                logging.info(f'resuming: skipping {files_consumed:,} already-processed files, {len(file_list) - files_consumed:,} remaining')
+                file_list = file_list[files_consumed:]
+
+            file_data = FileDatasetsIter(
+                version = version,
+                file_list = file_list,
+                pts = pts,
+                oracle = oracle,
+                file_batch_size = file_batch_size,
+                reserve_ratio = reserve_ratio,
+                player_names = player_names,
+                num_epochs = num_epochs,
+                enable_augmentation = enable_augmentation,
+                augmented_first = augmented_first,
+                suit_augment_mode = suit_augment_mode,
+                pre_shuffled = True,
+                policy_gradient = True,
+                shared_stats = shared_stats,
+                gamma = gamma,
+                precomputed_rewards = precomputed_rewards,
+            )
+            data_loader = iter(DataLoader(
+                dataset = file_data,
+                batch_size = batch_size,
+                drop_last = enable_compile,  # avoid recompilation on remainder batches
+                num_workers = num_workers,
+                pin_memory = True,
+                prefetch_factor = prefetch_factor if num_workers > 0 else None,
+                persistent_workers = num_workers > 0,
+                worker_init_fn = worker_init_fn,
+            ))
+            is_uint8_input = False
 
         before_next_test_play = (test_every - steps % test_every) % test_every
         logging.info(f'total steps: {steps:,} (~{before_next_test_play:,})')
-
-        # Deterministic shuffle for resumability
-        rng = random.Random(shuffle_seed)
-        rng.shuffle(file_list)
-
-        # Skip already-processed files on resume
-        if files_consumed > 0:
-            logging.info(f'resuming: skipping {files_consumed:,} already-processed files, {len(file_list) - files_consumed:,} remaining')
-            file_list = file_list[files_consumed:]
-
-        file_data = FileDatasetsIter(
-            version = version,
-            file_list = file_list,
-            pts = pts,
-            oracle = oracle,
-            file_batch_size = file_batch_size,
-            reserve_ratio = reserve_ratio,
-            player_names = player_names,
-            num_epochs = num_epochs,
-            enable_augmentation = enable_augmentation,
-            augmented_first = augmented_first,
-            suit_augment_mode = suit_augment_mode,
-            pre_shuffled = True,
-            policy_gradient = True,
-            shared_stats = shared_stats,
-        )
-        data_loader = iter(DataLoader(
-            dataset = file_data,
-            batch_size = batch_size,
-            drop_last = False,
-            num_workers = num_workers,
-            pin_memory = True,
-            prefetch_factor = 3 if num_workers > 0 else None,
-            persistent_workers = num_workers > 0,
-            worker_init_fn = worker_init_fn,
-        ))
 
         remaining_obs = []
         remaining_invisible_obs = []
@@ -244,9 +321,15 @@ def train():
             nonlocal idx
             nonlocal pb
 
-            obs = obs.to(dtype=torch.float32, device=device)
-            if invisible_obs is not None:
-                invisible_obs = invisible_obs.to(dtype=torch.float32, device=device)
+            # Handle uint8 inputs from precomputed shards
+            if is_uint8_input and obs.dtype == torch.uint8:
+                obs = obs.to(device=device).float() / 255.0
+                if invisible_obs is not None:
+                    invisible_obs = invisible_obs.to(device=device).float() / 255.0
+            else:
+                obs = obs.to(dtype=torch.float32, device=device)
+                if invisible_obs is not None:
+                    invisible_obs = invisible_obs.to(dtype=torch.float32, device=device)
             actions = actions.to(dtype=torch.int64, device=device)
             masks = masks.to(dtype=torch.bool, device=device)
             advantage = advantage.to(dtype=torch.float32, device=device)
@@ -264,7 +347,7 @@ def train():
                 if len(actions) == 0:
                     return
 
-            with torch.autocast(device.type, enabled=enable_amp):
+            with torch.autocast(device.type, dtype=amp_dtype, enabled=enable_amp):
                 phi = mortal(obs, invisible_obs)
                 probs = policy_net(phi, masks)
                 dist = Categorical(probs=probs)
@@ -307,16 +390,17 @@ def train():
                 writer.add_scalar('entropy/entropy', stats['entropy'] / save_every, steps)
                 writer.add_scalar('hparam/lr', scheduler.get_last_lr()[0], steps)
 
-                # Log Welford stats
-                with shared_stats['lock']:
-                    w_count = shared_stats['count'].value
-                    w_mean = shared_stats['mean'].value
-                    w_M2 = shared_stats['M2'].value
-                if w_count > 0:
-                    w_std = (w_M2 / w_count) ** 0.5
-                    writer.add_scalar('stats/count', w_count, steps)
-                    writer.add_scalar('stats/mean', w_mean, steps)
-                    writer.add_scalar('stats/std_dev', w_std, steps)
+                # Log Welford stats (only in live pipeline mode)
+                if shared_stats is not None:
+                    with shared_stats['lock']:
+                        w_count = shared_stats['count'].value
+                        w_mean = shared_stats['mean'].value
+                        w_M2 = shared_stats['M2'].value
+                    if w_count > 0:
+                        w_std = (w_M2 / w_count) ** 0.5
+                        writer.add_scalar('stats/count', w_count, steps)
+                        writer.add_scalar('stats/mean', w_mean, steps)
+                        writer.add_scalar('stats/std_dev', w_std, steps)
 
                 writer.flush()
 

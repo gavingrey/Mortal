@@ -1,4 +1,6 @@
 import random
+import time
+import logging
 import torch
 import numpy as np
 from torch.utils.data import IterableDataset
@@ -29,6 +31,7 @@ class FileDatasetsIter(IterableDataset):
         gamma = 1.0,
         pbrs_shanten = False,
         gae_lambda = 0.95,
+        precomputed_rewards = None,
     ):
         super().__init__()
         self.version = version
@@ -49,6 +52,7 @@ class FileDatasetsIter(IterableDataset):
         self.gamma = gamma
         self.pbrs_shanten = pbrs_shanten
         self.gae_lambda = gae_lambda
+        self.precomputed_rewards = precomputed_rewards
         self.iterator = None
 
         # Resolve suit_augment_mode: explicit setting overrides legacy flags
@@ -61,10 +65,13 @@ class FileDatasetsIter(IterableDataset):
 
     def build_iter(self):
         # do not put it in __init__, it won't work on Windows
-        self.grp = GRP(**config['grp']['network'])
-        grp_state = torch.load(config['grp']['state_file'], weights_only=True, map_location=torch.device('cpu'))
-        self.grp.load_state_dict(grp_state['model'])
-        self.reward_calc = RewardCalculator(self.grp, self.pts, shared_stats=self.shared_stats)
+        if self.precomputed_rewards is not None:
+            self.reward_calc = None
+        else:
+            self.grp = GRP(**config['grp']['network'])
+            grp_state = torch.load(config['grp']['state_file'], weights_only=True, map_location=torch.device('cpu'))
+            self.grp.load_state_dict(grp_state['model'])
+            self.reward_calc = RewardCalculator(self.grp, self.pts, shared_stats=self.shared_stats)
 
         for _ in range(self.num_epochs):
             if self.suit_augment_mode == 'random':
@@ -107,8 +114,12 @@ class FileDatasetsIter(IterableDataset):
         self.buffer.clear()
 
     def populate_buffer(self, file_list):
+        t0 = time.monotonic()
         data = self.loader.load_gz_log_files(file_list)
-        for file in data:
+        t1 = time.monotonic()
+
+        entries = 0
+        for file_idx, file in enumerate(data):
             for game in file:
                 # per move
                 obs = game.take_obs()
@@ -123,10 +134,22 @@ class FileDatasetsIter(IterableDataset):
                 player_id = game.take_player_id()
 
                 game_size = len(obs)
+                entries += game_size
 
-                grp_feature = grp.take_feature()
-                rank_by_player = grp.take_rank_by_player()
-                kyoku_rewards = self.reward_calc.calc_delta_pt(player_id, grp_feature, rank_by_player)
+                if self.precomputed_rewards is not None:
+                    import os
+                    pr = self.precomputed_rewards
+                    basename = os.path.basename(file_list[file_idx])
+                    raw_rewards = pr['rewards'].get(basename, {}).get(int(player_id))
+                    if raw_rewards is not None:
+                        kyoku_rewards = (raw_rewards - pr['global_mean']) / pr['global_std']
+                    else:
+                        logging.warning(f'precomputed rewards missing for {basename} player {player_id}, skipping game')
+                        continue
+                else:
+                    grp_feature = grp.take_feature()
+                    rank_by_player = grp.take_rank_by_player()
+                    kyoku_rewards = self.reward_calc.calc_delta_pt(player_id, grp_feature, rank_by_player)
                 assert len(kyoku_rewards) >= at_kyoku[-1] + 1
 
                 if self.policy_gradient:
@@ -210,6 +233,12 @@ class FileDatasetsIter(IterableDataset):
                             entry.append(min(s + 1, 7))
                             entry.append(1 if s == -1 else 0)
                         self.buffer.append(entry)
+
+        t2 = time.monotonic()
+        logging.info(
+            f'file_batch: rust={t1-t0:.2f}s grp+buffer={t2-t1:.2f}s '
+            f'total={t2-t0:.2f}s entries={entries}'
+        )
 
     def __iter__(self):
         if self.iterator is None:
