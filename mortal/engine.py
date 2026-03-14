@@ -31,6 +31,7 @@ class MortalEngine:
         search_placement_pts = None,
         search_policy_model = None,
         search_min_effect_size = 0.1,
+        zero_oracle = False,
     ):
         self.engine_type = 'mortal'
         self.device = device or torch.device('cpu')
@@ -60,6 +61,7 @@ class MortalEngine:
         self.search_placement_pts = search_placement_pts or [6.0, 4.0, 2.0, 0.0]
         self.search_policy_model = search_policy_model
         self.search_min_effect_size = search_min_effect_size
+        self.zero_oracle = zero_oracle
 
         self.is_policy = hasattr(dqn, 'fc1')  # CategoricalPolicy has fc1, DQN does not
 
@@ -78,6 +80,8 @@ class MortalEngine:
         masks = torch.as_tensor(np.stack(masks, axis=0), device=self.device)
         if invisible_obs is not None:
             invisible_obs = torch.as_tensor(np.stack(invisible_obs, axis=0), device=self.device)
+            if self.zero_oracle:
+                invisible_obs = torch.zeros_like(invisible_obs)
         batch_size = obs.shape[0]
 
         match self.version:
