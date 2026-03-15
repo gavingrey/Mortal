@@ -28,6 +28,14 @@ def train():
     from libriichi.consts import obs_shape
     from config import config
 
+    def compute_oracle_gamma(step, warmup_steps, anneal_end_step):
+        """Compute oracle dropout gamma: 1.0 during warmup, linear anneal to 0.0, then 0.0."""
+        if step < warmup_steps:
+            return 1.0
+        if step >= anneal_end_step:
+            return 0.0
+        return 1.0 - (step - warmup_steps) / (anneal_end_step - warmup_steps)
+
     version = config['control']['version']
 
     batch_size = config['control']['batch_size']
@@ -81,6 +89,13 @@ def train():
     gamma = config['dataset'].get('gamma', 1.0)
 
     oracle = config['dataset'].get('oracle', False)
+    # Oracle dropout annealing config
+    oracle_dropout_cfg = config.get('oracle_dropout', {})
+    od_warmup_steps = oracle_dropout_cfg.get('warmup_steps', 0)
+    od_anneal_end_step = oracle_dropout_cfg.get('anneal_end_step', 0)
+    od_enabled = oracle and od_anneal_end_step > 0
+    if od_enabled:
+        logging.info(f'oracle dropout: warmup={od_warmup_steps}, anneal_end={od_anneal_end_step}')
     norm = config['resnet'].get('norm', 'BN')
     mortal = Brain(version=version, norm=norm, is_oracle=oracle, **{k: v for k, v in config['resnet'].items() if k != 'norm'}).to(device)
     policy_net = CategoricalPolicy().to(device)
@@ -159,6 +174,9 @@ def train():
         steps = state.get('steps', 0)
         shuffle_seed = state.get('shuffle_seed', shuffle_seed)
         files_consumed = state.get('files_consumed', 0)
+        if od_enabled and 'oracle_gamma' in state:
+            mortal.oracle_gamma = state['oracle_gamma']
+            logging.info(f'restored oracle_gamma: {mortal.oracle_gamma:.4f}')
 
     optimizer.zero_grad(set_to_none=True)
 
@@ -321,6 +339,11 @@ def train():
             nonlocal idx
             nonlocal pb
 
+            # Update oracle dropout gamma
+            if od_enabled:
+                gamma_val = compute_oracle_gamma(steps, od_warmup_steps, od_anneal_end_step)
+                mortal.oracle_gamma = gamma_val
+
             # Handle uint8 inputs from precomputed shards
             if is_uint8_input and obs.dtype == torch.uint8:
                 obs = obs.to(device=device).float() / 255.0
@@ -389,6 +412,8 @@ def train():
                 writer.add_scalar('loss/awr_loss', stats['awr_loss'] / save_every, steps)
                 writer.add_scalar('entropy/entropy', stats['entropy'] / save_every, steps)
                 writer.add_scalar('hparam/lr', scheduler.get_last_lr()[0], steps)
+                if od_enabled:
+                    writer.add_scalar('oracle_dropout/gamma', mortal.oracle_gamma, steps)
 
                 # Log Welford stats (only in live pipeline mode)
                 if shared_stats is not None:
@@ -423,6 +448,7 @@ def train():
                     'timestamp': datetime.now().timestamp(),
                     'best_perf': best_perf,
                     'config': config,
+                    'oracle_gamma': getattr(mortal, 'oracle_gamma', 1.0),
                 }
                 torch.save(state, state_file)
 
@@ -481,6 +507,26 @@ def train():
                     writer.add_scalar('test_play/fuuro_num', stat.avg_fuuro_num, steps)
                     writer.add_scalar('test_play/fuuro_point', stat.avg_fuuro_point, steps)
                     writer.flush()
+
+                    # Zero-oracle evaluation (feature transfer diagnostic)
+                    if oracle:
+                        logging.info('running zero-oracle test play...')
+                        stat_zo = test_player.test_play_zero_oracle(test_games // 4, mortal, policy_net, device)
+                        mortal.train()
+                        policy_net.train()
+
+                        avg_pt_zo = stat_zo.avg_pt([90, 45, 0, -135])
+                        logging.info(f'zero-oracle avg rank: {stat_zo.avg_rank:.6}')
+                        logging.info(f'zero-oracle avg pt: {avg_pt_zo:.6}')
+                        writer.add_scalar('test_play_zero_oracle/avg_ranking', stat_zo.avg_rank, steps)
+                        writer.add_scalar('test_play_zero_oracle/avg_pt', avg_pt_zo, steps)
+                        writer.add_scalars('test_play_zero_oracle/ranking', {
+                            '1st': stat_zo.rank_1_rate,
+                            '2nd': stat_zo.rank_2_rate,
+                            '3rd': stat_zo.rank_3_rate,
+                            '4th': stat_zo.rank_4_rate,
+                        }, steps)
+                        writer.flush()
 
                     if better:
                         torch.save(state, state_file)

@@ -128,6 +128,7 @@ class Brain(nn.Module):
         self.is_oracle = is_oracle
         self.version = version
         self.norm = norm
+        self.oracle_gamma = 1.0  # probability of keeping oracle features (set by training script)
 
         in_channels = obs_shape(version)[0]
         if is_oracle:
@@ -173,6 +174,12 @@ class Brain(nn.Module):
     def forward(self, obs: Tensor, invisible_obs: Optional[Tensor] = None) -> Union[Tuple[Tensor, Tensor], Tensor]:
         if self.is_oracle:
             assert invisible_obs is not None
+            if self.training and self.oracle_gamma < 1.0:
+                # Per-sample Bernoulli: zero oracle channels with probability (1 - gamma)
+                mask = torch.bernoulli(
+                    torch.full((obs.shape[0], 1, 1), self.oracle_gamma, device=obs.device)
+                )
+                invisible_obs = invisible_obs * mask
             obs = torch.cat((obs, invisible_obs), dim=1)
         phi = self.encoder(obs)
 

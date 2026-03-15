@@ -79,6 +79,39 @@ class TestPlayer:
         torch.backends.cudnn.benchmark = config['control']['enable_cudnn_benchmark']
         return stat
 
+    def test_play_zero_oracle(self, seed_count, mortal, action_head, device):
+        """Test play with oracle channels zeroed — measures feature transfer quality."""
+        torch.backends.cudnn.benchmark = False
+        engine_chal = MortalEngine(
+            mortal,
+            action_head,
+            is_oracle = getattr(mortal, 'is_oracle', False),
+            version = self.chal_version,
+            device = device,
+            enable_amp = True,
+            zero_oracle = True,
+            name = 'mortal',
+        )
+
+        zero_oracle_log_dir = self.log_dir + '_zero_oracle'
+        if path.isdir(zero_oracle_log_dir):
+            shutil.rmtree(zero_oracle_log_dir)
+
+        env = OneVsThree(
+            disable_progress_bar = False,
+            log_dir = zero_oracle_log_dir,
+        )
+        env.py_vs_py(
+            challenger = engine_chal,
+            champion = self.baseline_engine,
+            seed_start = (10000, 0x3000),  # different key from test_play to avoid seed overlap
+            seed_count = seed_count,
+        )
+
+        stat = Stat.from_dir(zero_oracle_log_dir, 'mortal')
+        torch.backends.cudnn.benchmark = config['control']['enable_cudnn_benchmark']
+        return stat
+
 class TrainPlayer:
     def __init__(self):
         baseline_cfg = config['baseline']['train']
