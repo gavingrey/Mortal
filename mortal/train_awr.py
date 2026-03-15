@@ -458,12 +458,6 @@ def train():
                     policy_net.train()
 
                     avg_pt = stat.avg_pt([90, 45, 0, -135])
-                    better = avg_pt >= best_perf['avg_pt'] and stat.avg_rank <= best_perf['avg_rank']
-                    if better:
-                        past_best = best_perf.copy()
-                        best_perf['avg_pt'] = avg_pt
-                        best_perf['avg_rank'] = stat.avg_rank
-
                     logging.info(f'avg rank: {stat.avg_rank:.6}')
                     logging.info(f'avg pt: {avg_pt:.6}')
                     writer.add_scalar('test_play/avg_ranking', stat.avg_rank, steps)
@@ -527,6 +521,20 @@ def train():
                             '4th': stat_zo.rank_4_rate,
                         }, steps)
                         writer.flush()
+
+                        # Track best by zero-oracle performance (what we deploy)
+                        better = avg_pt_zo >= best_perf['avg_pt'] and stat_zo.avg_rank <= best_perf['avg_rank']
+                        if better:
+                            past_best = best_perf.copy()
+                            best_perf['avg_pt'] = avg_pt_zo
+                            best_perf['avg_rank'] = stat_zo.avg_rank
+
+                    if not oracle:
+                        better = avg_pt >= best_perf['avg_pt'] and stat.avg_rank <= best_perf['avg_rank']
+                        if better:
+                            past_best = best_perf.copy()
+                            best_perf['avg_pt'] = avg_pt
+                            best_perf['avg_rank'] = stat.avg_rank
 
                     if better:
                         torch.save(state, state_file)
