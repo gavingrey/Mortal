@@ -140,6 +140,10 @@ def train():
         'avg_rank': 4.,
         'avg_pt': -135.,
     }
+    best_oracle_perf = {
+        'avg_rank': 4.,
+        'avg_pt': -135.,
+    }
 
     steps = 0
     shuffle_seed = random.randint(0, 2**63)
@@ -171,6 +175,7 @@ def train():
         if 'scaler' in state:
             scaler.load_state_dict(state['scaler'])
         best_perf = state.get('best_perf', best_perf)
+        best_oracle_perf = state.get('best_oracle_perf', best_oracle_perf)
         steps = state.get('steps', 0)
         shuffle_seed = state.get('shuffle_seed', shuffle_seed)
         files_consumed = state.get('files_consumed', 0)
@@ -447,6 +452,7 @@ def train():
                     'files_consumed': int(steps * batch_size / 1402),
                     'timestamp': datetime.now().timestamp(),
                     'best_perf': best_perf,
+                    'best_oracle_perf': best_oracle_perf,
                     'config': config,
                     'oracle_gamma': getattr(mortal, 'oracle_gamma', 1.0),
                 }
@@ -458,6 +464,10 @@ def train():
                     policy_net.train()
 
                     avg_pt = stat.avg_pt([90, 45, 0, -135])
+                    oracle_better = avg_pt >= best_oracle_perf['avg_pt'] and stat.avg_rank <= best_oracle_perf['avg_rank']
+                    if oracle_better:
+                        best_oracle_perf['avg_pt'] = avg_pt
+                        best_oracle_perf['avg_rank'] = stat.avg_rank
                     logging.info(f'avg rank: {stat.avg_rank:.6}')
                     logging.info(f'avg pt: {avg_pt:.6}')
                     writer.add_scalar('test_play/avg_ranking', stat.avg_rank, steps)
@@ -545,6 +555,13 @@ def train():
                             f'saving to {best_state_file}'
                         )
                         shutil.copy(state_file, best_state_file)
+                    if oracle_better:
+                        oracle_best_file = best_state_file.replace('_best.', '_oracle_best.')
+                        logging.info(
+                            f'oracle record: rank {best_oracle_perf["avg_rank"]:.4}, '
+                            f'pt {best_oracle_perf["avg_pt"]:.4}, saving to {oracle_best_file}'
+                        )
+                        shutil.copy(state_file, oracle_best_file)
                 pb = tqdm(total=save_every, desc='AWR')
 
         for batch in data_loader:
