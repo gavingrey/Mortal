@@ -94,6 +94,7 @@ def train():
     od_warmup_steps = oracle_dropout_cfg.get('warmup_steps', 0)
     od_anneal_end_step = oracle_dropout_cfg.get('anneal_end_step', 0)
     od_enabled = oracle and od_anneal_end_step > 0
+    oracle_gamma = 1.0
     if od_enabled:
         logging.info(f'oracle dropout: warmup={od_warmup_steps}, anneal_end={od_anneal_end_step}')
     norm = config['resnet'].get('norm', 'BN')
@@ -180,8 +181,7 @@ def train():
         shuffle_seed = state.get('shuffle_seed', shuffle_seed)
         files_consumed = state.get('files_consumed', 0)
         if od_enabled and 'oracle_gamma' in state:
-            mortal.oracle_gamma = state['oracle_gamma']
-            logging.info(f'restored oracle_gamma: {mortal.oracle_gamma:.4f}')
+            logging.info(f'checkpoint oracle_gamma: {state["oracle_gamma"]:.4f}')
 
     optimizer.zero_grad(set_to_none=True)
 
@@ -346,8 +346,7 @@ def train():
 
             # Update oracle dropout gamma
             if od_enabled:
-                gamma_val = compute_oracle_gamma(steps, od_warmup_steps, od_anneal_end_step)
-                mortal.oracle_gamma = gamma_val
+                oracle_gamma = compute_oracle_gamma(steps, od_warmup_steps, od_anneal_end_step)
 
             # Handle uint8 inputs from precomputed shards
             if is_uint8_input and obs.dtype == torch.uint8:
@@ -374,6 +373,13 @@ def train():
                 advantage = advantage[valid_idx]
                 if len(actions) == 0:
                     return
+
+            # Oracle dropout: Bernoulli mask applied outside compiled graph
+            if od_enabled and invisible_obs is not None and oracle_gamma < 1.0:
+                mask = torch.bernoulli(
+                    torch.full((obs.shape[0], 1, 1), oracle_gamma, device=obs.device)
+                )
+                invisible_obs = invisible_obs * mask
 
             with torch.autocast(device.type, dtype=amp_dtype, enabled=enable_amp):
                 phi = mortal(obs, invisible_obs)
@@ -418,7 +424,7 @@ def train():
                 writer.add_scalar('entropy/entropy', stats['entropy'] / save_every, steps)
                 writer.add_scalar('hparam/lr', scheduler.get_last_lr()[0], steps)
                 if od_enabled:
-                    writer.add_scalar('oracle_dropout/gamma', mortal.oracle_gamma, steps)
+                    writer.add_scalar('oracle_dropout/gamma', oracle_gamma, steps)
 
                 # Log Welford stats (only in live pipeline mode)
                 if shared_stats is not None:
@@ -454,7 +460,7 @@ def train():
                     'best_perf': best_perf,
                     'best_oracle_perf': best_oracle_perf,
                     'config': config,
-                    'oracle_gamma': getattr(mortal, 'oracle_gamma', 1.0),
+                    'oracle_gamma': oracle_gamma if od_enabled else 1.0,
                 }
                 torch.save(state, state_file)
 
