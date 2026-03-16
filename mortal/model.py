@@ -174,8 +174,9 @@ class Brain(nn.Module):
     def forward(self, obs: Tensor, invisible_obs: Optional[Tensor] = None) -> Union[Tuple[Tensor, Tensor], Tensor]:
         if self.is_oracle:
             assert invisible_obs is not None
-            if self.training and self.oracle_gamma < 1.0:
+            if self.training:
                 # Per-sample Bernoulli: zero oracle channels with probability (1 - gamma)
+                # No gamma conditional — avoids torch.compile recompilation when gamma changes
                 mask = torch.bernoulli(
                     torch.full((obs.shape[0], 1, 1), self.oracle_gamma, device=obs.device)
                 )
