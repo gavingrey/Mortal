@@ -295,12 +295,16 @@ def train():
             rng.shuffle(file_list)
 
             # Skip already-processed files on resume
+            # files_consumed is approximate (steps * batch_size / 1402), so use a margin
+            # to detect when we've effectively consumed everything
+            min_useful_files = save_every * batch_size // 1402 + file_batch_size
             if files_consumed > 0:
-                if files_consumed >= len(file_list):
-                    # All files consumed — start a new epoch with a fresh shuffle
-                    epoch_num = files_consumed // len(file_list)
-                    files_consumed = files_consumed % len(file_list)
-                    logging.info(f'all files consumed (epoch {epoch_num}), re-shuffling for new pass, skipping {files_consumed:,} files')
+                remaining = len(file_list) - files_consumed
+                if files_consumed >= len(file_list) or remaining < min_useful_files:
+                    # All files consumed (or too few to reach next save) — start a new epoch
+                    epoch_num = max(1, files_consumed // len(file_list))
+                    files_consumed = 0
+                    logging.info(f'epoch {epoch_num} complete, re-shuffling for new pass over all {len(file_list):,} files')
                     rng2 = random.Random(shuffle_seed + epoch_num)
                     rng2.shuffle(file_list)
                 if files_consumed > 0:
@@ -621,6 +625,26 @@ def train():
                 start = end
                 end += batch_size
         pb.close()
+
+        # Save checkpoint when data exhausts mid-save_every, so progress isn't lost on restart
+        if steps < max_steps and steps % save_every != 0:
+            logging.info(f'data exhausted at step {steps:,}, saving checkpoint for clean resume')
+            state = {
+                'mortal': mortal.state_dict(),
+                'policy_net': policy_net.state_dict(),
+                'optimizer': optimizer.state_dict(),
+                'scheduler': scheduler.state_dict(),
+                'scaler': scaler.state_dict(),
+                'steps': steps,
+                'shuffle_seed': shuffle_seed,
+                'files_consumed': int(steps * batch_size / 1402),
+                'timestamp': datetime.now().timestamp(),
+                'best_perf': best_perf,
+                'best_oracle_perf': best_oracle_perf,
+                'config': config,
+                'oracle_gamma': oracle_gamma if od_enabled else 1.0,
+            }
+            torch.save(state, state_file)
 
     while True:
         train_epoch()
