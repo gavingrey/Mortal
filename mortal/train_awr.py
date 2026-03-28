@@ -220,6 +220,7 @@ def train():
     def train_epoch():
         nonlocal steps
         nonlocal idx
+        nonlocal files_consumed
 
         if use_precomputed:
             # Precomputed shard path — bypasses Rust FFI + GRP entirely
