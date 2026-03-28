@@ -295,8 +295,16 @@ def train():
 
             # Skip already-processed files on resume
             if files_consumed > 0:
-                logging.info(f'resuming: skipping {files_consumed:,} already-processed files, {len(file_list) - files_consumed:,} remaining')
-                file_list = file_list[files_consumed:]
+                if files_consumed >= len(file_list):
+                    # All files consumed — start a new epoch with a fresh shuffle
+                    epoch_num = files_consumed // len(file_list)
+                    files_consumed = files_consumed % len(file_list)
+                    logging.info(f'all files consumed (epoch {epoch_num}), re-shuffling for new pass, skipping {files_consumed:,} files')
+                    rng2 = random.Random(shuffle_seed + epoch_num)
+                    rng2.shuffle(file_list)
+                if files_consumed > 0:
+                    logging.info(f'resuming: skipping {files_consumed:,} already-processed files, {len(file_list) - files_consumed:,} remaining')
+                    file_list = file_list[files_consumed:]
 
             file_data = FileDatasetsIter(
                 version = version,
