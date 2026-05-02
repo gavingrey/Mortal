@@ -1,4 +1,5 @@
 pub mod config;
+pub mod features;
 pub mod grp;
 pub mod heuristic;
 pub mod particle;
@@ -379,6 +380,26 @@ impl SearchModule {
         }
 
         Ok(results)
+    }
+
+    /// Compute Tier 1 search-as-features (per-opp genbutsu / suji / tenpai prob).
+    ///
+    /// Returns a flat `Vec<f32>` of length 306 (9 channels × 34, row-major).
+    /// Channels:
+    ///
+    ///   0..=2  per-opp genbutsu     (binary, only when opp in riichi)
+    ///   3..=5  per-opp suji         (binary, only when opp in riichi)
+    ///   6..=8  per-opp tenpai prob  (broadcast scalar from particle shanten check)
+    ///
+    /// Opp index 0/1/2 = relative seats 1/2/3 — same convention as Tier 0.
+    /// Empty `particles` → tenpai-prob channels stay at 0.
+    #[must_use]
+    pub fn compute_tier1_features(
+        &self,
+        state: &PlayerState,
+        particles: Vec<Particle>,
+    ) -> Vec<f32> {
+        features::compute_tier1_features(state, &particles)
     }
 
     /// Collect leaf observation tensors from truncated rollouts.
