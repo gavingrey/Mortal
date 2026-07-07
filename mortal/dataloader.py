@@ -1,3 +1,4 @@
+import os
 import random
 import time
 import logging
@@ -10,6 +11,12 @@ from libriichi.dataset import GameplayLoader
 from config import config
 
 class FileDatasetsIter(IterableDataset):
+    # Per-worker counter of instances dropped by the illegal-action data-integrity
+    # guard in populate_buffer (DQN mode). With num_workers>1 each spawn worker keeps
+    # its own count; a small per-worker number => rare corrupt games (expected), a
+    # flood => a systematic problem to investigate rather than skip.
+    _bad_action_count = 0
+
     def __init__(
         self,
         version,
@@ -218,6 +225,26 @@ class FileDatasetsIter(IterableDataset):
                             steps_to_done[i] = steps_to_done[i + 1] + int(apply_gamma[i])
 
                     for i in range(game_size):
+                        # Data-integrity guard: drop instances whose recorded action is
+                        # not in libriichi's legal-action mask. These originate from rare
+                        # corrupt / edge-case game logs and would otherwise trip the hard
+                        # assertion `masks[range(bs), actions].all()` in train.py and kill
+                        # the entire run. Dropping a handful out of ~1.65B instances/epoch
+                        # is negligible and keeps a multi-week offline run resilient.
+                        # (See docs/plans/2026-07-03-experiment-b-v4-faithful-config.md.)
+                        act = int(actions[i])
+                        if act >= len(masks[i]) or not masks[i][act]:
+                            FileDatasetsIter._bad_action_count += 1
+                            n = FileDatasetsIter._bad_action_count
+                            if n <= 50 or n % 100 == 0:
+                                fname = os.path.basename(file_list[file_idx])
+                                logging.warning(
+                                    f'skipping illegal-action instance: file={fname} '
+                                    f'instance={i} action={act} '
+                                    f'legal_actions={int(np.sum(masks[i]))} '
+                                    f'(worker dropped so far: {n})'
+                                )
+                            continue
                         entry = [
                             obs[i],
                             actions[i],
