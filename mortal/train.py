@@ -4,6 +4,7 @@ def train():
 
     import logging
     import sys
+    import signal
     import os
     import gc
     import gzip
@@ -103,6 +104,7 @@ def train():
     }
 
     steps = 0
+    shuffle_seed = random.randint(0, 2**63)
     state_file = config['control']['state_file']
     best_state_file = config['control']['best_state_file']
     if path.exists(state_file):
@@ -118,6 +120,7 @@ def train():
         scaler.load_state_dict(state['scaler'])
         best_perf = state['best_perf']
         steps = state['steps']
+        shuffle_seed = state.get('shuffle_seed', shuffle_seed)
 
     optimizer.zero_grad(set_to_none=True)
     mse = nn.MSELoss()
@@ -141,6 +144,32 @@ def train():
     all_q = torch.zeros((save_every, batch_size), device=device, dtype=torch.float32)
     all_q_target = torch.zeros((save_every, batch_size), device=device, dtype=torch.float32)
     idx = 0
+
+    def build_state():
+        return {
+            'mortal': mortal.state_dict(),
+            'current_dqn': dqn.state_dict(),
+            'aux_net': aux_net.state_dict(),
+            'optimizer': optimizer.state_dict(),
+            'scheduler': scheduler.state_dict(),
+            'scaler': scaler.state_dict(),
+            'steps': steps,
+            'files_consumed': int(steps * batch_size / 1402),
+            'shuffle_seed': shuffle_seed,
+            'timestamp': datetime.now().timestamp(),
+            'best_perf': best_perf,
+            'config': config,
+        }
+
+    # Graceful pause: on SIGTERM/SIGINT, finish the current step, save state,
+    # exit 0. Resume re-derives the epoch position from `steps`, so pausing is
+    # lossless (no rollback, no reshuffle).
+    pause_requested = [False]
+    def _request_pause(signum, frame):
+        pause_requested[0] = True
+        logging.info('pause requested — saving state after current step')
+    signal.signal(signal.SIGTERM, _request_pause)
+    signal.signal(signal.SIGINT, _request_pause)
 
     def train_epoch():
         nonlocal steps
@@ -183,7 +212,30 @@ def train():
         before_next_test_play = (test_every - steps % test_every) % test_every
         logging.info(f'total steps: {steps:,} (~{before_next_test_play:,})')
 
-        if num_workers > 1:
+        if not online:
+            # Deterministic, resumable data order (ported from train_awr.py).
+            # One seeded shuffle per epoch; on resume, skip files already
+            # consumed. files_consumed is approximate (steps * batch_size /
+            # ~1402 samples per game file), so a margin guards the epoch wrap.
+            files_consumed = int(steps * batch_size / 1402)
+            epoch_num = files_consumed // len(file_list)
+            pos = files_consumed % len(file_list)
+            min_useful_files = save_every * batch_size // 1402 + file_batch_size
+            if len(file_list) - pos < min_useful_files:
+                epoch_num += 1
+                pos = 0
+            if epoch_num >= num_epochs:
+                logging.info(f'num_epochs={num_epochs} exhausted at step {steps:,}, stopping')
+                torch.save(build_state(), state_file)
+                sys.exit(0)
+            rng = random.Random(shuffle_seed + epoch_num)
+            rng.shuffle(file_list)
+            if pos > 0:
+                logging.info(f'epoch {epoch_num}: resuming, skipping {pos:,} consumed files, {len(file_list) - pos:,} remaining')
+                file_list = file_list[pos:]
+            else:
+                logging.info(f'epoch {epoch_num}: full pass over {len(file_list):,} files')
+        elif num_workers > 1:
             random.shuffle(file_list)
         file_data = FileDatasetsIter(
             version = version,
@@ -192,10 +244,11 @@ def train():
             file_batch_size = file_batch_size,
             reserve_ratio = reserve_ratio,
             player_names = player_names,
-            num_epochs = num_epochs,
+            num_epochs = 1 if not online else num_epochs,
             enable_augmentation = enable_augmentation,
             augmented_first = augmented_first,
             suit_augment_mode = suit_augment_mode,
+            pre_shuffled = not online,
         )
         data_loader = iter(DataLoader(
             dataset = file_data,
@@ -277,6 +330,11 @@ def train():
                 submit_param(mortal, dqn, is_idle=False)
                 logging.info('param has been submitted')
 
+            if pause_requested[0]:
+                torch.save(build_state(), state_file)
+                logging.info(f'paused: state saved at step {steps:,}')
+                sys.exit(0)
+
             if steps % save_every == 0:
                 pb.close()
 
@@ -300,18 +358,7 @@ def train():
                 before_next_test_play = (test_every - steps % test_every) % test_every
                 logging.info(f'total steps: {steps:,} (~{before_next_test_play:,})')
 
-                state = {
-                    'mortal': mortal.state_dict(),
-                    'current_dqn': dqn.state_dict(),
-                    'aux_net': aux_net.state_dict(),
-                    'optimizer': optimizer.state_dict(),
-                    'scheduler': scheduler.state_dict(),
-                    'scaler': scaler.state_dict(),
-                    'steps': steps,
-                    'timestamp': datetime.now().timestamp(),
-                    'best_perf': best_perf,
-                    'config': config,
-                }
+                state = build_state()
                 torch.save(state, state_file)
 
                 if online and steps % submit_every != 0:
@@ -436,9 +483,8 @@ def train():
         gc.collect()
         # torch.cuda.empty_cache()
         # torch.cuda.synchronize()
-        if not online:
-            # only run one epoch for offline for easier control
-            break
+        # offline: keep looping — train_epoch derives epoch/position from
+        # `steps` each call and exits itself when num_epochs is exhausted
 
 def main():
     import os
